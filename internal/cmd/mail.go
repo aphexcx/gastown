@@ -186,6 +186,7 @@ func init() {
 	mailInboxCmd.Flags().BoolVar(&mailInboxJSON, "json", false, "Output as JSON")
 	mailInboxCmd.Flags().BoolVarP(&mailInboxUnread, "unread", "u", false, "Show only unread messages")
 	mailInboxCmd.Flags().StringVar(&mailInboxIdentity, "identity", "", "Explicit identity for inbox (e.g., gastown/Toast)")
+	mailInboxCmd.Flags().StringVar(&mailInboxIdentity, "address", "", "Alias for --identity")
 
 	// Read flags
 	mailReadCmd.Flags().BoolVar(&mailReadJSON, "json", false, "Output as JSON")
@@ -194,6 +195,7 @@ func init() {
 	mailCheckCmd.Flags().BoolVar(&mailCheckInject, "inject", false, "Output format for Claude Code hooks")
 	mailCheckCmd.Flags().BoolVar(&mailCheckJSON, "json", false, "Output as JSON")
 	mailCheckCmd.Flags().StringVar(&mailCheckIdentity, "identity", "", "Explicit identity for inbox (e.g., gastown/Toast)")
+	mailCheckCmd.Flags().StringVar(&mailCheckIdentity, "address", "", "Alias for --identity")
 
 	// Thread flags
 	mailThreadCmd.Flags().BoolVar(&mailThreadJSON, "json", false, "Output as JSON")

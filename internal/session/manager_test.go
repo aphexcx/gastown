@@ -16,7 +16,7 @@ func TestSessionName(t *testing.T) {
 	}
 	m := NewManager(tmux.NewTmux(), r)
 
-	name := m.sessionName("Toast")
+	name := m.SessionName("Toast")
 	if name != "gt-gastown-Toast" {
 		t.Errorf("sessionName = %q, want gt-gastown-Toast", name)
 	}

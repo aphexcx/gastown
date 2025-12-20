@@ -336,7 +336,21 @@ func runSpawn(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Session started. Attach with: %s\n",
 		style.Bold.Render("✓"),
 		style.Dim.Render(fmt.Sprintf("gt session at %s/%s", rigName, polecatName)))
-	fmt.Printf("  %s\n", style.Dim.Render("Polecat will read work assignment from inbox on startup"))
+
+	// TODO: Proper solution requires Witness/Deacon to monitor polecat startup
+	// and detect when Claude is ready using AI intelligence. See gt-polecat-ready issue.
+	// For now, use a fixed delay - SessionStart hook runs gt prime which tells polecat
+	// to check mail, but we also send an explicit instruction as backup.
+	sessionName := sessMgr.SessionName(polecatName)
+	time.Sleep(5 * time.Second)
+
+	// Send work instruction - backup in case SessionStart hook doesn't trigger action
+	workInstruction := "Check your inbox with `gt mail inbox` and begin working on your assigned issue."
+	if err := t.SendKeys(sessionName, workInstruction); err != nil {
+		fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("Warning: could not send work instruction: %v", err)))
+	}
+
+	fmt.Printf("  %s\n", style.Dim.Render("Work instruction sent to polecat"))
 
 	return nil
 }

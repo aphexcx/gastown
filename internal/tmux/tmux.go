@@ -177,6 +177,18 @@ func (t *Tmux) CapturePaneAll(session string) (string, error) {
 	return t.run("capture-pane", "-p", "-t", session, "-S", "-")
 }
 
+// CapturePaneLines captures the last N lines of a pane as a slice.
+func (t *Tmux) CapturePaneLines(session string, lines int) ([]string, error) {
+	out, err := t.CapturePane(session, lines)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
 // AttachSession attaches to an existing session.
 // Note: This replaces the current process with tmux attach.
 func (t *Tmux) AttachSession(session string) error {
@@ -314,6 +326,30 @@ func (t *Tmux) WaitForShellReady(session string, timeout time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("timeout waiting for shell")
+}
+
+// WaitForClaudeReady polls until Claude's prompt indicator appears in the pane.
+// Claude is ready when we see "> " at the start of a line (the input prompt).
+// This is more reliable than just checking if node is running.
+func (t *Tmux) WaitForClaudeReady(session string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		// Capture last few lines of the pane
+		lines, err := t.CapturePaneLines(session, 10)
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		// Look for Claude's prompt indicator "> " at start of line
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "> ") || trimmed == ">" {
+				return nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for Claude prompt")
 }
 
 // GetSessionInfo returns detailed information about a session.
