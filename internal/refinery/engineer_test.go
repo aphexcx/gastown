@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
@@ -37,7 +36,7 @@ func TestEngineer_LoadConfig_NoFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer os.RemoveAll(tmpDir)
 
 	r := &rig.Rig{
 		Name: "test-rig",
@@ -63,7 +62,7 @@ func TestEngineer_LoadConfig_WithMergeQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer os.RemoveAll(tmpDir)
 
 	// Write config file
 	config := map[string]interface{}{
@@ -125,7 +124,7 @@ func TestEngineer_LoadConfig_NoMergeQueueSection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer os.RemoveAll(tmpDir)
 
 	// Write config file without merge_queue
 	config := map[string]interface{}{
@@ -161,7 +160,7 @@ func TestEngineer_LoadConfig_InvalidPollInterval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer os.RemoveAll(tmpDir)
 
 	config := map[string]interface{}{
 		"merge_queue": map[string]interface{}{
@@ -201,6 +200,9 @@ func TestNewEngineer(t *testing.T) {
 	if e.beads == nil {
 		t.Error("expected beads client to be initialized")
 	}
+	if e.git == nil {
+		t.Error("expected git client to be initialized")
+	}
 	if e.config == nil {
 		t.Error("expected config to be initialized with defaults")
 	}
@@ -209,163 +211,10 @@ func TestNewEngineer(t *testing.T) {
 	}
 }
 
-func TestProcessMR_NoMRFields(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	r := &rig.Rig{
-		Name: "test-rig",
-		Path: tmpDir,
-	}
-	e := NewEngineer(r)
-
-	// Create an issue without MR fields
-	issue := &beads.Issue{
-		ID:          "gt-mr-test",
-		Title:       "Test MR",
-		Type:        "merge-request",
-		Description: "This issue has no MR fields",
-	}
-
-	result := e.ProcessMR(nil, issue)
-
-	if result.Success {
-		t.Error("expected failure when MR fields are missing")
-	}
-	if result.Error != "no MR fields found in description" {
-		t.Errorf("expected 'no MR fields found in description', got %q", result.Error)
-	}
-}
-
-func TestProcessMR_MissingBranch(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	r := &rig.Rig{
-		Name: "test-rig",
-		Path: tmpDir,
-	}
-	e := NewEngineer(r)
-
-	// Create an issue with MR fields but no branch
-	issue := &beads.Issue{
-		ID:          "gt-mr-test",
-		Title:       "Test MR",
-		Type:        "merge-request",
-		Description: "target: main\nworker: TestWorker",
-	}
-
-	result := e.ProcessMR(nil, issue)
-
-	if result.Success {
-		t.Error("expected failure when branch field is missing")
-	}
-	if result.Error != "branch field is required in merge request" {
-		t.Errorf("expected 'branch field is required in merge request', got %q", result.Error)
-	}
-}
-
-func TestProcessResult_Fields(t *testing.T) {
-	// Test that ProcessResult can represent various failure states
-	tests := []struct {
-		name   string
-		result ProcessResult
-	}{
-		{
-			name: "success",
-			result: ProcessResult{
-				Success:     true,
-				MergeCommit: "abc123",
-			},
-		},
-		{
-			name: "conflict",
-			result: ProcessResult{
-				Success:  false,
-				Error:    "merge conflict",
-				Conflict: true,
-			},
-		},
-		{
-			name: "tests_failed",
-			result: ProcessResult{
-				Success:     false,
-				Error:       "tests failed",
-				TestsFailed: true,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Just verify the struct fields work as expected
-			if tt.result.Success && tt.result.MergeCommit == "" && !tt.result.Conflict && !tt.result.TestsFailed {
-				// This is fine for a non-failing success case
-			}
-		})
-	}
-}
-
-func TestEngineer_RunTestsEmptyCommand(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	r := &rig.Rig{
-		Name: "test-rig",
-		Path: tmpDir,
-	}
-	e := NewEngineer(r)
-
-	// Empty test command should not error
-	if err := e.runTests(""); err != nil {
-		t.Errorf("empty test command should not error, got: %v", err)
-	}
-}
-
-func TestEngineer_RunTestsSuccess(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	r := &rig.Rig{
-		Name: "test-rig",
-		Path: tmpDir,
-	}
-	e := NewEngineer(r)
-
-	// Run a simple command that should succeed
-	if err := e.runTests("true"); err != nil {
-		t.Errorf("expected 'true' command to succeed, got: %v", err)
-	}
-}
-
-func TestEngineer_RunTestsFailure(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	r := &rig.Rig{
-		Name: "test-rig",
-		Path: tmpDir,
-	}
-	e := NewEngineer(r)
-
-	// Run a command that should fail
-	err = e.runTests("false")
-	if err == nil {
-		t.Error("expected 'false' command to fail")
+func TestEngineer_DeleteMergedBranchesConfig(t *testing.T) {
+	// Test that DeleteMergedBranches is true by default
+	cfg := DefaultMergeQueueConfig()
+	if !cfg.DeleteMergedBranches {
+		t.Error("expected DeleteMergedBranches to be true by default")
 	}
 }

@@ -364,13 +364,19 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 	return out != "", nil
 }
 
-// DeleteBranch deletes a branch.
+// DeleteBranch deletes a local branch.
 func (g *Git) DeleteBranch(name string, force bool) error {
 	flag := "-d"
 	if force {
 		flag = "-D"
 	}
 	_, err := g.run("branch", flag, name)
+	return err
+}
+
+// DeleteRemoteBranch deletes a branch from the remote.
+func (g *Git) DeleteRemoteBranch(remote, branch string) error {
+	_, err := g.run("push", remote, "--delete", branch)
 	return err
 }
 

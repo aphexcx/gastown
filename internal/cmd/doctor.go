@@ -53,16 +53,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d := doctor.NewDoctor()
 
 	// Register built-in checks
-	// Note: Town-level checks are registered in gt-f9x.5
-	// Rig-level checks are registered in gt-f9x.6
-	// For now, we just have the framework ready
-
-	// If no checks registered, inform user
-	if len(d.Checks()) == 0 {
-		fmt.Println("No health checks registered yet.")
-		fmt.Println("Town-level and rig-level checks will be added in future updates.")
-		return nil
-	}
+	d.Register(doctor.NewBeadsDatabaseCheck())
 
 	// Run checks
 	var report *doctor.Report
