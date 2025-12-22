@@ -173,15 +173,16 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 }
 
 // runDeaconStatusLine outputs status for the deacon session.
-// Shows: active rigs, patrol status, mail count
+// Shows: active rigs, polecat count, mail preview
 func runDeaconStatusLine(t *tmux.Tmux) error {
-	// Count active rigs by checking for witnesses
+	// Count active rigs and polecats
 	sessions, err := t.ListSessions()
 	if err != nil {
 		return nil // Silent fail
 	}
 
 	rigs := make(map[string]bool)
+	polecatCount := 0
 	for _, s := range sessions {
 		agent := categorizeSession(s)
 		if agent == nil {
@@ -190,17 +191,25 @@ func runDeaconStatusLine(t *tmux.Tmux) error {
 		if agent.Rig != "" {
 			rigs[agent.Rig] = true
 		}
+		if agent.Type == AgentPolecat {
+			polecatCount++
+		}
 	}
 	rigCount := len(rigs)
 
-	// Get deacon mail
-	unread := getUnreadMailCount("deacon/")
+	// Get deacon mail with preview
+	unread, subject := getMailPreview("deacon/", 40)
 
 	// Build status
 	var parts []string
 	parts = append(parts, fmt.Sprintf("%s %d rigs", AgentTypeIcons[AgentDeacon], rigCount))
+	parts = append(parts, fmt.Sprintf("%d polecats", polecatCount))
 	if unread > 0 {
-		parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		if subject != "" {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
+		} else {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		}
 	}
 
 	fmt.Print(strings.Join(parts, " | ") + " |")
@@ -208,7 +217,7 @@ func runDeaconStatusLine(t *tmux.Tmux) error {
 }
 
 // runWitnessStatusLine outputs status for a witness session.
-// Shows: polecat count under management, mail count
+// Shows: polecat count, crew count, mail preview
 func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 	if rigName == "" {
 		// Try to extract from session name: gt-witness-<rig>
@@ -217,33 +226,44 @@ func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 		}
 	}
 
-	// Count polecats in this rig
+	// Count polecats and crew in this rig
 	sessions, err := t.ListSessions()
 	if err != nil {
 		return nil // Silent fail
 	}
 
 	polecatCount := 0
+	crewCount := 0
 	for _, s := range sessions {
 		agent := categorizeSession(s)
 		if agent == nil {
 			continue
 		}
-		// Count polecats in this specific rig
-		if agent.Type == AgentPolecat && agent.Rig == rigName {
-			polecatCount++
+		if agent.Rig == rigName {
+			if agent.Type == AgentPolecat {
+				polecatCount++
+			} else if agent.Type == AgentCrew {
+				crewCount++
+			}
 		}
 	}
 
-	// Get witness mail
+	// Get witness mail with preview
 	identity := fmt.Sprintf("%s/witness", rigName)
-	unread := getUnreadMailCount(identity)
+	unread, subject := getMailPreview(identity, 35)
 
 	// Build status
 	var parts []string
 	parts = append(parts, fmt.Sprintf("%s %d polecats", AgentTypeIcons[AgentWitness], polecatCount))
+	if crewCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d crew", crewCount))
+	}
 	if unread > 0 {
-		parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		if subject != "" {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
+		} else {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		}
 	}
 
 	fmt.Print(strings.Join(parts, " | ") + " |")
@@ -251,7 +271,7 @@ func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 }
 
 // runRefineryStatusLine outputs status for a refinery session.
-// Shows: MQ length, current processing status, mail count
+// Shows: MQ length, current item, mail preview
 func runRefineryStatusLine(rigName string) error {
 	if rigName == "" {
 		// Try to extract from session name: gt-<rig>-refinery
@@ -282,34 +302,42 @@ func runRefineryStatusLine(rigName string) error {
 		return nil
 	}
 
-	// Count pending items (position > 0 means pending, 0 means currently processing)
+	// Count pending items and find current item
 	pending := 0
-	processing := false
+	var currentItem string
 	for _, item := range queue {
-		if item.Position == 0 {
-			processing = true
+		if item.Position == 0 && item.MR != nil {
+			// Currently processing - show issue ID
+			currentItem = item.MR.IssueID
 		} else {
 			pending++
 		}
 	}
 
-	// Get refinery mail
+	// Get refinery mail with preview
 	identity := fmt.Sprintf("%s/refinery", rigName)
-	unread := getUnreadMailCount(identity)
+	unread, subject := getMailPreview(identity, 30)
 
 	// Build status
 	var parts []string
 	icon := AgentTypeIcons[AgentRefinery]
-	if processing {
-		parts = append(parts, fmt.Sprintf("%s MQ: %d (+1)", icon, pending))
+	if currentItem != "" {
+		parts = append(parts, fmt.Sprintf("%s merging %s", icon, currentItem))
+		if pending > 0 {
+			parts = append(parts, fmt.Sprintf("+%d queued", pending))
+		}
 	} else if pending > 0 {
-		parts = append(parts, fmt.Sprintf("%s MQ: %d", icon, pending))
+		parts = append(parts, fmt.Sprintf("%s %d queued", icon, pending))
 	} else {
 		parts = append(parts, fmt.Sprintf("%s idle", icon))
 	}
 
 	if unread > 0 {
-		parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		if subject != "" {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
+		} else {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		}
 	}
 
 	fmt.Print(strings.Join(parts, " | ") + " |")
