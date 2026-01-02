@@ -257,26 +257,33 @@ For each rig, run:
 ```bash
 gt witness status <rig>
 gt refinery status <rig>
+```
 
-# Health ping (clears backoff as side effect)
+**IMPORTANT: Do NOT send health pings on every patrol cycle.**
+Health check nudges disturb idle agents and waste their context. Only send
+a HEALTH_CHECK nudge when you have **concerning signals** (see table below).
+
+**When to send health pings** (only if concerned):
+```bash
+# Only if agent appears unresponsive or status check fails:
 gt nudge <rig>/witness 'HEALTH_CHECK from deacon'
 gt nudge <rig>/refinery 'HEALTH_CHECK from deacon'
 ```
-
-**Health Ping Benefit**: The nudge commands serve dual purposes:
-1. **Liveness verification** - Agent responds to prove it's alive
-2. **Backoff reset** - Any nudge resets agent's backoff to base interval
-
-This ensures patrol agents remain responsive even during quiet periods when the
-feed has no mutations. Deacon patrols every ~1-2 minutes, so maximum backoff
-is bounded by the ping interval.
 
 **Signals to assess:**
 
 | Component | Healthy Signals | Concerning Signals |
 |-----------|-----------------|-------------------|
-| Witness | State: running, recent activity | State: not running, no heartbeat |
-| Refinery | State: running, queue processing | Queue stuck, merge failures |
+| Witness | State: running, recent activity | State: not running, no heartbeat, or status check hangs |
+| Refinery | State: running, queue processing | Queue stuck, merge failures, or not responding |
+
+**When NOT to ping:**
+- Agent reports state=running with recent activity
+- No pending work in queues
+- Status check returns promptly with healthy output
+
+The status commands (`gt witness status`, `gt refinery status`) provide
+sufficient liveness information. Reserve nudges for actual problems.
 
 **Tracking unresponsive cycles:**
 
@@ -296,7 +303,7 @@ health_state:
 
 | Cycles Unresponsive | Suggested Action |
 |---------------------|------------------|
-| 1-2 | Note it, check again next cycle |
+| 1-2 | Note it, send HEALTH_CHECK nudge |
 | 3-4 | Attempt restart: gt witness restart <rig> |
 | 5+ | Escalate to Mayor with context |
 
