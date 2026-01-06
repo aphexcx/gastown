@@ -417,7 +417,8 @@ func (d *Daemon) ensureWitnessesRunning() {
 
 // ensureWitnessRunning ensures the witness for a specific rig is running.
 func (d *Daemon) ensureWitnessRunning(rigName string) {
-	agentID := beads.WitnessBeadID(rigName)
+	prefix := config.GetRigPrefix(d.config.TownRoot, rigName)
+	agentID := beads.WitnessBeadIDWithPrefix(prefix, rigName)
 	sessionName := "gt-" + rigName + "-witness"
 
 	// Check agent bead state (ZFC: trust what agent reports)
@@ -503,7 +504,8 @@ func (d *Daemon) ensureRefineriesRunning() {
 
 // ensureRefineryRunning ensures the refinery for a specific rig is running.
 func (d *Daemon) ensureRefineryRunning(rigName string) {
-	agentID := beads.RefineryBeadID(rigName)
+	prefix := config.GetRigPrefix(d.config.TownRoot, rigName)
+	agentID := beads.RefineryBeadIDWithPrefix(prefix, rigName)
 	sessionName := "gt-" + rigName + "-refinery"
 
 	// Check agent bead state (ZFC: trust what agent reports)

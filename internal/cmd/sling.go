@@ -949,29 +949,29 @@ func runSlingFormula(args []string) error {
 func updateAgentHookBead(agentID, beadID, workDir, townBeadsDir string) {
 	_ = townBeadsDir // Not used - BEADS_DIR breaks redirect mechanism
 
-	// Convert agent ID to agent bead ID
-	// Format examples (canonical: prefix-rig-role-name):
-	//   greenplace/crew/max -> gt-greenplace-crew-max
-	//   greenplace/polecats/Toast -> gt-greenplace-polecat-Toast
-	//   mayor -> gt-mayor
-	//   greenplace/witness -> gt-greenplace-witness
-	agentBeadID := agentIDToBeadID(agentID)
-	if agentBeadID == "" {
-		return
-	}
-
 	// Determine the directory to run bd commands from:
 	// - If workDir is provided (polecat's clone path), use it for redirect-based routing
 	// - Otherwise fall back to town root
 	bdWorkDir := workDir
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		// Not in a Gas Town workspace - can't update agent bead
+		fmt.Fprintf(os.Stderr, "Warning: couldn't find town root to update agent hook: %v\n", err)
+		return
+	}
 	if bdWorkDir == "" {
-		townRoot, err := workspace.FindFromCwd()
-		if err != nil {
-			// Not in a Gas Town workspace - can't update agent bead
-			fmt.Fprintf(os.Stderr, "Warning: couldn't find town root to update agent hook: %v\n", err)
-			return
-		}
 		bdWorkDir = townRoot
+	}
+
+	// Convert agent ID to agent bead ID
+	// Format examples (canonical: prefix-rig-role-name):
+	//   greenplace/crew/max -> gt-greenplace-crew-max
+	//   greenplace/polecats/Toast -> gt-greenplace-polecat-Toast
+	//   mayor -> hq-mayor
+	//   greenplace/witness -> gt-greenplace-witness
+	agentBeadID := agentIDToBeadID(agentID, townRoot)
+	if agentBeadID == "" {
+		return
 	}
 
 	// Run from workDir WITHOUT BEADS_DIR to enable redirect-based routing.
@@ -1016,7 +1016,8 @@ func detectActor() string {
 // Uses canonical naming: prefix-rig-role-name
 // Town-level agents (Mayor, Deacon) use hq- prefix and are stored in town beads.
 // Rig-level agents use the rig's configured prefix (default "gt-").
-func agentIDToBeadID(agentID string) string {
+// townRoot is needed to look up the rig's configured prefix.
+func agentIDToBeadID(agentID, townRoot string) string {
 	// Handle simple cases (town-level agents with hq- prefix)
 	if agentID == "mayor" {
 		return beads.MayorBeadIDTown()
@@ -1032,16 +1033,17 @@ func agentIDToBeadID(agentID string) string {
 	}
 
 	rig := parts[0]
+	prefix := config.GetRigPrefix(townRoot, rig)
 
 	switch {
 	case len(parts) == 2 && parts[1] == "witness":
-		return beads.WitnessBeadID(rig)
+		return beads.WitnessBeadIDWithPrefix(prefix, rig)
 	case len(parts) == 2 && parts[1] == "refinery":
-		return beads.RefineryBeadID(rig)
+		return beads.RefineryBeadIDWithPrefix(prefix, rig)
 	case len(parts) == 3 && parts[1] == "crew":
-		return beads.CrewBeadID(rig, parts[2])
+		return beads.CrewBeadIDWithPrefix(prefix, rig, parts[2])
 	case len(parts) == 3 && parts[1] == "polecats":
-		return beads.PolecatBeadID(rig, parts[2])
+		return beads.PolecatBeadIDWithPrefix(prefix, rig, parts[2])
 	default:
 		return ""
 	}
