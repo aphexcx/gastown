@@ -12,7 +12,6 @@ import (
 	"github.com/steveyegge/gastown/internal/claude"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -23,9 +22,8 @@ import (
 
 // Witness command flags
 var (
-	witnessForeground  bool
-	witnessStatusJSON  bool
-	witnessProcessJSON bool
+	witnessForeground bool
+	witnessStatusJSON bool
 )
 
 var witnessCmd = &cobra.Command{
@@ -107,30 +105,6 @@ Examples:
 	RunE: runWitnessRestart,
 }
 
-var witnessProcessCmd = &cobra.Command{
-	Use:   "process <rig>",
-	Short: "Process witness mail",
-	Long: `Process protocol messages in the Witness's mailbox.
-
-Reads unread messages and handles each based on protocol type:
-
-  POLECAT_DONE       - Auto-nuke if clean, create cleanup wisp if dirty
-  LIFECYCLE:Shutdown - Auto-nuke if clean
-  MERGED             - Verify and complete cleanup
-  MERGE_FAILED       - Notify polecat of failure
-  HELP               - Assess and escalate if needed
-  SWARM_START        - Initialize swarm tracking
-
-This command invokes the Go handlers that perform the actual cleanup
-operations (killing tmux sessions, removing worktrees, etc.).
-
-Examples:
-  gt witness process gastown
-  gt witness process gastown --json`,
-	Args: cobra.ExactArgs(1),
-	RunE: runWitnessProcess,
-}
-
 func init() {
 	// Start flags
 	witnessStartCmd.Flags().BoolVar(&witnessForeground, "foreground", false, "Run in foreground (default: background)")
@@ -138,16 +112,12 @@ func init() {
 	// Status flags
 	witnessStatusCmd.Flags().BoolVar(&witnessStatusJSON, "json", false, "Output as JSON")
 
-	// Process flags
-	witnessProcessCmd.Flags().BoolVar(&witnessProcessJSON, "json", false, "Output as JSON")
-
 	// Add subcommands
 	witnessCmd.AddCommand(witnessStartCmd)
 	witnessCmd.AddCommand(witnessStopCmd)
 	witnessCmd.AddCommand(witnessRestartCmd)
 	witnessCmd.AddCommand(witnessStatusCmd)
 	witnessCmd.AddCommand(witnessAttachCmd)
-	witnessCmd.AddCommand(witnessProcessCmd)
 
 	rootCmd.AddCommand(witnessCmd)
 }
@@ -487,197 +457,4 @@ func runWitnessRestart(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Witness restarted for %s\n", style.Bold.Render("✓"), rigName)
 	fmt.Printf("  %s\n", style.Dim.Render("Use 'gt witness attach' to connect"))
 	return nil
-}
-
-// WitnessProcessResult tracks the result of processing witness mail.
-type WitnessProcessResult struct {
-	MessageID    string                `json:"message_id"`
-	ProtocolType witness.ProtocolType  `json:"protocol_type"`
-	From         string                `json:"from"`
-	Subject      string                `json:"subject"`
-	Handled      bool                  `json:"handled"`
-	Action       string                `json:"action"`
-	WispCreated  string                `json:"wisp_created,omitempty"`
-	Error        string                `json:"error,omitempty"`
-}
-
-func runWitnessProcess(cmd *cobra.Command, args []string) error {
-	rigName := args[0]
-
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
-	}
-
-	// Verify rig exists
-	_, r, err := getWitnessManager(rigName)
-	if err != nil {
-		return err
-	}
-
-	// Get witness mailbox
-	witnessAddr := fmt.Sprintf("%s/witness", rigName)
-	router := mail.NewRouter(townRoot)
-	mailbox, err := router.GetMailbox(witnessAddr)
-	if err != nil {
-		return fmt.Errorf("getting witness mailbox: %w", err)
-	}
-
-	// Get unread messages
-	messages, err := mailbox.ListUnread()
-	if err != nil {
-		return fmt.Errorf("listing unread messages: %w", err)
-	}
-
-	if len(messages) == 0 {
-		if witnessProcessJSON {
-			fmt.Println("[]")
-		} else {
-			fmt.Printf("%s No pending messages\n", style.Dim.Render("○"))
-		}
-		return nil
-	}
-
-	if !witnessProcessJSON {
-		fmt.Printf("%s Processing %d message(s) for %s\n", style.Bold.Render("●"), len(messages), rigName)
-	}
-
-	var results []WitnessProcessResult
-	for _, msg := range messages {
-		result := processWitnessMessage(townRoot, r.Path, rigName, msg, router)
-		results = append(results, result)
-
-		if !witnessProcessJSON {
-			// Print result
-			if result.Error != "" {
-				fmt.Printf("  %s [%s] %s: %s\n",
-					style.Error.Render("✗"),
-					result.ProtocolType,
-					msg.Subject,
-					result.Error)
-			} else if result.Handled {
-				fmt.Printf("  %s [%s] %s\n",
-					style.Bold.Render("✓"),
-					result.ProtocolType,
-					result.Action)
-			} else {
-				fmt.Printf("  %s [%s] %s\n",
-					style.Dim.Render("○"),
-					result.ProtocolType,
-					result.Action)
-			}
-		}
-
-		// Archive handled messages
-		if result.Handled && result.Error == "" {
-			_ = mailbox.Delete(msg.ID)
-		}
-	}
-
-	// Output
-	if witnessProcessJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(results)
-	}
-
-	// Summary
-	handled := 0
-	errors := 0
-	for _, r := range results {
-		if r.Handled {
-			handled++
-		}
-		if r.Error != "" {
-			errors++
-		}
-	}
-
-	fmt.Println()
-	fmt.Printf("%s Processed %d/%d messages",
-		style.Bold.Render("✓"), handled, len(results))
-	if errors > 0 {
-		fmt.Printf(" (%d errors)", errors)
-	}
-	fmt.Println()
-
-	return nil
-}
-
-// processWitnessMessage handles a single protocol message and returns the result.
-func processWitnessMessage(townRoot, rigPath, rigName string, msg *mail.Message, router *mail.Router) WitnessProcessResult {
-	result := WitnessProcessResult{
-		MessageID: msg.ID,
-		From:      msg.From,
-		Subject:   msg.Subject,
-	}
-
-	// Classify the message
-	result.ProtocolType = witness.ClassifyMessage(msg.Subject)
-
-	// Handle based on type
-	switch result.ProtocolType {
-	case witness.ProtoPolecatDone:
-		handlerResult := witness.HandlePolecatDone(rigPath, rigName, msg)
-		result.Handled = handlerResult.Handled
-		result.Action = handlerResult.Action
-		result.WispCreated = handlerResult.WispCreated
-		if handlerResult.Error != nil {
-			result.Error = handlerResult.Error.Error()
-		}
-
-	case witness.ProtoLifecycleShutdown:
-		handlerResult := witness.HandleLifecycleShutdown(rigPath, rigName, msg)
-		result.Handled = handlerResult.Handled
-		result.Action = handlerResult.Action
-		result.WispCreated = handlerResult.WispCreated
-		if handlerResult.Error != nil {
-			result.Error = handlerResult.Error.Error()
-		}
-
-	case witness.ProtoMerged:
-		handlerResult := witness.HandleMerged(rigPath, rigName, msg)
-		result.Handled = handlerResult.Handled
-		result.Action = handlerResult.Action
-		result.WispCreated = handlerResult.WispCreated
-		if handlerResult.Error != nil {
-			result.Error = handlerResult.Error.Error()
-		}
-
-	case witness.ProtoMergeFailed:
-		handlerResult := witness.HandleMergeFailed(rigPath, rigName, msg, router)
-		result.Handled = handlerResult.Handled
-		result.Action = handlerResult.Action
-		if handlerResult.Error != nil {
-			result.Error = handlerResult.Error.Error()
-		}
-
-	case witness.ProtoHelp:
-		handlerResult := witness.HandleHelp(rigPath, rigName, msg, router)
-		result.Handled = handlerResult.Handled
-		result.Action = handlerResult.Action
-		if handlerResult.Error != nil {
-			result.Error = handlerResult.Error.Error()
-		}
-
-	case witness.ProtoSwarmStart:
-		handlerResult := witness.HandleSwarmStart(rigPath, msg)
-		result.Handled = handlerResult.Handled
-		result.Action = handlerResult.Action
-		result.WispCreated = handlerResult.WispCreated
-		if handlerResult.Error != nil {
-			result.Error = handlerResult.Error.Error()
-		}
-
-	case witness.ProtoHandoff:
-		// Handoff messages are handled by the Claude agent reading them, not by Go code
-		result.Handled = false
-		result.Action = "handoff message - read by Claude agent, not processed here"
-
-	default:
-		result.Handled = false
-		result.Action = "unknown message type, skipped"
-	}
-
-	return result
 }
