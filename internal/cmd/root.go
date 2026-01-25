@@ -73,7 +73,9 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	if BuiltProperly == "" {
 		fmt.Fprintln(os.Stderr, "ERROR: This binary was built with 'go build' directly.")
 		fmt.Fprintln(os.Stderr, "       Use 'make build' to create a properly signed binary.")
-		fmt.Fprintln(os.Stderr, "       Run from: ~/gt/gastown/mayor/rig (or your rig's worktree)")
+		if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
+			fmt.Fprintf(os.Stderr, "       Run from: %s\n", gtRoot)
+		}
 		os.Exit(1)
 	}
 
