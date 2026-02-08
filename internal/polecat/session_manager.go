@@ -158,7 +158,9 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 	if running {
 		if m.isSessionStale(sessionID) {
-			debugSession("KillStaleSession", m.tmux.KillSessionWithProcesses(sessionID))
+			if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+				return fmt.Errorf("killing stale session %s: %w", sessionID, err)
+			}
 		} else {
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
 		}
