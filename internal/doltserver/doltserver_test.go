@@ -821,6 +821,88 @@ func TestConcurrentMetadataAccess(t *testing.T) {
 	}
 }
 
+// TestConcurrentMetadataSameFile tests that concurrent EnsureMetadata calls
+// targeting the SAME metadata.json file don't corrupt data. This exercises
+// the file locking added to prevent read-modify-write races.
+func TestConcurrentMetadataSameFile(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// All goroutines will target the same rig (and thus the same metadata.json)
+	rigName := "shared-rig"
+	beadsDir := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed with extra fields that must survive concurrent overwrites
+	initial := map[string]interface{}{
+		"custom_field": "preserve-me",
+		"version":      42.0,
+	}
+	data, _ := json.MarshalIndent(initial, "", "  ")
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 10 concurrent goroutines all writing to the same file
+	const concurrency = 10
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = EnsureMetadata(townRoot, rigName)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: EnsureMetadata failed: %v", i, err)
+		}
+	}
+
+	// Verify final metadata is valid and preserves all fields
+	finalData, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var meta map[string]interface{}
+	if err := json.Unmarshal(finalData, &meta); err != nil {
+		t.Fatalf("final metadata is corrupted JSON: %v\ncontent: %s", err, string(finalData))
+	}
+
+	// Dolt fields must be set
+	if meta["backend"] != "dolt" {
+		t.Errorf("backend = %v, want dolt", meta["backend"])
+	}
+	if meta["dolt_database"] != rigName {
+		t.Errorf("dolt_database = %v, want %s", meta["dolt_database"], rigName)
+	}
+	if meta["dolt_mode"] != "server" {
+		t.Errorf("dolt_mode = %v, want server", meta["dolt_mode"])
+	}
+
+	// Custom fields must be preserved (not clobbered by concurrent writes)
+	if meta["custom_field"] != "preserve-me" {
+		t.Errorf("custom_field = %v, want preserve-me (field was clobbered)", meta["custom_field"])
+	}
+	if meta["version"] != 42.0 {
+		t.Errorf("version = %v, want 42 (field was clobbered)", meta["version"])
+	}
+
+	// Lock file should exist (cleanup is caller's responsibility)
+	lockPath := metadataPath + ".lock"
+	if _, err := os.Stat(lockPath); os.IsNotExist(err) {
+		t.Error("lock file should exist after locking")
+	}
+}
+
 // TestConcurrentFindMigratableDatabases tests that FindMigratableDatabases
 // can be called concurrently (simulating gt status during migration).
 func TestConcurrentFindMigratableDatabases(t *testing.T) {

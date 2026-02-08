@@ -707,7 +707,22 @@ func EnsureMetadata(townRoot, rigName string) error {
 		return fmt.Errorf("could not find .beads directory for rig %q", rigName)
 	}
 
+	// Ensure directory exists before locking
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		return fmt.Errorf("creating beads directory: %w", err)
+	}
+
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
+
+	// Acquire file lock to prevent concurrent read-modify-write races.
+	// Multiple goroutines (via EnsureAllMetadata) can target the same
+	// metadata.json if rig resolution overlaps.
+	lockPath := metadataPath + ".lock"
+	fileLock := flock.New(lockPath)
+	if err := fileLock.Lock(); err != nil {
+		return fmt.Errorf("acquiring metadata lock: %w", err)
+	}
+	defer func() { _ = fileLock.Unlock() }()
 
 	// Load existing metadata if present (preserve any extra fields)
 	existing := make(map[string]interface{})
@@ -729,11 +744,6 @@ func EnsureMetadata(townRoot, rigName string) error {
 	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling metadata: %w", err)
-	}
-
-	// Ensure directory exists
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		return fmt.Errorf("creating beads directory: %w", err)
 	}
 
 	if err := util.AtomicWriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
