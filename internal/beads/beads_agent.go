@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/gofrs/flock"
 )
 
 // runSlotSet runs `bd slot set` from a specific directory.
@@ -30,6 +33,23 @@ func runSlotClear(workDir, beadID, slotName string) error {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
+}
+
+// lockAgentBead acquires an exclusive file lock for a specific agent bead ID.
+// This prevents concurrent read-modify-write races in methods like
+// CreateOrReopenAgentBead, ResetAgentBeadForReuse, and UpdateAgentDescriptionFields.
+// Caller must defer fl.Unlock().
+func (b *Beads) lockAgentBead(id string) (*flock.Flock, error) {
+	lockDir := filepath.Join(b.getResolvedBeadsDir(), ".locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating bead lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, fmt.Sprintf("agent-%s.lock", id))
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring agent bead lock for %s: %w", id, err)
+	}
+	return fl, nil
 }
 
 // AgentFields holds structured fields for agent beads.
@@ -225,11 +245,20 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 // - If nuke used CloseAndClearAgentBead (legacy), bead is closed → reopen then update
 // - If bead is in unknown state, falls back to show+update
 func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (*Issue, error) {
-	// First try to create the bead
+	// First try to create the bead (no lock needed - create is atomic)
 	issue, err := b.CreateAgentBead(id, title, fields)
 	if err == nil {
 		return issue, nil
 	}
+
+	// Create failed - need to do Show→Reopen→Update which requires locking
+	// to prevent concurrent modifications (e.g., nuke clearing fields while
+	// spawn is updating them). See gt-joazs.
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return nil, fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
 
 	// Create failed - check if bead already exists (handles both open and closed states)
 	createErr := err
@@ -306,6 +335,15 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 //
 // This replaces CloseAndClearAgentBead for the nuke path (gt-14b8o).
 func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
+	// Lock the agent bead to prevent concurrent read-modify-write races.
+	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
+	// the nuked state we're about to set. See gt-joazs.
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	// Resolve where this bead lives (handles cross-rig routing).
 	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
 	// from gastown) would be looked up in the local rig's database and fail.
@@ -443,6 +481,15 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 		}
 	}
 
+	// Lock the agent bead to prevent concurrent read-modify-write races.
+	// Without this, concurrent callers updating different fields could overwrite
+	// each other's changes. See gt-joazs.
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	issue, err := b.Show(id)
 	if err != nil {
 		return err
@@ -527,6 +574,14 @@ func (b *Beads) DeleteAgentBead(id string) error {
 // CreateOrReopenAgentBead can reopen closed beads when re-spawning polecats,
 // but the preferred path avoids close/reopen entirely.
 func (b *Beads) CloseAndClearAgentBead(id, reason string) error {
+	// Lock the agent bead to prevent concurrent read-modify-write races.
+	// See gt-joazs.
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	// Resolve where this bead lives (handles cross-rig routing).
 	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
 	// from gastown) would be looked up in the local rig's database and fail.
