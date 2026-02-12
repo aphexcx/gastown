@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -691,6 +692,62 @@ func TestReconcilePoolWith_OrphanDoesNotBlockAllocation(t *testing.T) {
 
 	if name != "furiosa" {
 		t.Errorf("expected furiosa (orphan freed), got %q", name)
+	}
+}
+
+func TestIsDoltConfigError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"transient optimistic lock", fmt.Errorf("optimistic lock failed"), false},
+		{"transient serialization", fmt.Errorf("serialization failure"), false},
+		{"not initialized", fmt.Errorf("database not initialized"), true},
+		{"no such table", fmt.Errorf("no such table: issues"), true},
+		{"table not found", fmt.Errorf("table not found: issues"), true},
+		{"issue_prefix missing", fmt.Errorf("issue_prefix not configured"), true},
+		{"no database", fmt.Errorf("no database found at path"), true},
+		{"database not found", fmt.Errorf("database not found"), true},
+		{"connection refused", fmt.Errorf("dial tcp: connection refused"), true},
+		{"configure custom types", fmt.Errorf("configure custom types in /path: exit 1"), true},
+		{"generic error", fmt.Errorf("something else failed"), false},
+		{"wrapped not initialized", fmt.Errorf("bd create failed: %w", fmt.Errorf("database not initialized")), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDoltConfigError(tt.err); got != tt.want {
+				t.Errorf("isDoltConfigError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsDoltOptimisticLockError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"optimistic lock", fmt.Errorf("optimistic lock failed"), true},
+		{"serialization failure", fmt.Errorf("serialization failure"), true},
+		{"lock wait timeout", fmt.Errorf("lock wait timeout exceeded"), true},
+		{"try restarting transaction", fmt.Errorf("try restarting transaction"), true},
+		{"database is read only", fmt.Errorf("database is read only"), true},
+		{"cannot update manifest", fmt.Errorf("cannot update manifest"), true},
+		{"config error", fmt.Errorf("not initialized"), false},
+		{"generic error", fmt.Errorf("something else"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDoltOptimisticLockError(tt.err); got != tt.want {
+				t.Errorf("isDoltOptimisticLockError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
