@@ -16,7 +16,7 @@ import (
 // stopHookResponse is the JSON response for Claude Code's Stop hook.
 // See: https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/hooks
 type stopHookResponse struct {
-	Decision string `json:"decision"`         // "block" or "allow"
+	Decision string `json:"decision"`         // "block" or "approve"
 	Reason   string `json:"reason,omitempty"` // Message to inject when blocking
 }
 
@@ -32,7 +32,7 @@ Checks for queued work or messages for the current agent:
 If work is found, outputs {"decision":"block","reason":"<message>"} which
 prevents the turn from ending and injects the message as new context.
 
-If nothing is queued, outputs {"decision":"allow"} and the agent goes idle.
+If nothing is queued, outputs {"decision":"approve"} and the agent goes idle.
 
 This command must complete in <500ms as it runs on every turn boundary.
 All output goes to stdout as JSON for Claude Code to consume.`,
@@ -186,9 +186,9 @@ func checkStopSlungWork(townRoot string) string {
 	return ""
 }
 
-// outputStopAllow outputs the JSON response to allow the agent to stop.
+// outputStopAllow outputs the JSON response to approve the agent stopping.
 func outputStopAllow() error {
-	return outputStopResponse(stopHookResponse{Decision: "allow"})
+	return outputStopResponse(stopHookResponse{Decision: "approve"})
 }
 
 // outputStopBlock outputs the JSON response to block the agent and inject a message.
@@ -200,8 +200,8 @@ func outputStopBlock(reason string) error {
 func outputStopResponse(resp stopHookResponse) error {
 	data, err := json.Marshal(resp)
 	if err != nil {
-		// If we can't marshal, allow the stop rather than crash
-		fmt.Fprintln(os.Stdout, `{"decision":"allow"}`)
+		// If we can't marshal, approve the stop rather than crash
+		fmt.Fprintln(os.Stdout, `{"decision":"approve"}`)
 		return nil
 	}
 	fmt.Fprintln(os.Stdout, string(data))
