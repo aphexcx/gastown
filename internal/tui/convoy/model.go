@@ -54,8 +54,9 @@ type Model struct {
 	width    int
 	height   int
 
-	// mu protects convoys slice from concurrent access
-	// (e.g. View called while fetchConvoysMsg updates the slice).
+	// mu protects all fields read by View() from concurrent access:
+	// convoys, cursor, err, showHelp, help, width, height.
+	// Write lock is held during Update mutations; read lock during View/render.
 	mu sync.RWMutex
 }
 
@@ -249,9 +250,11 @@ func refreshIssueStatus(ctx context.Context, tracked []struct {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.mu.Lock()
 		m.width = msg.Width
 		m.height = msg.Height
 		m.help.Width = msg.Width
+		m.mu.Unlock()
 		return m, nil
 
 	case fetchConvoysMsg:
@@ -267,34 +270,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case key.Matches(msg, m.keys.Help):
+			m.mu.Lock()
 			m.showHelp = !m.showHelp
+			m.mu.Unlock()
 			return m, nil
 
 		case key.Matches(msg, m.keys.Up):
-			m.mu.RLock()
+			m.mu.Lock()
 			if m.cursor > 0 {
 				m.cursor--
 			}
-			m.mu.RUnlock()
+			m.mu.Unlock()
 			return m, nil
 
 		case key.Matches(msg, m.keys.Down):
-			m.mu.RLock()
+			m.mu.Lock()
 			max := m.maxCursorLocked()
-			m.mu.RUnlock()
 			if m.cursor < max {
 				m.cursor++
 			}
+			m.mu.Unlock()
 			return m, nil
 
 		case key.Matches(msg, m.keys.Top):
+			m.mu.Lock()
 			m.cursor = 0
+			m.mu.Unlock()
 			return m, nil
 
 		case key.Matches(msg, m.keys.Bottom):
-			m.mu.RLock()
+			m.mu.Lock()
 			m.cursor = m.maxCursorLocked()
-			m.mu.RUnlock()
+			m.mu.Unlock()
 			return m, nil
 
 		case key.Matches(msg, m.keys.Toggle):
@@ -306,14 +313,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Number keys for direct convoy access
 		case msg.String() >= "1" && msg.String() <= "9":
 			n := int(msg.String()[0] - '0')
-			m.mu.RLock()
-			inRange := n <= len(m.convoys)
-			m.mu.RUnlock()
-			if inRange {
-				m.mu.Lock()
+			m.mu.Lock()
+			if n <= len(m.convoys) {
 				m.jumpToConvoyLocked(n - 1)
-				m.mu.Unlock()
 			}
+			m.mu.Unlock()
 			return m, nil
 		}
 	}
@@ -389,7 +393,7 @@ func (m *Model) jumpToConvoyLocked(convoyIdx int) {
 }
 
 // View renders the model.
-// Acquires read lock to safely iterate m.convoys.
+// Acquires read lock to safely access all View-visible fields.
 func (m *Model) View() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
