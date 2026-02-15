@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -24,6 +25,11 @@ var (
 	ErrNotRunning     = errors.New("witness not running")
 	ErrAlreadyRunning = errors.New("witness already running")
 )
+
+// configMu serializes role config resolution across concurrent witness starts.
+// config.ResolveRoleAgentConfig loads rig-specific agents into a global registry;
+// concurrent calls for different rigs would corrupt each other's lookups.
+var configMu sync.Mutex
 
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
@@ -119,21 +125,28 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 
 	// Ensure runtime settings exist in the shared witness parent directory.
 	// Settings are passed to Claude Code via --settings flag.
+	//
+	// configMu serializes this section: ResolveRoleAgentConfig loads
+	// rig-specific agents into a global registry, and concurrent calls
+	// for different rigs would see each other's agents. The mutex ensures
+	// each rig resolves its config atomically.
 	townRoot := m.townRoot()
+	configMu.Lock()
 	runtimeConfig := config.ResolveRoleAgentConfig("witness", townRoot, m.rig.Path)
 	witnessSettingsDir := config.RoleSettingsDir("witness", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(witnessSettingsDir, witnessDir, "witness", runtimeConfig); err != nil {
+		configMu.Unlock()
 		return fmt.Errorf("ensuring runtime settings: %w", err)
+	}
+	roleConfig, err := m.roleConfig()
+	configMu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(witnessDir); err != nil {
 		fmt.Printf("Warning: could not update witness .gitignore: %v\n", err)
-	}
-
-	roleConfig, err := m.roleConfig()
-	if err != nil {
-		return err
 	}
 
 	// Build startup command first
