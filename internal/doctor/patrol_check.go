@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -428,7 +429,7 @@ func isLikelyGastownRepo(repoRoot string) (bool, error) {
 		return false, err
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "//") {
