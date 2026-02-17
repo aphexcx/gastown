@@ -53,6 +53,11 @@ type StartOptions struct {
 
 	// AgentOverride specifies an alternate agent alias (e.g., for testing).
 	AgentOverride string
+
+	// ResumeSessionID resumes a previous agent session instead of starting fresh.
+	// "last" means resume the most recent session (--resume with no session ID).
+	// Any other non-empty value is a specific session ID to resume.
+	ResumeSessionID string
 }
 
 // validateCrewName checks that a crew name is safe and valid.
@@ -620,7 +625,11 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	address := fmt.Sprintf("%s/crew/%s", m.rig.Name, name)
 	topic := opts.Topic
 	if topic == "" {
-		topic = "start"
+		if opts.ResumeSessionID != "" {
+			topic = "resume"
+		} else {
+			topic = "start"
+		}
 	}
 	beacon := session.FormatStartupBeacon(session.BeaconConfig{
 		Recipient: address,
@@ -646,9 +655,43 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	// Build startup command (also includes env vars via 'exec env' for
 	// WaitForCommand detection — belt and suspenders with -e flags)
 	// SessionStart hook handles context loading (gt prime --hook)
-	claudeCmd, err := config.BuildCrewStartupCommandWithAgentOverride(m.rig.Name, name, m.rig.Path, beacon, opts.AgentOverride)
-	if err != nil {
-		return fmt.Errorf("building startup command: %w", err)
+	var claudeCmd string
+	if opts.ResumeSessionID != "" {
+		// Resume mode: build command without prompt, then append resume flag.
+		// No beacon is passed as prompt - the resumed session already has context.
+		// The SessionStart hook still fires and injects Gas Town metadata.
+		claudeCmd, err = config.BuildCrewStartupCommandWithAgentOverride(m.rig.Name, name, m.rig.Path, "", opts.AgentOverride)
+		if err != nil {
+			return fmt.Errorf("building resume command: %w", err)
+		}
+
+		// Determine agent preset for resume flag
+		agentName := opts.AgentOverride
+		if agentName == "" {
+			agentName = "claude"
+		}
+		preset := config.GetAgentPresetByName(agentName)
+		if preset == nil || preset.ResumeFlag == "" {
+			return fmt.Errorf("agent %q does not support session resume", agentName)
+		}
+		if preset.ResumeStyle == "subcommand" {
+			return fmt.Errorf("--resume not yet supported for subcommand-style agents (e.g., %s); use the agent's native resume mechanism", agentName)
+		}
+
+		// Append resume flag
+		if opts.ResumeSessionID == "last" {
+			// Resume most recent session (no specific ID)
+			claudeCmd += " " + preset.ResumeFlag
+		} else {
+			// Resume specific session ID
+			claudeCmd += " " + preset.ResumeFlag + " " + opts.ResumeSessionID
+		}
+	} else {
+		// Normal start: pass beacon as prompt
+		claudeCmd, err = config.BuildCrewStartupCommandWithAgentOverride(m.rig.Name, name, m.rig.Path, beacon, opts.AgentOverride)
+		if err != nil {
+			return fmt.Errorf("building startup command: %w", err)
+		}
 	}
 
 	// For interactive/refresh mode, remove --dangerously-skip-permissions

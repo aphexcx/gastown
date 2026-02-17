@@ -316,6 +316,7 @@ func runCrewStart(cmd *cobra.Command, args []string) error {
 		Account:         crewAccount,
 		ClaudeConfigDir: claudeConfigDir,
 		AgentOverride:   crewAgentOverride,
+		ResumeSessionID: crewResume,
 	}
 
 	// Start each crew member in parallel
