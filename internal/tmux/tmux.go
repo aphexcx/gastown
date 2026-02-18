@@ -1973,6 +1973,12 @@ func (t *Tmux) SetTownCycleBindings(session string) error {
 	return t.SetCycleBindings(session)
 }
 
+// safePrefixRe matches the character set guaranteed by beadsPrefixRegexp in
+// internal/rig/manager.go.  Used as defense-in-depth: if rigs.json is
+// hand-edited with regex metacharacters or shell-special chars, we skip the
+// entry rather than injecting it into a grep -Eq / tmux if-shell fragment.
+var safePrefixRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,19}$`)
+
 // sessionPrefixPattern returns a grep -Eq pattern that matches any registered
 // Gas Town session name.  The pattern is built dynamically from rigs.json
 // (via config.AllRigPrefixes) so that rigs beyond gastown/hq are recognized.
@@ -1985,7 +1991,9 @@ func sessionPrefixPattern() string {
 	townRoot := os.Getenv("GT_ROOT")
 	if townRoot != "" {
 		for _, p := range config.AllRigPrefixes(townRoot) {
-			seen[p] = true
+			if safePrefixRe.MatchString(p) {
+				seen[p] = true
+			}
 		}
 	}
 	sorted := make([]string, 0, len(seen))
