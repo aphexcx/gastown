@@ -197,11 +197,19 @@ type socketGroup struct {
 	Sessions []*AgentSession
 }
 
+// tmuxSocketDir returns the directory where tmux stores its socket files.
+// tmux uses /tmp/tmux-<uid>/ regardless of TMPDIR on most platforms, since
+// it needs a world-accessible path. os.TempDir() returns $TMPDIR on macOS
+// (/var/folders/...) which is wrong for tmux socket discovery.
+func tmuxSocketDir() string {
+	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
+}
+
 // findTestSockets scans the tmux socket directory for active gt-test-* sockets.
 // These sockets are created by TestMain in packages that need tmux isolation.
 // Only sockets with a running tmux server (i.e., ListSessions succeeds) are returned.
 func findTestSockets() []string {
-	socketDir := filepath.Join(os.TempDir(), fmt.Sprintf("tmux-%d", os.Getuid()))
+	socketDir := tmuxSocketDir()
 	entries, err := os.ReadDir(socketDir)
 	if err != nil {
 		return nil

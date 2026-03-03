@@ -93,7 +93,7 @@ func TestAutoRespawnHook_RespawnWorks(t *testing.T) {
 	testSession(t, socket, session, "sleep 2")
 	defer func() { _ = exec.Command("tmux", "-L", socket, "kill-session", "-t", session).Run() }()
 
-	tmx := NewTmux()
+	tmx := NewTmuxWithSocket(socket)
 	if err := tmx.SetAutoRespawnHook(session); err != nil {
 		t.Fatalf("SetAutoRespawnHook: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestAutoRespawnHook_SkipsAlreadyAlive(t *testing.T) {
 	testSession(t, socket, session, "sleep 300")
 	defer func() { _ = exec.Command("tmux", "-L", socket, "kill-session", "-t", session).Run() }()
 
-	tmx := NewTmux()
+	tmx := NewTmuxWithSocket(socket)
 	if err := tmx.SetAutoRespawnHook(session); err != nil {
 		t.Fatalf("SetAutoRespawnHook: %v", err)
 	}

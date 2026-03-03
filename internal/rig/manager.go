@@ -1206,52 +1206,6 @@ func detectBeadsPrefixFromConfig(configPath string) string {
 		}
 	}
 
-	// Fallback: try to detect prefix from existing issues in issues.jsonl
-	// Parse multiple lines and only consider regular issue IDs (5-char hashes)
-	// to avoid misdetecting agent beads like "gt-demo-witness" as prefix "gt-demo".
-	beadsDir := filepath.Dir(configPath)
-	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
-	if issuesData, err := os.ReadFile(issuesPath); err == nil {
-		issuesLines := strings.Split(string(issuesData), "\n")
-		var detectedPrefix string
-		for _, line := range issuesLines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			// Look for "id":"<prefix>-<hash>" pattern
-			if idx := strings.Index(line, `"id":"`); idx != -1 {
-				start := idx + 6 // len(`"id":"`)
-				if end := strings.Index(line[start:], `"`); end != -1 {
-					issueID := line[start : start+end]
-					// Only consider IDs with a 5-char alphanumeric hash suffix
-					// (standard bead format). This filters out agent beads
-					// (gt-demo-witness), merge requests (gt-mr-abc1234567),
-					// and other multi-hyphen IDs.
-					if dashIdx := strings.LastIndex(issueID, "-"); dashIdx > 0 {
-						hash := issueID[dashIdx+1:]
-						if !isStandardBeadHash(hash) {
-							continue
-						}
-						prefix := issueID[:dashIdx]
-						if !isValidBeadsPrefix(prefix) {
-							continue
-						}
-						if detectedPrefix == "" {
-							detectedPrefix = prefix
-						} else if detectedPrefix != prefix {
-							// Conflicting prefixes — can't determine reliably
-							return ""
-						}
-					}
-				}
-			}
-		}
-		if detectedPrefix != "" {
-			return detectedPrefix
-		}
-	}
-
 	return ""
 }
 
