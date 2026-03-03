@@ -8,6 +8,10 @@
 {"issue_id":"gt-3hki","label":"gt:message"}
 {"issue_id":"gt-3hki","label":"plugin:dolt-backup"}
 {"issue_id":"gt-3hki","label":"result:skip"}
+{"issue_id":"gt-3vr5","label":"api"}
+{"issue_id":"gt-3vr5","label":"heartbeat"}
+{"issue_id":"gt-3vr5","label":"witness"}
+{"issue_id":"gt-3vr5","label":"zfc"}
 {"issue_id":"gt-4d7p","label":"zfc-violation"}
 {"issue_id":"gt-4k12","label":"zfc-violation"}
 {"issue_id":"gt-4unmo","label":"worker-lifecycle"}
