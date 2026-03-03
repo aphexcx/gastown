@@ -1,0 +1,16 @@
+{"issue_id":"gt-3u0em","label":"gt:merge-request"}
+{"issue_id":"gt-9y24p","label":"gt:merge-request"}
+{"issue_id":"gt-gastown-crew-cog","label":"gt:agent"}
+{"issue_id":"gt-gastown-refinery","label":"backoff-until:1772177752"}
+{"issue_id":"gt-gastown-refinery","label":"gt:agent"}
+{"issue_id":"gt-gastown-refinery","label":"idle:6"}
+{"issue_id":"gt-gastown-witness","label":"agent_state:running"}
+{"issue_id":"gt-gastown-witness","label":"backoff-until:1772241111"}
+{"issue_id":"gt-gastown-witness","label":"gt:agent"}
+{"issue_id":"gt-gastown-witness","label":"idle:3"}
+{"issue_id":"gt-mol-1nf8m","label":"idle:1"}
+{"issue_id":"gt-mol-el5ge","label":"idle:1"}
+{"issue_id":"gt-mol-uclcx","label":"idle:1"}
+{"issue_id":"gt-rig-gastown","label":"idle:0"}
+{"issue_id":"gt-rp6ua","label":"gt:test-failure"}
+{"issue_id":"gt-wisp-4vk5m1","label":"idle:3"}
