@@ -54,13 +54,15 @@ func TestNewSessionWithCommand_ExecEnvBadBinary(t *testing.T) {
 }
 
 // TestNewSessionWithCommand_Success verifies a valid command runs and produces output.
+// Uses a command that stays alive past checkSessionAfterCreate's 50ms health window
+// so the pane is capturable before the session is torn down.
 func TestNewSessionWithCommand_Success(t *testing.T) {
 	tm := newTestTmux(t)
 	session := "gt-test-success-" + t.Name()
 	_ = tm.KillSession(session)
 	defer func() { _ = tm.KillSession(session) }()
 
-	err := tm.NewSessionWithCommand(session, "", `echo "SESSION_OK"`)
+	err := tm.NewSessionWithCommand(session, "", `sh -c 'echo "SESSION_OK"; sleep 2'`)
 	if err != nil {
 		t.Fatalf("NewSessionWithCommand failed: %v", err)
 	}

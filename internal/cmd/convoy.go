@@ -26,11 +26,12 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-// generateShortID generates a convoy ID suffix using base36 (matching beads' ID scheme).
-// 5 chars of base36 supports ~60M possible values — more than enough for convoys.
+// generateShortID generates a convoy ID suffix using base32 (Crockford lowercase).
+// 8 chars of base32 supports ~1T possible values — more than enough for convoys.
+// Alphabet: a-z, 2-7 (32 chars, no ambiguous 0/O or 1/I/l).
 func generateShortID() string {
-	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
-	b := make([]byte, 5)
+	const alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	for i := range b {
 		b[i] = alphabet[int(b[i])%len(alphabet)]

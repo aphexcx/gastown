@@ -414,3 +414,8 @@ required = true
 description = "Additional context: constraints, related code, prior decisions, linked beads"
 required = false
 default = ""
+
+[vars.review_id]
+description = "Unique review session ID computed at spawn time (e.g. timestamp or bead ID)"
+required = false
+default = ""
