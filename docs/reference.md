@@ -2,40 +2,7 @@
 
 Technical reference for Gas Town internals. Read the README first.
 
-## Directory Structure
-
-```
-~/gt/                           Town root
-├── .beads/                     Town-level beads (hq-* prefix)
-├── CLAUDE.md                   Identity anchor (run gt prime)
-├── mayor/                      Mayor agent home (town coordinator)
-│   ├── town.json               Town configuration
-│   └── .claude/settings.local.json  Mayor Claude settings
-├── deacon/                     Deacon agent home (background supervisor)
-│   └── .claude/settings.local.json  Deacon settings (context via gt prime)
-└── <rig>/                      Project container (NOT a git clone)
-    ├── config.json             Rig identity
-    ├── .beads/ → mayor/rig/.beads
-    ├── .repo.git/              Bare repo (shared by worktrees)
-    ├── mayor/rig/              Mayor's clone (canonical beads, NOT an agent)
-    ├── witness/                Witness agent home (monitors only)
-    ├── refinery/               Refinery agent home
-    │   └── rig/                Worktree on main
-    ├── crew/                   Crew parent
-    │   └── <name>/             Human workspaces (worktrees)
-    └── polecats/               Polecats parent
-        └── <name>/<rigname>/   Worker worktrees
-```
-
-**Key points:**
-
-- Only `~/gt/CLAUDE.md` exists on disk — a minimal identity anchor
-- No per-directory CLAUDE.md or AGENTS.md — full context comes from `gt prime` via SessionStart hook
-- Settings use `settings.local.json` at each agent's working directory
-- Rig root is a container, not a clone
-- `.repo.git/` is bare — refinery and polecats are worktrees
-- Per-rig `mayor/rig/` holds canonical `.beads/`, others inherit via redirect
-- Per-rig `mayor/rig/` is just a source clone, NOT an agent directory
+> For directory structure details, see [architecture.md](design/architecture.md).
 
 ## Beads Routing
 
@@ -218,75 +185,26 @@ with = "macro-formula"
 
 ## Molecule Lifecycle
 
-```
-Formula (source TOML) ─── "Ice-9"
-    │
-    ▼ bd cook
-Protomolecule (frozen template) ─── Solid
-    │
-    ├─▶ bd mol pour ──▶ Mol (persistent) ─── Liquid ──▶ bd squash ──▶ Digest
-    │
-    └─▶ bd mol wisp ──▶ Wisp (ephemeral) ─── Vapor ──┬▶ bd squash ──▶ Digest
-                                                  └▶ bd burn ──▶ (gone)
-```
+> For the full lifecycle diagram and detailed command reference, see [concepts/molecules.md](concepts/molecules.md).
 
-**Note**: Wisps are stored in `.beads/` with an ephemeral flag - they're not
-persisted to JSONL. They exist only in memory during execution.
+**Summary**: Formula (TOML) --`bd cook`--> Protomolecule --`bd mol pour`--> Mol (persistent) or Wisp (ephemeral) --`bd squash`--> Digest.
 
-## Molecule Commands
-
-**Principle**: `bd` = beads data operations, `gt` = agent operations.
-
-### Beads Operations (bd)
-
-```bash
-# Formulas
-bd formula list              # Available formulas
-bd formula show <name>       # Formula details
-bd cook <formula>            # Formula → Proto
-
-# Molecules (data operations)
-bd mol list                  # Available protos
-bd mol show <id>             # Proto details
-bd mol pour <proto>          # Create mol
-bd mol wisp <proto>          # Create wisp
-bd mol bond <proto> <parent> # Attach to existing mol
-bd mol squash <id>           # Condense to digest (explicit ID)
-bd mol burn <id>             # Discard wisp (explicit ID)
-```
-
-### Agent Operations (gt)
-
-```bash
-# Hook management (operates on current agent's hook)
-gt hook                    # What's on MY hook
-gt mol current               # What should I work on next
-gt mol progress <id>         # Execution progress of molecule
-gt mol attach <bead> <mol>   # Pin molecule to bead
-gt mol detach <bead>         # Unpin molecule from bead
-gt mol attach-from-mail <id> # Attach from mail message
-
-# Agent lifecycle (operates on agent's attached molecule)
-gt mol burn                  # Burn attached molecule (no ID needed)
-gt mol squash                # Squash attached molecule (no ID needed)
-gt mol step done <step>      # Complete a molecule step
-```
-
-**Key distinction**: `bd mol burn/squash <id>` take explicit molecule IDs.
-`gt mol burn/squash` operate on the current agent's attached molecule
-(auto-detected from working directory).
+| Operation | bd (data) | gt (agent) |
+|-----------|-----------|------------|
+| Cook/pour/wisp | `bd cook`, `bd mol pour/wisp` | — |
+| Squash/burn | `bd mol squash/burn <id>` | `gt mol squash/burn` (attached) |
+| Navigate | `bd mol current`, `bd mol show` | `gt hook`, `gt mol current` |
+| Attach | — | `gt mol attach/detach` |
 
 ## Agent Lifecycle
 
 ### Polecat Shutdown
 
 ```
-1. Complete work steps
-2. gt mol squash (create digest)
-3. Submit to merge queue
-4. gt handoff (request shutdown)
-5. Wait for Witness to kill session
-6. Witness removes worktree + branch
+1. Work through formula checklist (shown inline by gt prime)
+2. Submit to merge queue via gt done
+3. gt done nukes sandbox and exits
+4. Witness removes worktree + branch
 ```
 
 ### Session Cycling
@@ -687,10 +605,10 @@ Deacon, Witness, and Refinery run continuous patrol loops using wisps:
 | **Refinery** | `mol-refinery-patrol` | Process merge queue, review MRs, check integration branches |
 
 ```
-1. bd mol wisp mol-<role>-patrol
-2. Execute steps (check workers, process queue, run plugins)
-3. gt mol squash --jitter 10s (or burn if routine)
-4. Loop
+1. gt patrol new               # Create root-only wisp
+2. gt prime                    # Shows patrol checklist inline
+3. Work through each step
+4. gt patrol report --summary "..."  # Close + start next cycle
 ```
 
 ## Plugin Molecules
@@ -761,12 +679,4 @@ bd formula list          # Lists formulas by type
 | Stuck worker | `gt nudge`, then `gt peek` |
 | Dirty git state | Commit or discard, then `gt handoff` |
 
-## Architecture Notes
-
-**Bare repo pattern**: `.repo.git/` is bare (no working dir). Refinery and polecats are worktrees sharing refs. Polecat branches visible to refinery immediately.
-
-**Beads as control plane**: No separate orchestrator. Molecule steps ARE beads issues. State transitions are git commits.
-
-**Nondeterministic idempotence**: Any worker can continue any molecule. Steps are atomic checkpoints in beads.
-
-**Convoy tracking**: Convoys track batched work across rigs. A "swarm" is ephemeral - just the workers currently on a convoy's issues. See [Convoys](concepts/convoy.md) for details.
+> For architecture details (bare repo pattern, beads as control plane, nondeterministic idempotence), see [architecture.md](design/architecture.md).

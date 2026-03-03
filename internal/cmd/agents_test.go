@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestAgentsCmd_DefaultRunE(t *testing.T) {
@@ -561,7 +562,7 @@ func TestFindTestSockets_Integration(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
-		socketPath := filepath.Join(fmt.Sprintf("/tmp/tmux-%d", os.Getuid()), socketName)
+		socketPath := filepath.Join(tmux.SocketDir(), socketName)
 		_ = os.Remove(socketPath)
 	})
 

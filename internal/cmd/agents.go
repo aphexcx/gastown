@@ -197,19 +197,11 @@ type socketGroup struct {
 	Sessions []*AgentSession
 }
 
-// tmuxSocketDir returns the directory where tmux stores its socket files.
-// tmux uses /tmp/tmux-<uid>/ regardless of TMPDIR on most platforms, since
-// it needs a world-accessible path. os.TempDir() returns $TMPDIR on macOS
-// (/var/folders/...) which is wrong for tmux socket discovery.
-func tmuxSocketDir() string {
-	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
-}
-
 // findTestSockets scans the tmux socket directory for active gt-test-* sockets.
 // These sockets are created by TestMain in packages that need tmux isolation.
 // Only sockets with a running tmux server (i.e., ListSessions succeeds) are returned.
 func findTestSockets() []string {
-	socketDir := tmuxSocketDir()
+	socketDir := tmux.SocketDir()
 	entries, err := os.ReadDir(socketDir)
 	if err != nil {
 		return nil
@@ -242,10 +234,20 @@ func findTestSockets() []string {
 // active test sockets (gt-test-*) when integration tests are running.
 func getAllSocketSessions(includePolecats bool) []socketGroup {
 	townSocket := tmux.GetDefaultSocket()
+
+	// When gt agents menu is invoked via a tmux binding from a non-town
+	// directory (e.g. a personal session), workspace.FindFromCwd fails in
+	// persistentPreRun, InitRegistry is never called, and GetDefaultSocket
+	// returns "". Fall back to GT_TOWN_SOCKET, which EnsureBindingsOnSocket
+	// embeds in the binding command at gt-up time.
+	if townSocket == "" {
+		townSocket = os.Getenv("GT_TOWN_SOCKET")
+	}
+
 	var groups []socketGroup
 
 	// Town socket: GT agent sessions
-	townTmux := tmux.NewTmux() // uses default (town) socket
+	townTmux := tmux.NewTmuxWithSocket(townSocket) // explicit socket avoids default-socket ambiguity
 	if sessions, err := townTmux.ListSessions(); err == nil && len(sessions) > 0 {
 		agents := filterAndSortSessions(sessions, includePolecats)
 		for _, a := range agents {
@@ -285,7 +287,9 @@ func getAllSocketSessions(includePolecats bool) []socketGroup {
 		if err != nil || len(sessions) == 0 {
 			continue
 		}
-		_ = tmux.EnsureBindingsOnSocket(sock)
+		// Test sockets: InitRegistry is already called (we're in a gt process),
+		// so townSocket is not needed here.
+		_ = tmux.EnsureBindingsOnSocket(sock, "")
 
 		for _, name := range sessions {
 			allTestSessions = append(allTestSessions, &AgentSession{
@@ -763,13 +767,13 @@ func guessSessionFromWorkerDir(workerDir, townRoot string) string {
 	workerName := parts[2]
 
 	switch workerType {
-	case "crew":
+	case constants.RoleCrew:
 		return session.CrewSessionName(session.PrefixFor(rig), workerName)
 	case "polecats":
 		return session.PolecatSessionName(session.PrefixFor(rig), workerName)
-	case "witness":
+	case constants.RoleWitness:
 		return session.WitnessSessionName(session.PrefixFor(rig))
-	case "refinery":
+	case constants.RoleRefinery:
 		return session.RefinerySessionName(session.PrefixFor(rig))
 	}
 

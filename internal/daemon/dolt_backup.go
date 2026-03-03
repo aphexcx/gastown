@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 const (
@@ -34,6 +36,10 @@ func (d *Daemon) syncDoltBackups() {
 		return
 	}
 
+	// Pour molecule for observability (nil-safe — all methods are no-ops on nil).
+	mol := d.pourDogMolecule(constants.MolDogBackup, nil)
+	defer mol.close()
+
 	// Resolve data dir: use DoltServerManager if available, else conventional path.
 	var dataDir string
 	if d.doltServer != nil && d.doltServer.IsEnabled() && d.doltServer.config.DataDir != "" {
@@ -43,6 +49,7 @@ func (d *Daemon) syncDoltBackups() {
 	}
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
 		d.logger.Printf("dolt_backup: data dir %s does not exist, skipping", dataDir)
+		mol.failStep("sync", "data dir does not exist")
 		return
 	}
 
@@ -54,16 +61,19 @@ func (d *Daemon) syncDoltBackups() {
 
 	if len(databases) == 0 {
 		d.logger.Printf("dolt_backup: no databases with backup remotes found")
+		mol.failStep("sync", "no databases with backup remotes")
 		return
 	}
 
 	d.logger.Printf("dolt_backup: syncing %d database(s)", len(databases))
 
 	synced := 0
+	var failures []string
 	for _, db := range databases {
 		backupName := db + "-backup"
 		if err := d.syncBackup(dataDir, db, backupName); err != nil {
 			d.logger.Printf("dolt_backup: %s: sync failed: %v", db, err)
+			failures = append(failures, db)
 		} else {
 			synced++
 		}
@@ -71,11 +81,22 @@ func (d *Daemon) syncDoltBackups() {
 
 	d.logger.Printf("dolt_backup: synced %d/%d database(s)", synced, len(databases))
 
+	if len(failures) > 0 {
+		mol.failStep("sync", fmt.Sprintf("synced %d/%d, failures: %s", synced, len(databases), strings.Join(failures, "; ")))
+	} else {
+		mol.closeStep("sync")
+	}
+
 	// Offsite sync: rsync local backups to iCloud Drive for cloud replication.
 	// This is a stopgap until proper dolt remote push is configured.
 	if synced > 0 {
 		d.syncOffsiteBackup()
+		mol.closeStep("offsite")
+	} else {
+		mol.closeStep("offsite")
 	}
+
+	mol.closeStep("report")
 }
 
 // syncBackup runs `dolt backup sync <backup-name>` for a single database.

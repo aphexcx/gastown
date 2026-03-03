@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -131,6 +132,16 @@ type DoltServerManager struct {
 	// Identity verification state
 	lastIdentityCheck time.Time // Last time we ran the database identity check
 
+	// Health check warnings (Option B throttling for doctor molecule).
+	// Populated by checkHealthLocked(), consumed by Daemon.ensureDoltServerRunning().
+	lastWarnings []string // Warnings from the most recent health check
+
+	// onRecoveryFn is called (in a goroutine) when the Dolt server transitions
+	// from unhealthy back to healthy, i.e., when the DOLT_UNHEALTHY signal file
+	// is cleared after having been present. Set by SetRecoveryCallback.
+	// Protected by mu.
+	onRecoveryFn func()
+
 	// Test hooks (nil = use real implementations; set only in tests)
 	healthCheckFn      func() error
 	writeProbeCheckFn  func() error
@@ -159,6 +170,15 @@ func NewDoltServerManager(townRoot string, config *DoltServerConfig, logger func
 	}
 }
 
+// SetRecoveryCallback registers fn to be called (in a goroutine) whenever Dolt
+// transitions from unhealthy back to healthy. Only the most recently registered
+// callback is used. Pass nil to clear the callback.
+func (m *DoltServerManager) SetRecoveryCallback(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onRecoveryFn = fn
+}
+
 func (m *DoltServerManager) now() time.Time {
 	if m.nowFn != nil {
 		return m.nowFn()
@@ -175,8 +195,13 @@ func (m *DoltServerManager) doSleep(d time.Duration) {
 }
 
 // pidFile returns the path to the Dolt server PID file.
+// Production (port 3307) uses the canonical "dolt.pid" for compatibility with
+// gt dolt start/stop. Other ports get a port-specific name to avoid collisions.
 func (m *DoltServerManager) pidFile() string {
-	return filepath.Join(m.townRoot, "daemon", "dolt.pid")
+	if m.config.Port == 3307 {
+		return filepath.Join(m.townRoot, "daemon", "dolt.pid")
+	}
+	return filepath.Join(m.townRoot, "daemon", fmt.Sprintf("dolt-%d.pid", m.config.Port))
 }
 
 // IsEnabled returns whether Dolt server management is enabled.
@@ -294,51 +319,43 @@ func (m *DoltServerManager) isRunning() (int, bool) {
 		m.process = nil
 	}
 
-	// Check PID file
-	data, err := os.ReadFile(m.pidFile())
-	if err != nil {
+	// Check PID file with nonce-based ownership verification
+	pid, alive, err := verifyPIDOwnership(m.pidFile())
+	if err != nil || pid == 0 {
 		return 0, false
 	}
 
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, false
-	}
-
-	// Verify process is alive and is dolt
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return 0, false
-	}
-
-	if !isProcessAlive(process) {
+	if !alive {
 		// Process not running, clean up stale PID file
 		_ = os.Remove(m.pidFile())
 		return 0, false
 	}
 
-	// Verify it's actually dolt sql-server
-	if !isDoltSqlServer(pid) {
+	// Verify it's actually our dolt server by checking port connectivity.
+	// More reliable than ps string matching (ZFC fix: gt-utuk).
+	if !m.isDoltServerOnPort() {
 		_ = os.Remove(m.pidFile())
 		return 0, false
 	}
 
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return 0, false
+	}
 	m.process = process
 	return pid, true
 }
 
-// isDoltSqlServer checks if a PID is actually a dolt sql-server process.
-func isDoltSqlServer(pid int) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "command=")
-	output, err := cmd.Output()
+// isDoltServerOnPort checks if the configured dolt port is accepting connections.
+// More reliable than ps string matching for process identity verification.
+func (m *DoltServerManager) isDoltServerOnPort() bool {
+	addr := net.JoinHostPort(m.config.Host, strconv.Itoa(m.config.Port))
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return false
 	}
-
-	cmdline := strings.TrimSpace(string(output))
-	return strings.Contains(cmdline, "dolt") && strings.Contains(cmdline, "sql-server")
+	conn.Close()
+	return true
 }
 
 // EnsureRunning ensures the Dolt server is running.
@@ -697,8 +714,13 @@ func sendDoltAlertToWitnesses(townRoot, subject, body string, logger func(format
 
 // unhealthySignalFile returns the path to the DOLT_UNHEALTHY signal file.
 // Witness patrols can check for this file to detect degraded Dolt state.
+// Production (port 3307) uses the canonical name; other ports get a suffix
+// so multiple instances don't clobber each other's signal files.
 func (m *DoltServerManager) unhealthySignalFile() string {
-	return filepath.Join(m.townRoot, "daemon", "DOLT_UNHEALTHY")
+	if m.config.Port == 3307 {
+		return filepath.Join(m.townRoot, "daemon", "DOLT_UNHEALTHY")
+	}
+	return filepath.Join(m.townRoot, "daemon", fmt.Sprintf("DOLT_UNHEALTHY_%d", m.config.Port))
 }
 
 // writeUnhealthySignal writes the DOLT_UNHEALTHY signal file.
@@ -712,8 +734,18 @@ func (m *DoltServerManager) writeUnhealthySignal(reason, detail string) {
 }
 
 // clearUnhealthySignal removes the DOLT_UNHEALTHY signal file when the server is healthy.
+// If the signal file was present (meaning Dolt was previously unhealthy), it fires the
+// onRecoveryFn callback in a goroutine to trigger a convoy recovery sweep.
+// Must be called with mu held (onRecoveryFn is protected by mu).
 func (m *DoltServerManager) clearUnhealthySignal() {
-	_ = os.Remove(m.unhealthySignalFile())
+	signalFile := m.unhealthySignalFile()
+	_, wasUnhealthy := os.Stat(signalFile)
+	_ = os.Remove(signalFile)
+	// Transition detected: was unhealthy, now healthy — fire recovery callback.
+	if wasUnhealthy == nil && m.onRecoveryFn != nil {
+		fn := m.onRecoveryFn
+		go fn()
+	}
 }
 
 // IsDoltUnhealthy checks if the DOLT_UNHEALTHY signal file exists.
@@ -796,8 +828,8 @@ func (m *DoltServerManager) startLocked() error {
 	m.process = cmd.Process
 	m.startedAt = time.Now()
 
-	// Write PID file
-	if err := os.WriteFile(m.pidFile(), []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
+	// Write PID file with nonce for ownership verification
+	if _, err := writePIDFile(m.pidFile(), cmd.Process.Pid); err != nil {
 		m.logger("Warning: failed to write PID file: %v", err)
 	}
 
@@ -905,7 +937,11 @@ func (m *DoltServerManager) checkHealth() error {
 // Performs a connectivity check (SELECT active_branch()) with latency measurement, and logs
 // warnings for degraded resource conditions (high latency, high connection count,
 // disk usage). Returns an error only if the server is unreachable.
+// Warnings are collected in m.lastWarnings for Option B throttling: the daemon
+// pours a mol-dog-doctor molecule only when anomalies are detected.
 func (m *DoltServerManager) checkHealthLocked() error {
+	m.lastWarnings = nil // Reset warnings each check cycle.
+
 	if m.healthCheckFn != nil {
 		return m.healthCheckFn()
 	}
@@ -928,21 +964,50 @@ func (m *DoltServerManager) checkHealthLocked() error {
 
 	latency := time.Since(start)
 	if latency > 1*time.Second {
-		m.logger("Warning: Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
+		w := fmt.Sprintf("Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
 	}
 
 	// 2. Connection count (best-effort, non-fatal)
-	m.checkConnectionCount()
+	if w := m.checkConnectionCount(); w != "" {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
 
 	// 3. Disk space (best-effort, non-fatal)
-	m.checkDiskUsage()
+	if w := m.checkDiskUsage(); w != "" {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
+
+	// 4. Database count (best-effort, non-fatal) — orphan detection
+	if w := m.checkDatabaseCount(); w != "" {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
+
+	// 5. Backup freshness (best-effort, non-fatal)
+	for _, w := range m.checkBackupFreshness() {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
 
 	return nil
 }
 
-// checkConnectionCount queries the connection count and logs a warning if approaching the limit.
-// Non-fatal: failures are silently ignored.
-func (m *DoltServerManager) checkConnectionCount() {
+// LastWarnings returns warnings from the most recent health check.
+// Used by the Daemon for Option B throttling: only pour a mol-dog-doctor
+// molecule when anomalies are detected.
+func (m *DoltServerManager) LastWarnings() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastWarnings
+}
+
+// checkConnectionCount queries the connection count and returns a warning if approaching the limit.
+// Non-fatal: failures return empty string.
+func (m *DoltServerManager) checkConnectionCount() string {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 	cmd := m.buildDoltSQLCmd(ctx,
@@ -952,33 +1017,34 @@ func (m *DoltServerManager) checkConnectionCount() {
 
 	output, err := cmd.Output()
 	if err != nil {
-		return // non-fatal
+		return "" // non-fatal
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) < 2 {
-		return
+		return ""
 	}
 	count, err := strconv.Atoi(strings.TrimSpace(lines[len(lines)-1]))
 	if err != nil {
-		return
+		return ""
 	}
 
 	// Use the doltserver package default (50) as a reasonable cap reference
 	maxConn := 50
 	threshold := (maxConn * 80) / 100
 	if count >= threshold {
-		m.logger("Warning: Dolt connection count %d is at %d%% of max %d — approaching limit",
+		return fmt.Sprintf("Dolt connection count %d is at %d%% of max %d — approaching limit",
 			count, (count*100)/maxConn, maxConn)
 	}
+	return ""
 }
 
-// checkDiskUsage checks disk usage of the data directory and logs a warning
-// if it exceeds 1 GB. Non-fatal: failures are silently ignored.
-func (m *DoltServerManager) checkDiskUsage() {
+// checkDiskUsage checks disk usage of the data directory and returns a warning
+// if it exceeds 1 GB. Non-fatal: failures return empty string.
+func (m *DoltServerManager) checkDiskUsage() string {
 	dataDir := m.config.DataDir
 	if dataDir == "" {
-		return
+		return ""
 	}
 
 	var total int64
@@ -994,8 +1060,88 @@ func (m *DoltServerManager) checkDiskUsage() {
 
 	const gb = 1024 * 1024 * 1024
 	if total > gb {
-		m.logger("Warning: Dolt data directory %s is %.1f GB", dataDir, float64(total)/float64(gb))
+		return fmt.Sprintf("Dolt data directory %s is %.1f GB", dataDir, float64(total)/float64(gb))
 	}
+	return ""
+}
+
+// checkDatabaseCount queries the database list and returns a warning if the count exceeds
+// what's expected based on the data directory contents. Non-fatal: failures return empty string.
+// The expected count is derived from subdirectories in the data dir (each is a registered DB).
+func (m *DoltServerManager) checkDatabaseCount() string {
+	databases, err := m.getDatabases()
+	if err != nil {
+		return "" // non-fatal
+	}
+
+	// Derive expected count from data directory — each subdirectory is a database.
+	// This adapts automatically as users add/remove rigs.
+	expected := m.countDataDirDatabases()
+	if expected == 0 {
+		expected = 6 // Fallback if data dir can't be read
+	}
+
+	// Allow a small buffer (3) above expected for transient states.
+	threshold := expected + 3
+	if len(databases) > threshold {
+		return fmt.Sprintf("%d databases detected (expected ~%d, threshold %d) — possible orphan/test database accumulation: %v",
+			len(databases), expected, threshold, databases)
+	}
+	return ""
+}
+
+// countDataDirDatabases counts subdirectories in the Dolt data directory.
+// Each subdirectory corresponds to a registered database.
+func (m *DoltServerManager) countDataDirDatabases() int {
+	dataDir := m.config.DataDir
+	if dataDir == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			count++
+		}
+	}
+	return count
+}
+
+// checkBackupFreshness checks if Dolt backups are fresh. Returns warnings for any configured
+// backup database that hasn't been synced in over 2 hours. Non-fatal: failures return nil.
+func (m *DoltServerManager) checkBackupFreshness() []string {
+	backupDir := filepath.Join(m.townRoot, ".dolt-backup")
+	info, err := os.Stat(backupDir)
+	if err != nil || !info.IsDir() {
+		return nil // No backup directory — backup patrol may not be configured
+	}
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return nil
+	}
+
+	const staleThreshold = 2 * time.Hour
+	now := time.Now()
+	var warnings []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dbInfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		age := now.Sub(dbInfo.ModTime())
+		if age > staleThreshold {
+			warnings = append(warnings, fmt.Sprintf("Dolt backup %q is %.0f minutes old (threshold %.0fm) — backup patrol may be stalled",
+				entry.Name(), age.Minutes(), staleThreshold.Minutes()))
+		}
+	}
+	return warnings
 }
 
 // checkWriteHealthLocked probes the Dolt server's write capability by attempting
@@ -1229,73 +1375,59 @@ func (m *DoltServerManager) getDoltVersion() (string, error) {
 }
 
 // listDatabases returns the list of databases in the Dolt server.
+// Delegates to doltserver.ListDatabases which caches results and deduplicates
+// concurrent queries to avoid the thundering herd problem (GH#2180).
 func (m *DoltServerManager) listDatabases() ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
-	defer cancel()
-	cmd := m.buildDoltSQLCmd(ctx,
-		"-r", "json",
-		"-q", "SHOW DATABASES",
-	)
-
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse JSON output
-	var result struct {
-		Rows []struct {
-			Database string `json:"Database"`
-		} `json:"rows"`
-	}
-
-	if err := json.Unmarshal(output, &result); err != nil {
-		// Fall back to line parsing
-		var databases []string
-		for _, line := range strings.Split(string(output), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && line != "Database" && !strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "|") {
-				databases = append(databases, line)
-			}
-		}
-		return databases, nil
-	}
-
-	var databases []string
-	for _, row := range result.Rows {
-		if row.Database != "" && !doltserver.IsSystemDatabase(row.Database) {
-			databases = append(databases, row.Database)
-		}
-	}
-	return databases, nil
+	return doltserver.ListDatabases(m.townRoot)
 }
 
 // CountDoltServers returns the count of running dolt sql-server processes.
+// Uses lsof-based listener discovery instead of pgrep string matching (ZFC fix: gt-fj87).
 func CountDoltServers() int {
-	cmd := exec.Command("sh", "-c", "pgrep -f 'dolt sql-server' 2>/dev/null | wc -l")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0
-	}
-	count, _ := strconv.Atoi(strings.TrimSpace(string(output)))
-	return count
+	return len(doltserver.FindAllDoltListeners())
 }
 
 // StopAllDoltServers stops all dolt sql-server processes.
 // Returns (killed, remaining).
+// Uses lsof-based discovery and direct signal delivery instead of pkill -f (ZFC fix: gt-fj87).
 func StopAllDoltServers(force bool) (int, int) {
-	before := CountDoltServers()
-	if before == 0 {
+	listeners := doltserver.FindAllDoltListeners()
+	if len(listeners) == 0 {
 		return 0, 0
 	}
 
+	// Deduplicate PIDs (one process may listen on multiple ports).
+	seen := make(map[int]bool)
+	var pids []int
+	for _, l := range listeners {
+		if !seen[l.PID] {
+			seen[l.PID] = true
+			pids = append(pids, l.PID)
+		}
+	}
+	before := len(pids)
+
+	sig := syscall.SIGTERM
 	if force {
-		_ = exec.Command("pkill", "-9", "-f", "dolt sql-server").Run()
-	} else {
-		_ = exec.Command("pkill", "-TERM", "-f", "dolt sql-server").Run()
+		sig = syscall.SIGKILL
+	}
+
+	for _, pid := range pids {
+		if p, err := os.FindProcess(pid); err == nil {
+			_ = p.Signal(sig)
+		}
+	}
+
+	if !force {
 		time.Sleep(2 * time.Second)
-		if remaining := CountDoltServers(); remaining > 0 {
-			_ = exec.Command("pkill", "-9", "-f", "dolt sql-server").Run()
+		// Check if any survived, escalate to SIGKILL.
+		remaining := doltserver.FindAllDoltListeners()
+		if len(remaining) > 0 {
+			for _, l := range remaining {
+				if p, err := os.FindProcess(l.PID); err == nil {
+					_ = p.Signal(syscall.SIGKILL)
+				}
+			}
 		}
 	}
 

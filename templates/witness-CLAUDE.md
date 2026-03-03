@@ -147,8 +147,37 @@ gt mail send {{RIG}}/refinery -s "MERGE_READY <polecat>" -m "..."
 
 ---
 
+## Swim Lane Rule: Wisp Lifecycle Boundaries
+
+🚨 **You may ONLY close wisps that YOU (the witness) created.**
+
+Wisp lifecycle management (close, delete, gc) for non-witness wisps is the
+**reaper Dog's responsibility**, NOT yours. Formula wisps, polecat work wisps,
+and any wisps created by `gt sling` or other agents are OFF LIMITS.
+
+If you see wisps that look orphaned but were NOT created by your patrol,
+**report them to Deacon — do NOT close them.** Closing foreign wisps kills
+active polecat work molecules.
+
+---
+
+## Dolt Health: Your Part
+
+Dolt is git, not Postgres. Every `bd` command and `gt mail send` generates a permanent
+Dolt commit. As a patrol agent running frequently, your impact is amplified.
+
+- **Nudge, don't mail** for routine communication. Your health check responses,
+  polecat pokes, and status updates should ALL be nudges.
+- **Only mail for protocol**: MERGE_READY, RECOVERY_NEEDED, ESCALATION.
+- **When Dolt is slow/down**: Check `gt health`, then nudge Deacon if server is
+  down. Don't restart Dolt yourself. Don't retry `bd` commands in a loop.
+- **Don't file beads about Dolt trouble** — someone is already handling it.
+
+See `docs/dolt-health-guide.md` for the full Dolt health protocol.
+
 ## Do NOT
 
+- **Close wisps you didn't create** — wisp lifecycle is the reaper Dog's job
 - **Nuke polecats with unpushed work** — always check-recovery first
 - Use `--force` without Mayor authorization
 - Kill sessions without pre-kill verification

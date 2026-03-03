@@ -7,31 +7,22 @@ import (
 	"testing"
 )
 
-// testSocket is the package-level isolated tmux socket used by all tests.
-// Set by TestMain so newTestTmux() can return a properly isolated Tmux instance.
-var testSocket string
-
-// TestMain sets up a shared isolated tmux server for the package, runs all
-// tests, then tears down the server. Using a single named socket:
-//   - isolates tests from the user's interactive tmux sessions
-//   - avoids session name collisions across packages running in parallel
-//   - ensures cleanup even if individual tests panic
+// TestMain sets up a dedicated tmux server for the package's integration tests.
+// All tests that call newTestTmux() share this isolated server, which is torn
+// down after all tests complete. This prevents test sessions from appearing on
+// the user's interactive tmux and avoids socket conflicts with other packages.
 func TestMain(m *testing.M) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		// tmux not installed; all tests that need it will self-skip via hasTmux().
-		os.Exit(m.Run())
-	}
+	socket := fmt.Sprintf("gt-test-%d", os.Getpid())
 
-	testSocket = fmt.Sprintf("gt-test-%d", os.Getpid())
-	SetDefaultSocket(testSocket)
-
-	// Start the server by creating a throwaway session.
-	_ = exec.Command("tmux", "-L", testSocket, "new-session", "-d", "-s", "bootstrap").Run()
+	// Set defaultSocket so NewTmux() connects to the test server, not the
+	// user's personal server or the sentinel that indicates "no town context".
+	SetDefaultSocket(socket)
 
 	code := m.Run()
 
-	// Tear down the entire test tmux server.
-	_ = exec.Command("tmux", "-L", testSocket, "kill-server").Run()
+	// Kill the test tmux server and restore the original socket state.
+	_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+	SetDefaultSocket("")
 
 	os.Exit(code)
 }

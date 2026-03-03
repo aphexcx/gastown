@@ -70,19 +70,14 @@ func TestPatrolFormulasHaveBackoffLogic(t *testing.T) {
 	}
 }
 
-// TestPatrolFormulasHaveSquashCycle verifies that all three patrol formulas
-// include the squash/create-wisp/hook cycle in their loop step.
+// TestPatrolFormulasHaveReportCycle verifies that all three patrol formulas
+// include `gt patrol report` in their loop step.
 //
-// Without this cycle, closed step beads accumulate across patrol cycles,
-// `bd ready` eventually returns nothing, and `findActivePatrol` can't find
-// the wisp via status=hooked on session restart.
+// The patrol report command atomically closes the current patrol wisp and
+// starts a new one, replacing the old squash+new pattern.
 //
-// Regression test for steveyegge/gastown#1371.
-//
-// Also enforces that squash uses `gt mol squash --jitter` to desynchronize
-// concurrent Dolt lock acquisitions from deacon/witness/refinery patrol agents.
-// See: hq-vytww2 (Reduce Dolt lock contention from concurrent patrol agents).
-func TestPatrolFormulasHaveSquashCycle(t *testing.T) {
+// Regression test: replaces TestPatrolFormulasHaveSquashCycle (steveyegge/gastown#1371).
+func TestPatrolFormulasHaveReportCycle(t *testing.T) {
 	type patrolFormula struct {
 		name       string
 		loopStepID string
@@ -101,7 +96,6 @@ func TestPatrolFormulasHaveSquashCycle(t *testing.T) {
 				t.Fatalf("reading %s: %v", pf.name, err)
 			}
 
-			// Parse the formula and find the loop step description
 			f, err := Parse(content)
 			if err != nil {
 				t.Fatalf("parsing %s: %v", pf.name, err)
@@ -118,25 +112,11 @@ func TestPatrolFormulasHaveSquashCycle(t *testing.T) {
 				t.Fatalf("%s: %s step not found or has empty description", pf.name, pf.loopStepID)
 			}
 
-			// The loop step must contain all parts of the cycle:
-			// 1. Squash the current wisp (using gt mol squash --jitter to reduce lock contention)
-			// 2. Create and hook a new patrol wisp via gt patrol new
-			requiredPatterns := []struct {
-				pattern string
-				reason  string
-			}{
-				{"gt mol squash", "squash current wisp using gt command (not bd) for jitter support"},
-				{"--jitter", "jitter flag required to desynchronize concurrent Dolt lock acquisitions (hq-vytww2)"},
-				{"gt patrol new", "create and hook new patrol wisp for next cycle"},
-			}
-
-			for _, rp := range requiredPatterns {
-				if !strings.Contains(loopDesc, rp.pattern) {
-					t.Errorf("%s %s step missing %q (%s)\n"+
-						"All patrol formulas must include the squash/create-wisp/hook cycle with jitter.\n"+
-						"See steveyegge/gastown#1371 (squash cycle) and hq-vytww2 (jitter requirement).",
-						pf.name, pf.loopStepID, rp.pattern, rp.reason)
-				}
+			// The loop step must use gt patrol report to close current and start next cycle
+			if !strings.Contains(loopDesc, "gt patrol report") {
+				t.Errorf("%s %s step missing \"gt patrol report\" (close current patrol and start next cycle)\n"+
+					"All patrol formulas must use gt patrol report in their loop step.",
+					pf.name, pf.loopStepID)
 			}
 		})
 	}

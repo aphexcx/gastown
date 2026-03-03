@@ -181,18 +181,6 @@ Detected: <timestamp>
 **Handler**: Deacon coordinates recovery (push branch, save work) before
 authorizing cleanup. Only escalates to Mayor if Deacon cannot resolve.
 
-### WITNESS_PING (deprecated)
-
-**Status**: Removed. Witnesses no longer send WITNESS_PING mail.
-
-**Previous behavior**: Witnesses sent heartbeat mail to the Deacon every patrol
-cycle, which spammed inboxes with routine noise.
-
-**Current behavior**: Witnesses passively check the Deacon's agent bead
-`last_activity` timestamp. If stale (>5 minutes), they escalate directly to
-the Mayor with an `ALERT: Deacon appears unresponsive` message. No routine
-heartbeat mail is sent — only escalations when a problem is detected.
-
 ### HELP
 
 **Route**: Any → escalation target (usually Mayor)
@@ -374,6 +362,73 @@ Witness-N ──┘
             ALERT to Mayor (mail only on failure)
 ```
 
+## Communication Hygiene: Mail vs Nudge
+
+Agents overuse mail for routine communication, generating permanent beads and
+Dolt commits for messages that should be ephemeral. Every `gt mail send` creates
+a wisp bead in Dolt -- a permanent record with its own commit in the git-like
+history. This is a critical pollution source.
+
+### The Two Channels
+
+**`gt nudge` (ephemeral, preferred for routine comms)**
+- Sends a message directly to an agent's tmux session
+- No beads created. No Dolt commits. Zero storage cost.
+- Message appears as a `<system-reminder>` in the agent's context
+- Suitable for: health checks, status requests, simple instructions, "wake up" signals
+- Limitation: if the target session is dead, the nudge is lost
+
+**`gt mail send` (persistent, for structured protocol messages only)**
+- Creates a bead (wisp) in the Dolt database
+- Generates at least one Dolt commit (the write)
+- Persists across session restarts -- survives agent death
+- Suitable for: HANDOFF context, MERGE_READY/MERGED protocol, escalations, HELP
+  requests, anything that MUST survive session death
+
+### The Rule
+
+**Default to `gt nudge`. Only use `gt mail send` when the message MUST survive
+the recipient's session death.**
+
+The litmus test: "If the recipient's session dies and restarts, do they need this
+message?" If yes -> mail. If no -> nudge.
+
+### Role-Specific Guidance
+
+| Role | Mail Budget | When to Mail | When to Nudge |
+|------|-------------|-------------|---------------|
+| **Polecat** | 0-1 per session | HELP/ESCALATE only (gt escalate preferred) | Everything else |
+| **Witness** | Protocol msgs only | MERGE_READY, RECOVERED_BEAD, RECOVERY_NEEDED, escalations to Mayor | Polecat health checks, status pings, nudge-and-observe |
+| **Refinery** | Protocol msgs only | MERGED, MERGE_FAILED, REWORK_REQUEST | Status updates to Witness |
+| **Deacon** | Escalations only | Escalations to Mayor, HANDOFF to self | TIMER callbacks, HEALTH_CHECK, lifecycle pokes |
+| **Dogs** | Zero | Never (results go to event beads or logs) | Report completion to Deacon via nudge |
+| **Mayor** | Strategic only | Cross-rig coordination, HANDOFF to self | Instructions to Deacon/Witness |
+
+### Why This Matters (The Commit Graph)
+
+Dolt is git under the hood. Every mail creates a Dolt commit. Over a day of
+normal operations:
+- 4 agents x 15 patrol cycles x 2 mails per cycle = 120 commits just for routine chatter
+- These commits live in the git history forever, even after mail rows are deleted
+- Rebase can remove them, but prevention is always cheaper than cleanup
+
+### Anti-Patterns
+
+**DOG_DONE as mail** -- Dogs should not mail their completion status. Use
+`gt nudge deacon/ "DOG_DONE: plugin-name success"` instead.
+
+**Duplicate escalations** -- Witnesses sending 2+ mails about the same issue
+minutes apart. Check inbox before sending: if you already sent about this topic,
+don't send again.
+
+**HANDOFF for routine cycles** -- Patrol agents (Witness, Deacon) doing routine
+handoffs should use minimal mail. If there's nothing extraordinary, just cycle --
+the next session discovers state from beads, not from mail.
+
+**Health check responses via mail** -- When Deacon sends a health check nudge, do
+NOT respond with mail. The Deacon tracks health via session status, not mail
+responses.
+
 ## Implementation
 
 ### Sending Mail
@@ -421,6 +476,86 @@ New message types follow the pattern:
 
 The protocol is intentionally simple - structured enough for parsing,
 flexible enough for human debugging.
+
+## Beads-Native Messaging
+
+Beyond direct agent-to-agent mail, the messaging system supports three bead-backed
+primitives for group and broadcast communication. All use the `hq-` prefix
+(town-level entities that span rigs).
+
+### Groups (`gt:group`)
+
+Named collections of addresses for mail distribution. Sending to a group
+delivers to all members.
+
+**Bead ID format:** `hq-group-<name>`
+
+**Member types:** direct addresses (`gastown/crew/max`), wildcard patterns
+(`*/witness`, `gastown/crew/*`), special patterns (`@town`, `@crew`,
+`@witnesses`), or nested group names.
+
+### Queues (`gt:queue`)
+
+Work queues where each message goes to exactly one claimant (unlike groups).
+
+**Bead ID format:** `hq-q-<name>` (town-level) or `gt-q-<name>` (rig-level)
+
+Fields: `status` (active/paused/closed), `max_concurrency`, `processing_order`
+(fifo/priority), plus count fields (available, processing, completed, failed).
+
+### Channels (`gt:channel`)
+
+Pub/sub broadcast streams with configurable message retention.
+
+**Bead ID format:** `hq-channel-<name>`
+
+Fields: `subscribers`, `status` (active/closed), `retention_count`,
+`retention_hours`.
+
+### Group and Channel CLI Commands
+
+```bash
+# Groups
+gt mail group list
+gt mail group show <name>
+gt mail group create <name> [members...]
+gt mail group add <name> <member>
+gt mail group remove <name> <member>
+gt mail group delete <name>
+
+# Channels
+gt mail channel list
+gt mail channel show <name>
+gt mail channel create <name> [--retain-count=N] [--retain-hours=N]
+gt mail channel delete <name>
+```
+
+### Sending to Groups, Queues, and Channels
+
+```bash
+gt mail send my-group -s "Subject" -m "Body"           # group (expands to members)
+gt mail send queue:my-queue -s "Work item" -m "Details" # queue (single claimant)
+gt mail send channel:alerts -s "Alert" -m "Content"     # channel (broadcast)
+```
+
+### Address Resolution Order
+
+When sending mail, addresses are resolved in this order:
+
+1. **Explicit prefix** -- `group:`, `queue:`, or `channel:` uses that type directly
+2. **Contains `/`** -- Treat as agent address or pattern (direct delivery)
+3. **Starts with `@`** -- Special pattern (`@town`, `@crew`, etc.) or group
+4. **Name lookup** -- Search group -> queue -> channel by name
+
+If a name matches multiple types, the resolver returns an error requiring an
+explicit prefix.
+
+### Retention Policy
+
+Channels support count-based (`--retain-count=N`) and time-based
+(`--retain-hours=N`) retention. Retention is enforced on-write (after posting)
+and on-patrol (Deacon runs `PruneAllChannels()` with a 10% buffer to avoid
+thrashing).
 
 ## Related Documents
 
