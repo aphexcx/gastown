@@ -46,6 +46,7 @@ const (
 	DefaultDoctorMolCooldown               = 5 * time.Minute
 	DefaultRecoveryHeartbeatInterval       = 3 * time.Minute
 	DefaultBootSpawnCooldown               = 2 * time.Minute
+	DefaultBootIdleSuppression             = 15 * time.Minute
 	DefaultDeaconGracePeriod               = 5 * time.Minute
 )
 
@@ -362,6 +363,15 @@ func (d *DaemonThresholds) BootSpawnCooldownD() time.Duration {
 		return ParseDurationOrDefault(d.BootSpawnCooldown, DefaultBootSpawnCooldown)
 	}
 	return DefaultBootSpawnCooldown
+}
+
+// BootIdleSuppressionD returns the configured or default boot idle suppression duration.
+// When Boot's last action was "nothing" (deacon healthy), spawns are suppressed for this long.
+func (d *DaemonThresholds) BootIdleSuppressionD() time.Duration {
+	if d != nil {
+		return ParseDurationOrDefault(d.BootIdleSuppression, DefaultBootIdleSuppression)
+	}
+	return DefaultBootIdleSuppression
 }
 
 // DeaconGracePeriodD returns the configured or default deacon grace period.
