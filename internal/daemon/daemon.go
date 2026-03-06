@@ -115,12 +115,6 @@ const (
 	massDeathWindow    = 30 * time.Second // Time window to detect mass death
 	massDeathThreshold = 3                // Number of deaths to trigger alert
 
-	// hungSessionThreshold is how long a refinery/witness session can be
-	// inactive (no tmux output) before the daemon considers it hung and
-	// kills it for restart. Derived from constants.HungSessionThreshold
-	// (single source of truth). See: gt-tr3d
-	hungSessionThreshold = constants.HungSessionThreshold
-
 	// doctorMolCooldown is the minimum interval between mol-dog-doctor molecules.
 	// Configurable via operational.daemon.doctor_mol_cooldown.
 	doctorMolCooldown = 5 * time.Minute
@@ -1114,14 +1108,11 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	}
 	mgr := witness.NewManager(r)
 
-	// Check for hung session before Start (which only detects process-dead zombies).
-	// A hung session has a live process but no tmux activity for an extended period,
-	// indicating Claude is stuck. Kill it so Start() can recreate a fresh one.
-	if status := mgr.IsHealthy(hungSessionThreshold); status == tmux.AgentHung {
-		d.logger.Printf("Witness for %s is hung (no activity for %v), killing for restart", rigName, hungSessionThreshold)
-		t := tmux.NewTmux()
-		_ = t.KillSession(mgr.SessionName())
-	}
+	// NOTE: Hung session detection removed for witnesses (serial killer bug).
+	// Idle witnesses legitimately produce no tmux output while waiting for work.
+	// The deacon's patrol health-scan step handles stuck detection with proper
+	// context (checks for active work before declaring something stuck).
+	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
 
 	if err := mgr.Start(false, "", nil); err != nil {
 		if err == witness.ErrAlreadyRunning {
@@ -1183,14 +1174,11 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	}
 	mgr := refinery.NewManager(r)
 
-	// Check for hung session before Start (which only detects process-dead zombies).
-	// A hung refinery means MRs pile up with no processing. Kill it so Start()
-	// can recreate a fresh one. See: gt-tr3d
-	if status := mgr.IsHealthy(hungSessionThreshold); status == tmux.AgentHung {
-		d.logger.Printf("Refinery for %s is hung (no activity for %v), killing for restart", rigName, hungSessionThreshold)
-		t := tmux.NewTmux()
-		_ = t.KillSession(mgr.SessionName())
-	}
+	// NOTE: Hung session detection removed for refineries (serial killer bug).
+	// Idle refineries legitimately produce no tmux output while waiting for MRs.
+	// The deacon's patrol health-scan step handles stuck detection with proper
+	// context (checks for active work before declaring something stuck).
+	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
 
 	if err := mgr.Start(false, ""); err != nil {
 		if err == refinery.ErrAlreadyRunning {
