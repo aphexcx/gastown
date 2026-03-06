@@ -2139,8 +2139,8 @@ func getExternalIssueDetails(townBeads, rigName, issueID string) *issueDetails {
 	}
 
 	// Query the rig database by running bd show from the rig directory
-	// Use --allow-stale to handle cases where the database may be temporarily stale
-	showCmd := exec.Command("bd", "show", issueID, "--json", "--allow-stale")
+	showArgs := beads.MaybePrependAllowStale([]string{"show", issueID, "--json"})
+	showCmd := exec.Command("bd", showArgs...)
 	showCmd.Dir = rigDir // Set working directory to rig directory
 	var stdout bytes.Buffer
 	showCmd.Stdout = &stdout

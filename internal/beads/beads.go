@@ -27,6 +27,33 @@ var (
 	ErrFlagTitle    = errors.New("title looks like a CLI flag (starts with '-'); use --title=\"...\" to set flag-like titles intentionally")
 )
 
+// bdAllowStale caches whether the installed bd supports --allow-stale.
+// Detected once at first use via `bd --allow-stale version`.
+var (
+	bdAllowStaleOnce   sync.Once
+	bdAllowStaleResult bool
+)
+
+// BdSupportsAllowStale returns true if the installed bd binary accepts --allow-stale.
+func BdSupportsAllowStale() bool {
+	bdAllowStaleOnce.Do(func() {
+		cmd := exec.Command("bd", "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
+		if err := cmd.Run(); err == nil {
+			bdAllowStaleResult = true
+		}
+	})
+	return bdAllowStaleResult
+}
+
+// MaybePrependAllowStale prepends --allow-stale to args if bd supports it.
+// Exported for use by other packages that shell out to bd directly.
+func MaybePrependAllowStale(args []string) []string {
+	if BdSupportsAllowStale() {
+		return append([]string{"--allow-stale"}, args...)
+	}
+	return args
+}
+
 // ExtractIssueID strips the external:prefix:id wrapper from bead IDs.
 // bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for display and lookups.
@@ -281,9 +308,9 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-	// Use --allow-stale to prevent failures when db is temporarily stale
-	// (e.g., after daemon is killed during shutdown).
-	fullArgs := append([]string{"--allow-stale"}, args...)
+	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
+	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
+	fullArgs := MaybePrependAllowStale(args)
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
@@ -337,7 +364,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-	fullArgs := append([]string{"--allow-stale"}, args...)
+	fullArgs := MaybePrependAllowStale(args)
 
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = b.workDir
@@ -551,12 +578,35 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 		return nil, err
 	}
 
+	// bd list --json may return plain text (e.g., "No issues found.") instead
+	// of an empty JSON array when there are no results. Handle gracefully.
+	if len(out) == 0 || !isJSONBytes(out) {
+		return nil, nil
+	}
+
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
 	return issues, nil
+}
+
+// isJSONBytes returns true if the byte slice starts with [ or { (after whitespace).
+// bd list --json may return plain text like "No issues found." instead of JSON
+// when there are no results.
+func isJSONBytes(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '[', '{':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // ListByAssignee returns all issues assigned to a specific assignee.
