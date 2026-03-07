@@ -112,7 +112,7 @@ func BuildCommand(args ...string) *exec.Cmd {
 	return BuildCommandContext(context.Background(), args...)
 }
 
-// BuildCommandContext is like BuildCommand but honours a context for cancellation.
+// BuildCommandContext is like BuildCommand but honors a context for cancellation.
 func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	allArgs := []string{"-u"}
 	if sock := GetDefaultSocket(); sock != "" {
@@ -131,6 +131,12 @@ type Tmux struct {
 // Using a non-existent socket causes tmux operations to fail with a clear
 // "no server running" error instead of silently connecting to the wrong server.
 const noTownSocket = "gt-no-town-socket"
+
+// EnvAgentReady is the tmux session environment variable set by the agent's
+// SessionStart hook (gt prime --hook) to signal that the agent has started.
+// Used by WaitForCommand as a ZFC-compliant fallback for detecting wrapped
+// agents (where pane_current_command remains a shell). See gt-sk5u.
+const EnvAgentReady = "GT_AGENT_READY"
 
 // NewTmux creates a new Tmux wrapper using the initialized town socket.
 // Falls back to GT_TOWN_SOCKET env var (set by cross-socket tmux bindings),
@@ -2206,12 +2212,18 @@ func (t *Tmux) resolveSessionProcessNames(session string) []string {
 // Useful for waiting until a shell has started a new process (e.g., claude).
 // Returns nil when a non-excluded command is detected, or error on timeout.
 //
-// Fallback: when the pane command IS a shell (e.g., bash), also checks
-// IsAgentAlive to detect agents wrapped in shell scripts (e.g., c2claude wrapping
-// claude-original). This handles cases where exec env does not replace the shell
-// as the pane foreground process. GT_PROCESS_NAMES must be set in the session
-// environment (via SetEnvironment) before calling for this fallback to work.
+// ZFC fallback: when the pane command IS a shell (e.g., bash), checks for the
+// GT_AGENT_READY env var set by the agent's SessionStart hook (gt prime --hook).
+// This handles agents wrapped in shell scripts (e.g., c2claude wrapping
+// claude-original) where exec env does not replace the shell as the pane
+// foreground process. Replaces process-tree probing (IsAgentAlive) per gt-sk5u.
 func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error {
+	// ZFC: Clear agent-ready sentinel to prevent stale values from previous
+	// agent runs. The agent's SessionStart hook (gt prime --hook) sets this
+	// to "1" once the agent is running. Unsetting here ensures we only detect
+	// the NEW agent, not a leftover from a previous run.
+	_, _ = t.run("set-environment", "-u", "-t", session, EnvAgentReady)
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		cmd, err := t.GetPaneCommand(session)
@@ -2230,12 +2242,10 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout 
 		if !excluded {
 			return nil
 		}
-		// Fallback: if the pane is running a shell, check whether the agent is
-		// alive as a descendant process. This handles agents wrapped in shell
-		// scripts (e.g., c2claude -> claude-original) where exec env does not
-		// replace the shell as pane_current_command. GT_PROCESS_NAMES in the
-		// tmux session environment determines which process names are expected.
-		if t.IsAgentAlive(session) {
+		// ZFC fallback: check if the agent signaled readiness via its startup
+		// hook. This replaces process-tree descendant probing (IsAgentAlive)
+		// for wrapped agents where pane_current_command remains a shell.
+		if ready, err := t.GetEnvironment(session, EnvAgentReady); err == nil && ready == "1" {
 			return nil
 		}
 		time.Sleep(constants.PollInterval)
@@ -2353,6 +2363,13 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := DefaultReadyPromptPrefix
 	prefix := strings.TrimSpace(promptPrefix)
 
+	// Require 2 consecutive idle polls to filter out transient states.
+	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
+	// in the pane buffer while Claude Code is still actively working.
+	// Two polls 200ms apart (400ms window) confirms genuine idle state.
+	consecutiveIdle := 0
+	const requiredConsecutive = 2
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		lines, err := t.CapturePaneLines(session, 5)
@@ -2363,20 +2380,52 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 			if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
 				return err
 			}
+			consecutiveIdle = 0
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
+
+		// Check the status bar first: if "esc to interrupt" is visible,
+		// Claude Code is actively running a tool call — NOT idle,
+		// regardless of whether the prompt prefix is also visible.
+		statusBarBusy := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.Contains(trimmed, "\u23F5\u23F5") || strings.Contains(trimmed, "⏵⏵") {
+				if strings.Contains(trimmed, "esc to interrupt") {
+					statusBarBusy = true
+				}
+				break
+			}
+		}
+		if statusBarBusy {
+			consecutiveIdle = 0
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
 		// Scan all captured lines for the prompt prefix.
 		// Claude Code renders a status bar below the prompt line,
 		// so the prompt may not be the last non-empty line.
+		promptFound := false
 		for _, line := range lines {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "" {
 				continue
 			}
 			if matchesPromptPrefix(trimmed, promptPrefix) || (prefix != "" && trimmed == prefix) {
+				promptFound = true
+				break
+			}
+		}
+
+		if promptFound {
+			consecutiveIdle++
+			if consecutiveIdle >= requiredConsecutive {
 				return nil
 			}
+		} else {
+			consecutiveIdle = 0
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -2633,27 +2682,6 @@ func (t *Tmux) SetMailClickBinding(session string) error {
 	return err
 }
 
-// IsPaneDead checks if the pane in a session has exited (remain-on-exit keeps it visible).
-// Returns true if the pane's process has exited but the pane is still displayed.
-// This distinguishes a "dead pane waiting for respawn" from a "zombie shell still running".
-func (t *Tmux) IsPaneDead(session string) bool {
-	out, err := t.run("list-panes", "-t", session, "-F", "#{pane_dead}")
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(out) == "1"
-}
-
-// RespawnPaneDefault restarts a dead pane with its original command.
-// This is used when the pane process has exited (remain-on-exit on) and we
-// want to restart it in place without killing the entire session.
-// Unlike RespawnPane, this does NOT specify a new command — tmux reuses the
-// command from when the pane was created or last respawned.
-func (t *Tmux) RespawnPaneDefault(session string) error {
-	_, err := t.run("respawn-pane", "-k", "-t", session)
-	return err
-}
-
 // RespawnPane kills all processes in a pane and starts a new command.
 // This is used for "hot reload" of agent sessions - instantly restart in place.
 // The pane parameter should be a pane ID (e.g., "%0") or session:window.pane format.
@@ -2754,6 +2782,17 @@ func (t *Tmux) isGTBindingWithClient(table, key string) bool {
 	}
 	return strings.Contains(output, "if-shell") && strings.Contains(output, "gt ") &&
 		strings.Contains(output, "--client")
+}
+
+// isGTBindingCurrent checks whether the existing GT cycle binding has the
+// current prefix pattern. Returns false if the binding is stale (e.g., after
+// gt rig add introduces a new prefix not yet in the grep pattern).
+func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
+	output, err := t.run("list-keys", "-T", table, key)
+	if err != nil || output == "" {
+		return false
+	}
+	return strings.Contains(output, currentPattern)
 }
 
 // getKeyBinding returns the current tmux command bound to the given key in the
@@ -2874,13 +2913,16 @@ func sessionPrefixPattern() string {
 // reliably preserve the session context. tmux expands #{session_name} at binding
 // resolution time (when the key is pressed), giving us the correct session.
 func (t *Tmux) SetCycleBindings(session string) error {
-	// Skip if already correctly configured (has --client for multi-client support).
-	// We must re-bind if an older GT binding exists without --client, since that
-	// version targets the wrong client when multiple tmux clients are attached.
-	if t.isGTBindingWithClient("prefix", "n") {
+	// Skip if already correctly configured:
+	// 1. Has --client for multi-client support
+	// 2. Has the current prefix pattern (not stale from before a gt rig add)
+	// We must re-bind if an older GT binding exists without --client, or if the
+	// prefix pattern is stale (missing newly added rig prefixes).
+	// See: https://github.com/steveyegge/gastown/issues/2299
+	pattern := sessionPrefixPattern()
+	if t.isGTBindingWithClient("prefix", "n") && t.isGTBindingCurrent("prefix", "n", pattern) {
 		return nil
 	}
-	pattern := sessionPrefixPattern()
 	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", pattern)
 
 	// Capture existing bindings before overwriting, falling back to tmux defaults

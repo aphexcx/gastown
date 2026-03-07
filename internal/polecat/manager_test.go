@@ -403,6 +403,20 @@ func TestAddWithOptions_HasAgentsMD(t *testing.T) {
 		t.Fatalf("git update-ref: %v\n%s", err, out)
 	}
 
+	// Create rig-level .beads directory with redirect to mayor/rig/.beads
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	rigRedirect := filepath.Join(rigBeads, "redirect")
+	if err := os.WriteFile(rigRedirect, []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
 	// Create rig pointing to root
 	r := &rig.Rig{
 		Name: "rig",
@@ -695,6 +709,53 @@ func TestIsDoltOptimisticLockError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isDoltOptimisticLockError(tt.err); got != tt.want {
 				t.Errorf("isDoltOptimisticLockError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsCurrentHookedIssueForAssignee(t *testing.T) {
+	assignee := "testrig/polecats/toast"
+
+	tests := []struct {
+		name  string
+		issue *beads.Issue
+		want  bool
+	}{
+		{
+			name: "nil issue",
+			want: false,
+		},
+		{
+			name: "hooked and matching assignee",
+			issue: &beads.Issue{
+				Status:   beads.StatusHooked,
+				Assignee: assignee,
+			},
+			want: true,
+		},
+		{
+			name: "hooked but different assignee",
+			issue: &beads.Issue{
+				Status:   beads.StatusHooked,
+				Assignee: "testrig/polecats/nux",
+			},
+			want: false,
+		},
+		{
+			name: "matching assignee but open status",
+			issue: &beads.Issue{
+				Status:   "open",
+				Assignee: assignee,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCurrentHookedIssueForAssignee(tt.issue, assignee); got != tt.want {
+				t.Fatalf("isCurrentHookedIssueForAssignee() = %v, want %v", got, tt.want)
 			}
 		})
 	}

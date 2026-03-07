@@ -1,5 +1,7 @@
 # Binaries
 /gt
+/gt-proxy-server
+/gt-proxy-client
 *.exe
 
 # Build
@@ -68,3 +70,6 @@ result
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Gas Town (added by gt)
+__pycache__/

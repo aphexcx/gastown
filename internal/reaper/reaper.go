@@ -22,10 +22,15 @@ import (
 var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // DefaultDatabases is the static fallback list of known production databases.
-var DefaultDatabases = []string{"hq", "beads", "gt"}
+var DefaultDatabases = []string{"hq", "beads", "gastown"}
 
 // testPollutionPrefixes are database name prefixes created by tests.
 var testPollutionPrefixes = []string{"testdb_", "beads_t", "beads_pt", "doctest_"}
+
+// isNothingToCommit returns true if the error is a Dolt "nothing to commit" error.
+func isNothingToCommit(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "nothing to commit")
+}
 
 // DiscoverDatabases queries SHOW DATABASES on the Dolt server and returns
 // all production databases, filtering out system databases and test pollution.
@@ -147,31 +152,35 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 	return sql.Open("mysql", dsn)
 }
 
-// parentCheckWhere returns the SQL WHERE fragment that restricts operations to
-// wisps whose parent molecule is closed, that have no parent (orphans), or
-// whose parent was purged (dangling dependency reference).
-func parentCheckWhere(dbName string) string {
-	return fmt.Sprintf(`
-		(
-			NOT EXISTS (
-				SELECT 1 FROM `+"`%s`"+`.wisp_dependencies wd
-				WHERE wd.issue_id = w.id AND wd.type = 'parent-child'
-			)
-			OR
-			EXISTS (
-				SELECT 1 FROM `+"`%s`"+`.wisp_dependencies wd
-				JOIN `+"`%s`"+`.wisps parent ON parent.id = wd.depends_on_id
-				WHERE wd.issue_id = w.id AND wd.type = 'parent-child'
-				AND parent.status = 'closed'
-			)
-			OR
-			EXISTS (
-				SELECT 1 FROM `+"`%s`"+`.wisp_dependencies wd
-				LEFT JOIN `+"`%s`"+`.wisps parent ON parent.id = wd.depends_on_id
-				WHERE wd.issue_id = w.id AND wd.type = 'parent-child'
-				AND parent.id IS NULL
-			)
-		)`, dbName, dbName, dbName, dbName, dbName)
+// parentExcludeJoin returns a LEFT JOIN clause and WHERE condition that restricts
+// results to wisps whose parent molecule is closed, missing, or nonexistent.
+//
+// This replaces the previous parentCheckWhere() which used 3 correlated EXISTS
+// subqueries per row, causing O(n*m) query cost on large wisp tables (gt-jd1z).
+// The LEFT JOIN approach runs the subquery once and hash-joins: O(n+m).
+//
+// Semantics (unchanged from parentCheckWhere):
+//   - No parent-child dependency → eligible (orphan wisps)
+//   - Parent status is 'closed' → eligible (parent already reaped)
+//   - Parent row missing (dangling ref) → eligible (parent already purged)
+//
+// The inverse is simpler: exclude wisps that have an OPEN parent.
+//
+// Usage:
+//
+//	join, where := parentExcludeJoin(dbName)
+//	query := fmt.Sprintf("SELECT ... FROM `%s`.wisps w %s WHERE ... AND %s", dbName, join, where)
+func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
+	joinClause = fmt.Sprintf(
+		`LEFT JOIN (
+			SELECT DISTINCT wd.issue_id
+			FROM `+"`%s`"+`.wisp_dependencies wd
+			INNER JOIN `+"`%s`"+`.wisps parent ON parent.id = wd.depends_on_id
+			WHERE wd.type = 'parent-child'
+			AND parent.status IN ('open', 'hooked', 'in_progress')
+		) open_parent ON open_parent.issue_id = w.id`, dbName, dbName)
+	whereCondition = "open_parent.issue_id IS NULL"
+	return
 }
 
 // Scan counts reaper candidates in a database without modifying anything.
@@ -181,20 +190,24 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 	result := &ScanResult{Database: dbName}
 	now := time.Now().UTC()
-	parentCheck := parentCheckWhere(dbName)
+	parentJoin, parentWhere := parentExcludeJoin(dbName)
 
 	// Count reap candidates: open wisps past max_age with eligible parent status.
-	reapWhere := fmt.Sprintf(
-		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s", parentCheck)
-	reapQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.wisps w WHERE %s", dbName, reapWhere)
+	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
+	reapQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM `%s`.wisps w %s WHERE w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s",
+		dbName, parentJoin, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
 
 	// Count purge candidates: closed wisps past purge_age.
+	// No parent check needed — closed wisps past the delete age are unconditionally purgeable.
+	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m) query
+	// cost with 1800+ closed wisps, leading to CPU spikes and connection timeouts (gt-wvd2).
 	purgeQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM `%s`.wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s",
-		dbName, parentCheck)
+		"SELECT COUNT(*) FROM `%s`.wisps w WHERE w.status = 'closed' AND w.closed_at < ?",
+		dbName)
 	if err := db.QueryRowContext(ctx, purgeQuery, now.Add(-purgeAge)).Scan(&result.PurgeCandidates); err != nil {
 		return nil, fmt.Errorf("count purge candidates: %w", err)
 	}
@@ -260,14 +273,14 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	defer cancel()
 
 	cutoff := time.Now().UTC().Add(-maxAge)
-	parentCheck := parentCheckWhere(dbName)
+	parentJoin, parentWhere := parentExcludeJoin(dbName)
 	whereClause := fmt.Sprintf(
-		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s", parentCheck)
+		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s", parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
 	if dryRun {
-		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.wisps w WHERE %s", dbName, whereClause)
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.wisps w %s WHERE %s", dbName, parentJoin, whereClause)
 		if err := db.QueryRowContext(ctx, countQuery, cutoff).Scan(&result.Reaped); err != nil {
 			return nil, fmt.Errorf("dry-run count: %w", err)
 		}
@@ -288,9 +301,10 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 
 	// Batch UPDATE: select IDs in chunks, update each chunk.
 	// This avoids holding a write lock on the entire table for minutes.
+	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM `%s`.wisps w WHERE %s LIMIT %d",
-		dbName, whereClause, DefaultBatchSize)
+		"SELECT w.id FROM `%s`.wisps w %s WHERE %s LIMIT %d",
+		dbName, parentJoin, whereClause, DefaultBatchSize)
 
 	totalReaped := 0
 	for {
@@ -337,9 +351,22 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	result.Reaped = totalReaped
 
 	if totalReaped > 0 {
+		// Flush the SQL transaction to the Dolt working set before DOLT_COMMIT.
+		// With autocommit=0, UPDATE changes are in the SQL transaction buffer,
+		// not the Dolt working set. DOLT_COMMIT operates on the working set,
+		// so without this COMMIT it sees "nothing to commit".
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			return result, fmt.Errorf("sql commit: %w", err)
+		}
 		commitMsg := fmt.Sprintf("reaper: close %d stale wisps in %s", totalReaped, dbName)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			return result, fmt.Errorf("dolt commit: %w", err)
+			// "nothing to commit" is expected when the reaper reverts dirty working
+			// set changes back to match HEAD. The wisps were set to "open" in the
+			// server's in-memory working set without being committed; closing them
+			// makes the working set match HEAD again, so DOLT_COMMIT sees no diff.
+			if !isNothingToCommit(err) {
+				return result, fmt.Errorf("dolt commit: %w", err)
+			}
 		}
 	}
 
@@ -379,13 +406,15 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	defer cancel()
 
 	deleteCutoff := time.Now().UTC().Add(-purgeAge)
-	parentCheck := parentCheckWhere(dbName)
 	var anomalies []Anomaly
 
 	// Digest: count by wisp_type.
+	// No parent check — closed wisps past the delete age are unconditionally purgeable.
+	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
+	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
 	digestQuery := fmt.Sprintf(
-		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM `%s`.wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
-		dbName, parentCheck)
+		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM `%s`.wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype",
+		dbName)
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
 		return 0, nil, fmt.Errorf("digest query: %w", err)
@@ -417,10 +446,10 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
 	}()
 
-	// Batch delete.
+	// Batch delete — simple status+age filter, no parent check needed for purge.
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM `%s`.wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
-		dbName, parentCheck, DefaultBatchSize)
+		"SELECT w.id FROM `%s`.wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
+		dbName, DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
 	totalDeleted, err := batchDeleteRows(ctx, db, dbName, idQuery, deleteCutoff, "wisps", auxTables)
@@ -429,6 +458,14 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	}
 
 	if totalDeleted > 0 {
+		// Flush SQL transaction to working set before DOLT_COMMIT.
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			anomalies = append(anomalies, Anomaly{
+				Type:    "sql_commit_failed",
+				Message: fmt.Sprintf("sql commit after purge failed: %v", err),
+			})
+			return totalDeleted, anomalies, nil
+		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal — log but continue.
@@ -481,6 +518,10 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 	}
 
 	if totalDeleted > 0 {
+		// Flush SQL transaction to working set before DOLT_COMMIT.
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			return totalDeleted, fmt.Errorf("sql commit: %w", err)
+		}
 		commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal.
@@ -565,6 +606,14 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	result.Closed = len(ids)
 
 	if len(ids) > 0 {
+		// Flush SQL transaction to working set before DOLT_COMMIT.
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "sql_commit_failed",
+				Message: fmt.Sprintf("sql commit after auto-close failed: %v", err),
+			})
+			return result, nil
+		}
 		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			result.Anomalies = append(result.Anomalies, Anomaly{
