@@ -122,7 +122,8 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		// GT_ROLE must be set so startup command resolution can honor role_agents.dog.
 		env["GT_ROLE"] = "dog"
 		if cfg.AgentName != "" {
-			env["BD_ACTOR"] = fmt.Sprintf("dog/%s", cfg.AgentName)
+			env["GT_DOG_NAME"] = cfg.AgentName
+			env["BD_ACTOR"] = fmt.Sprintf("deacon/dogs/%s", cfg.AgentName)
 			env["GIT_AUTHOR_NAME"] = cfg.AgentName
 		} else {
 			env["BD_ACTOR"] = "dog"

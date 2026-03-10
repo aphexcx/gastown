@@ -1392,6 +1392,33 @@ func (d *Daemon) getKnownRigs() []string {
 	return rigs
 }
 
+// getRigBeadsPrefix returns the beads prefix for a rig by reading rigs.json.
+// Returns "" if the prefix cannot be determined.
+func (d *Daemon) getRigBeadsPrefix(rigName string) string {
+	rigsPath := filepath.Join(d.config.TownRoot, "mayor", "rigs.json")
+	data, err := os.ReadFile(rigsPath)
+	if err != nil {
+		return ""
+	}
+
+	var parsed struct {
+		Rigs map[string]struct {
+			Beads *struct {
+				Prefix string `json:"prefix"`
+			} `json:"beads,omitempty"`
+		} `json:"rigs"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return ""
+	}
+
+	entry, ok := parsed.Rigs[rigName]
+	if !ok || entry.Beads == nil {
+		return ""
+	}
+	return entry.Beads.Prefix
+}
+
 // getPatrolRigs returns the list of operational rigs for a patrol.
 // If the patrol config specifies a rigs filter, only those rigs are returned.
 // Otherwise, all known rigs are returned. In both cases, non-operational
@@ -1446,8 +1473,12 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	// Check rig bead labels (global/synced docked status)
 	// This is the persistent docked state set by 'gt rig dock'
 	rigPath := filepath.Join(d.config.TownRoot, rigName)
-	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
-		rigBeadID := fmt.Sprintf("%s-rig-%s", rigCfg.Beads.Prefix, rigName)
+	// Look up the beads prefix from rigs.json (the daemon's authoritative
+	// rig registry).  The previous code used rig.LoadRigConfig which reads
+	// <rigPath>/config.json — a file that doesn't exist for most rigs,
+	// silently skipping the bead-label check and ignoring dock state.
+	if prefix := d.getRigBeadsPrefix(rigName); prefix != "" {
+		rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 		rigBeadsDir := beads.ResolveBeadsDir(rigPath)
 		bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
 		if issue, err := bd.Show(rigBeadID); err == nil {

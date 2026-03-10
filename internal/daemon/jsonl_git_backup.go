@@ -354,6 +354,9 @@ func (d *Daemon) commitAndPushJsonlBackup(gitRepo string, databases []string, co
 		return fmt.Errorf("git commit: %w", err)
 	}
 
+	// Successful commit — clear any spike baseline since HEAD is now up to date.
+	removeSpikeBaseline(gitRepo)
+
 	// Push — only if a remote is configured. Skip gracefully if not.
 	if d.hasGitRemote(gitRepo, "origin") {
 		// Detect current branch name for push (master vs main).
@@ -524,6 +527,69 @@ type spikeInfo struct {
 	Delta    float64 // absolute fractional change (0.0–1.0+)
 }
 
+// spikeBaseline records counts from a halted export so that subsequent runs
+// can detect when the count has stabilized at a new level.
+type spikeBaseline struct {
+	Counts    map[string]int `json:"counts"`
+	Timestamp string         `json:"timestamp"`
+}
+
+const spikeBaselineFile = ".spike-counts.json"
+
+// loadSpikeBaseline reads the spike baseline file from the git repo directory.
+// Returns nil if the file doesn't exist or can't be parsed.
+func loadSpikeBaseline(gitRepo string) *spikeBaseline {
+	path := filepath.Join(gitRepo, spikeBaselineFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var sb spikeBaseline
+	if err := json.Unmarshal(data, &sb); err != nil {
+		return nil
+	}
+	return &sb
+}
+
+// saveSpikeBaseline writes the current counts as a spike baseline file.
+// Also ensures the file is git-ignored so it doesn't get committed.
+func saveSpikeBaseline(gitRepo string, counts map[string]int) error {
+	sb := spikeBaseline{
+		Counts:    counts,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	data, err := json.MarshalIndent(sb, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Ensure the spike baseline file is git-ignored.
+	ensureGitIgnore(gitRepo, spikeBaselineFile)
+	return os.WriteFile(filepath.Join(gitRepo, spikeBaselineFile), data, 0644)
+}
+
+// ensureGitIgnore adds an entry to .gitignore if not already present.
+func ensureGitIgnore(gitRepo, entry string) {
+	ignorePath := filepath.Join(gitRepo, ".gitignore")
+	data, _ := os.ReadFile(ignorePath)
+	content := string(data)
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == entry {
+			return // Already present.
+		}
+	}
+	// Append the entry.
+	if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	content += entry + "\n"
+	os.WriteFile(ignorePath, []byte(content), 0644)
+}
+
+// removeSpikeBaseline removes the spike baseline file after a successful commit.
+func removeSpikeBaseline(gitRepo string) {
+	os.Remove(filepath.Join(gitRepo, spikeBaselineFile))
+}
+
 // verifyExportCounts compares current export line counts against the previous
 // commit for each database. Returns a list of anomalies that exceed the spike
 // threshold. On first export (no baseline), verification is skipped.
@@ -532,10 +598,17 @@ type spikeInfo struct {
 // increases (new issues filed) use 2x the threshold since growth is normal.
 // Small absolute changes (<20 records) are always allowed to avoid false alarms
 // on small databases.
+//
+// Recovery mechanism: when spike detection fires, a baseline file is saved with
+// the current counts. On the next run, if the current count is stable relative
+// to the spike baseline (within threshold), the spike is cleared and the export
+// proceeds. This prevents permanent blocking after legitimate large changes
+// (e.g., Reaper purges, filter updates).
 func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts map[string]int, threshold float64) []spikeInfo {
 	const minAbsoluteDelta = 20 // ignore changes smaller than this many records
 
 	var spikes []spikeInfo
+	spikeBase := loadSpikeBaseline(gitRepo)
 
 	for _, db := range databases {
 		currentCount, ok := counts[db]
@@ -575,6 +648,19 @@ func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts m
 		}
 
 		if fractionalDelta > effectiveThreshold {
+			// Check spike baseline: if the current count is stable relative
+			// to a previously-halted count, this is a confirmed new level.
+			if spikeBase != nil {
+				if baseCount, ok := spikeBase.Counts[db]; ok && baseCount > 0 {
+					baseDelta := math.Abs(float64(currentCount-baseCount)) / float64(baseCount)
+					if baseDelta <= threshold {
+						d.logger.Printf("jsonl_git_backup: %s: count stable vs spike baseline (%d → %d, %.1f%% vs baseline %d), accepting new level",
+							db, prevCount, currentCount, fractionalDelta*100, baseCount)
+						continue // Stable relative to spike baseline — not a new spike.
+					}
+				}
+			}
+
 			spike := spikeInfo{
 				DB:       db,
 				File:     relPath,
@@ -592,6 +678,14 @@ func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts m
 				db, direction, prevCount, currentCount, fractionalDelta*100, direction, effectiveThreshold*100)
 		}
 	}
+
+	// Save or clear spike baseline depending on results.
+	if len(spikes) > 0 {
+		if err := saveSpikeBaseline(gitRepo, counts); err != nil {
+			d.logger.Printf("jsonl_git_backup: failed to save spike baseline: %v", err)
+		}
+	}
+
 	return spikes
 }
 

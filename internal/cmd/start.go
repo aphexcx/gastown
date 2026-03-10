@@ -217,40 +217,39 @@ func runStart(cmd *cobra.Command, args []string) error {
 		// Continue anyway - core agents don't need rigs
 	}
 
-	// Start all agent groups in parallel for maximum speed
-	var wg sync.WaitGroup
-	var mu sync.Mutex // Protects stdout
-	var coreErr error
+	// Phase 1: Start Dolt server BEFORE agents.
+	// Agents run bd commands on startup (via gt prime → patrol_helpers) that
+	// connect to the Dolt SQL server. Without this sequencing, they race the
+	// server and bd auto-spawns orphan embedded servers. (gt-t2zf)
 	var doltOK bool
-
-	// Ensure Dolt server is running (prerequisite for beads)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		cfg := doltserver.DefaultConfig(townRoot)
-		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
-			// No Dolt data dir — nothing to start
-			return
-		}
+	cfg := doltserver.DefaultConfig(townRoot)
+	if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+		// No Dolt data dir — nothing to start
+		fmt.Printf("  %s Dolt server skipped (no data dir)\n", style.Dim.Render("○"))
+	} else {
 		running, _, _ := doltserver.IsRunning(townRoot)
 		if running {
 			doltOK = true
-			mu.Lock()
 			fmt.Printf("  %s Dolt server already running\n", style.Dim.Render("○"))
-			mu.Unlock()
-			return
-		}
-		if err := doltserver.Start(townRoot); err != nil {
-			mu.Lock()
+		} else if err := doltserver.Start(townRoot); err != nil {
 			fmt.Printf("  %s Dolt server failed: %v\n", style.Dim.Render("○"), err)
-			mu.Unlock()
 		} else {
 			doltOK = true
-			mu.Lock()
 			fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltserver.DefaultPort)
-			mu.Unlock()
 		}
-	}()
+	}
+
+	// Ensure beads metadata and port files are correct BEFORE agents start.
+	// This prevents bd from seeing stale config and spawning orphan servers.
+	if doltOK {
+		_, _ = doltserver.EnsureAllMetadata(townRoot)
+		_ = doltserver.SyncPortFiles(townRoot, cfg.Port)
+	}
+
+	// Phase 2: Start all agents in parallel (Dolt is now ready)
+	var wg sync.WaitGroup
+	var mu sync.Mutex // Protects stdout
+	var coreErr error
 
 	// Start core agents (Mayor and Deacon) in background
 	wg.Add(1)
@@ -282,11 +281,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	wg.Wait()
-
-	// Ensure beads metadata points to the Dolt server
-	if doltOK {
-		_, _ = doltserver.EnsureAllMetadata(townRoot)
-	}
 
 	if coreErr != nil {
 		return coreErr

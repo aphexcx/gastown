@@ -14,6 +14,7 @@ import (
 	"regexp"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -168,11 +169,34 @@ func PrefixFor(rigName string) string {
 	return DefaultRegistry().PrefixForRig(rigName)
 }
 
-// BuildPrefixRegistryFromTown reads rigs.json from a town root directory
-// and returns a populated PrefixRegistry.
+// BuildPrefixRegistryFromTown reads rigs.json and returns a populated PrefixRegistry.
+// Checks mayor/rigs.json first (canonical), then falls back to town-root rigs.json.
+// Warns to stderr if rigs.json is missing entirely — an empty registry causes
+// silent failures in session name parsing (crew cycling, nudge routing, etc.).
 func BuildPrefixRegistryFromTown(townRoot string) (*PrefixRegistry, error) {
+	// Canonical location: inside mayor worktree.
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
-	return BuildPrefixRegistryFromFile(rigsPath)
+	fallbackPath := filepath.Join(townRoot, "rigs.json")
+	if _, err := os.Stat(rigsPath); err == nil {
+		r, err := BuildPrefixRegistryFromFile(rigsPath)
+		if err == nil {
+			// Maintain fallback copy at town root (resilient to git ops in mayor/).
+			copyFileIfNewer(rigsPath, fallbackPath)
+		}
+		return r, err
+	}
+
+	// Fallback: town root (safe from git operations in mayor worktree).
+	if _, err := os.Stat(fallbackPath); err == nil {
+		style.PrintWarning("mayor/rigs.json missing, using fallback %s", fallbackPath)
+		return BuildPrefixRegistryFromFile(fallbackPath)
+	}
+
+	// No rigs.json found anywhere — warn loudly.
+	style.PrintWarning("rigs.json not found (checked mayor/rigs.json and town root). " +
+		"PrefixRegistry is empty — session parsing will fail. " +
+		"Run 'gt doctor' or restore rigs.json.")
+	return NewPrefixRegistry(), nil
 }
 
 // rigsJSON is the minimal structure for reading rigs.json prefix data.
@@ -285,4 +309,27 @@ func (r *PrefixRegistry) sortedPrefixes() []string {
 		return len(prefixes[i]) > len(prefixes[j])
 	})
 	return prefixes
+}
+
+// copyFileIfNewer copies src to dst if src is newer or dst doesn't exist.
+// Errors are silently ignored — this is a best-effort resilience mechanism.
+func copyFileIfNewer(src, dst string) {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return
+	}
+	if dstInfo, err := os.Stat(dst); err == nil {
+		if !srcInfo.ModTime().After(dstInfo.ModTime()) {
+			return // dst is up to date
+		}
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, dst)
 }

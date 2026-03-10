@@ -633,6 +633,193 @@ func TestFormatHelpSummary_WithAssessment(t *testing.T) {
 	}
 }
 
+// --- Dispatch message types (te-l0o) ---
+
+func TestClassifyMessage_DispatchTypes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		subject  string
+		expected ProtocolType
+	}{
+		{"DISPATCH_ATTEMPT nux", ProtoDispatchAttempt},
+		{"DISPATCH_ATTEMPT slit", ProtoDispatchAttempt},
+		{"DISPATCH_OK nux", ProtoDispatchOK},
+		{"DISPATCH_OK furiosa", ProtoDispatchOK},
+		{"DISPATCH_FAIL nux", ProtoDispatchFail},
+		{"DISPATCH_FAIL ace", ProtoDispatchFail},
+		{"IDLE_PASSIVATED nux", ProtoIdlePassivated},
+		{"IDLE_PASSIVATED slit", ProtoIdlePassivated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.subject, func(t *testing.T) {
+			result := ClassifyMessage(tc.subject)
+			if result != tc.expected {
+				t.Errorf("ClassifyMessage(%q) = %v, want %v", tc.subject, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestParseDispatchAttempt(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_ATTEMPT nux"
+	body := "Bead: gt-abc123"
+
+	payload, err := ParseDispatchAttempt(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchAttempt() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.BeadID != "gt-abc123" {
+		t.Errorf("BeadID = %q, want %q", payload.BeadID, "gt-abc123")
+	}
+	if payload.AttemptedAt.IsZero() {
+		t.Error("AttemptedAt should not be zero")
+	}
+}
+
+func TestParseDispatchAttempt_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDispatchAttempt("Not a dispatch", "body")
+	if err == nil {
+		t.Error("ParseDispatchAttempt() expected error for invalid subject")
+	}
+}
+
+func TestParseDispatchOK(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_OK nux"
+	body := "Bead: gt-abc123"
+
+	payload, err := ParseDispatchOK(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchOK() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.BeadID != "gt-abc123" {
+		t.Errorf("BeadID = %q, want %q", payload.BeadID, "gt-abc123")
+	}
+	if payload.DispatchedAt.IsZero() {
+		t.Error("DispatchedAt should not be zero")
+	}
+}
+
+func TestParseDispatchOK_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDispatchOK("Not a dispatch ok", "body")
+	if err == nil {
+		t.Error("ParseDispatchOK() expected error for invalid subject")
+	}
+}
+
+func TestParseDispatchFail(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_FAIL nux"
+	body := `Bead: gt-abc123
+Reason: bead already claimed`
+
+	payload, err := ParseDispatchFail(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchFail() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.BeadID != "gt-abc123" {
+		t.Errorf("BeadID = %q, want %q", payload.BeadID, "gt-abc123")
+	}
+	if payload.Reason != "bead already claimed" {
+		t.Errorf("Reason = %q, want %q", payload.Reason, "bead already claimed")
+	}
+	if payload.FailedAt.IsZero() {
+		t.Error("FailedAt should not be zero")
+	}
+}
+
+func TestParseDispatchFail_MinimalBody(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_FAIL ace"
+	body := "Reason: polecat state changed"
+
+	payload, err := ParseDispatchFail(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchFail() error = %v", err)
+	}
+
+	if payload.PolecatName != "ace" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "ace")
+	}
+	if payload.BeadID != "" {
+		t.Errorf("BeadID = %q, want empty", payload.BeadID)
+	}
+	if payload.Reason != "polecat state changed" {
+		t.Errorf("Reason = %q, want %q", payload.Reason, "polecat state changed")
+	}
+}
+
+func TestParseDispatchFail_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDispatchFail("Not a dispatch fail", "body")
+	if err == nil {
+		t.Error("ParseDispatchFail() expected error for invalid subject")
+	}
+}
+
+func TestParseIdlePassivated(t *testing.T) {
+	t.Parallel()
+	subject := "IDLE_PASSIVATED nux"
+	body := "IdleDuration: 24h0m0s"
+
+	payload, err := ParseIdlePassivated(subject, body)
+	if err != nil {
+		t.Fatalf("ParseIdlePassivated() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.IdleDuration != "24h0m0s" {
+		t.Errorf("IdleDuration = %q, want %q", payload.IdleDuration, "24h0m0s")
+	}
+	if payload.PassivatedAt.IsZero() {
+		t.Error("PassivatedAt should not be zero")
+	}
+}
+
+func TestParseIdlePassivated_MinimalBody(t *testing.T) {
+	t.Parallel()
+	subject := "IDLE_PASSIVATED slit"
+	body := ""
+
+	payload, err := ParseIdlePassivated(subject, body)
+	if err != nil {
+		t.Fatalf("ParseIdlePassivated() error = %v", err)
+	}
+
+	if payload.PolecatName != "slit" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "slit")
+	}
+	if payload.IdleDuration != "" {
+		t.Errorf("IdleDuration = %q, want empty", payload.IdleDuration)
+	}
+}
+
+func TestParseIdlePassivated_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseIdlePassivated("Not idle passivated", "body")
+	if err == nil {
+		t.Error("ParseIdlePassivated() expected error for invalid subject")
+	}
+}
+
 // --- Agent state and exit type constants (gt-x7t9) ---
 
 func TestAgentStateConstants(t *testing.T) {

@@ -35,6 +35,18 @@ var (
 
 	// SWARM_START - mayor initiating batch work
 	PatternSwarmStart = regexp.MustCompile(`^SWARM_START`)
+
+	// DISPATCH_ATTEMPT <polecat-name> - witness attempting to dispatch polecat to bead
+	PatternDispatchAttempt = regexp.MustCompile(`^DISPATCH_ATTEMPT\s+(\S+)`)
+
+	// DISPATCH_OK <polecat-name> - dispatch succeeded
+	PatternDispatchOK = regexp.MustCompile(`^DISPATCH_OK\s+(\S+)`)
+
+	// DISPATCH_FAIL <polecat-name> - dispatch failed
+	PatternDispatchFail = regexp.MustCompile(`^DISPATCH_FAIL\s+(\S+)`)
+
+	// IDLE_PASSIVATED <polecat-name> - polecat passivated after idle timeout
+	PatternIdlePassivated = regexp.MustCompile(`^IDLE_PASSIVATED\s+(\S+)`)
 )
 
 // ProtocolType identifies the type of protocol message.
@@ -49,6 +61,10 @@ const (
 	ProtoMergeReady        ProtocolType = "merge_ready"
 	ProtoHandoff           ProtocolType = "handoff"
 	ProtoSwarmStart        ProtocolType = "swarm_start"
+	ProtoDispatchAttempt   ProtocolType = "dispatch_attempt"
+	ProtoDispatchOK        ProtocolType = "dispatch_ok"
+	ProtoDispatchFail      ProtocolType = "dispatch_fail"
+	ProtoIdlePassivated    ProtocolType = "idle_passivated"
 	ProtoUnknown           ProtocolType = "unknown"
 )
 
@@ -169,6 +185,35 @@ type SwarmStartPayload struct {
 	StartedAt time.Time
 }
 
+// DispatchAttemptPayload contains parsed data from a DISPATCH_ATTEMPT message.
+type DispatchAttemptPayload struct {
+	PolecatName string
+	BeadID      string
+	AttemptedAt time.Time
+}
+
+// DispatchOKPayload contains parsed data from a DISPATCH_OK message.
+type DispatchOKPayload struct {
+	PolecatName string
+	BeadID      string
+	DispatchedAt time.Time
+}
+
+// DispatchFailPayload contains parsed data from a DISPATCH_FAIL message.
+type DispatchFailPayload struct {
+	PolecatName string
+	BeadID      string
+	Reason      string
+	FailedAt    time.Time
+}
+
+// IdlePassivatedPayload contains parsed data from an IDLE_PASSIVATED message.
+type IdlePassivatedPayload struct {
+	PolecatName  string
+	IdleDuration string
+	PassivatedAt time.Time
+}
+
 // ClassifyMessage determines the protocol type from a message subject.
 func ClassifyMessage(subject string) ProtocolType {
 	switch {
@@ -188,6 +233,14 @@ func ClassifyMessage(subject string) ProtocolType {
 		return ProtoHandoff
 	case PatternSwarmStart.MatchString(subject):
 		return ProtoSwarmStart
+	case PatternDispatchAttempt.MatchString(subject):
+		return ProtoDispatchAttempt
+	case PatternDispatchOK.MatchString(subject):
+		return ProtoDispatchOK
+	case PatternDispatchFail.MatchString(subject):
+		return ProtoDispatchFail
+	case PatternIdlePassivated.MatchString(subject):
+		return ProtoIdlePassivated
 	default:
 		return ProtoUnknown
 	}
@@ -404,6 +457,114 @@ func ParseSwarmStart(body string) (*SwarmStartPayload, error) {
 			}
 		} else if strings.HasPrefix(line, "Total:") {
 			_, _ = fmt.Sscanf(line, "Total: %d", &payload.Total)
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseDispatchAttempt extracts payload from a DISPATCH_ATTEMPT message.
+// Subject format: DISPATCH_ATTEMPT <polecat-name>
+// Body format:
+//
+//	Bead: <bead-id>
+func ParseDispatchAttempt(subject, body string) (*DispatchAttemptPayload, error) {
+	matches := PatternDispatchAttempt.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DISPATCH_ATTEMPT subject: %s", subject)
+	}
+
+	payload := &DispatchAttemptPayload{
+		PolecatName: matches[1],
+		AttemptedAt: time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Bead:") {
+			payload.BeadID = strings.TrimSpace(strings.TrimPrefix(line, "Bead:"))
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseDispatchOK extracts payload from a DISPATCH_OK message.
+// Subject format: DISPATCH_OK <polecat-name>
+// Body format:
+//
+//	Bead: <bead-id>
+func ParseDispatchOK(subject, body string) (*DispatchOKPayload, error) {
+	matches := PatternDispatchOK.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DISPATCH_OK subject: %s", subject)
+	}
+
+	payload := &DispatchOKPayload{
+		PolecatName:  matches[1],
+		DispatchedAt: time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Bead:") {
+			payload.BeadID = strings.TrimSpace(strings.TrimPrefix(line, "Bead:"))
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseDispatchFail extracts payload from a DISPATCH_FAIL message.
+// Subject format: DISPATCH_FAIL <polecat-name>
+// Body format:
+//
+//	Bead: <bead-id>
+//	Reason: <failure-reason>
+func ParseDispatchFail(subject, body string) (*DispatchFailPayload, error) {
+	matches := PatternDispatchFail.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DISPATCH_FAIL subject: %s", subject)
+	}
+
+	payload := &DispatchFailPayload{
+		PolecatName: matches[1],
+		FailedAt:    time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Bead:"):
+			payload.BeadID = strings.TrimSpace(strings.TrimPrefix(line, "Bead:"))
+		case strings.HasPrefix(line, "Reason:"):
+			payload.Reason = strings.TrimSpace(strings.TrimPrefix(line, "Reason:"))
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseIdlePassivated extracts payload from an IDLE_PASSIVATED message.
+// Subject format: IDLE_PASSIVATED <polecat-name>
+// Body format:
+//
+//	IdleDuration: <duration>
+func ParseIdlePassivated(subject, body string) (*IdlePassivatedPayload, error) {
+	matches := PatternIdlePassivated.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid IDLE_PASSIVATED subject: %s", subject)
+	}
+
+	payload := &IdlePassivatedPayload{
+		PolecatName:  matches[1],
+		PassivatedAt: time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "IdleDuration:") {
+			payload.IdleDuration = strings.TrimSpace(strings.TrimPrefix(line, "IdleDuration:"))
 		}
 	}
 
