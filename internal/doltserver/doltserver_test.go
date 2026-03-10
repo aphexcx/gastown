@@ -1470,6 +1470,56 @@ func TestEnsureMetadata_RepairsMissingDoltFields(t *testing.T) {
 	}
 }
 
+// TestEnsureMetadata_RepairsStalePort tests that EnsureMetadata overwrites
+// a stale dolt_server_port (e.g., 13729 from a previous bd init) with the
+// correct port from DefaultConfig. This is the root cause of "connection
+// refused" errors reported by community users after gt dolt fix-metadata.
+func TestEnsureMetadata_RepairsStalePort(t *testing.T) {
+	townRoot := t.TempDir()
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate stale metadata with wrong port (13729 instead of 3307)
+	stale := map[string]interface{}{
+		"backend":          "dolt",
+		"database":         "dolt",
+		"dolt_mode":        "server",
+		"dolt_database":    "hq",
+		"dolt_server_host": "127.0.0.1",
+		"dolt_server_port": 13729,
+	}
+	data, _ := json.Marshal(stale)
+	metaPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metaPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "hq"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	repaired, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("reading metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(repaired, &meta); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+
+	// Port should now be the default (3307), not the stale 13729
+	wantPort := float64(DefaultPort)
+	if meta["dolt_server_port"] != wantPort {
+		t.Errorf("dolt_server_port = %v, want %v", meta["dolt_server_port"], wantPort)
+	}
+	if meta["dolt_server_host"] != "127.0.0.1" {
+		t.Errorf("dolt_server_host = %v, want 127.0.0.1", meta["dolt_server_host"])
+	}
+}
+
 // TestEnsureAllMetadata_RepairsAllCorrupt tests that EnsureAllMetadata
 // repairs metadata for all known databases, even if some are corrupt.
 func TestEnsureAllMetadata_RepairsAllCorrupt(t *testing.T) {

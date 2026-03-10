@@ -1249,6 +1249,16 @@ func ResolveWorkerAgentConfig(workerName, townRoot, rigPath string) *RuntimeConf
 	return withRoleSettingsFlag(rc, "crew", rigPath)
 }
 
+// IsResolvedAgentClaude returns true if the RuntimeConfig represents a Claude agent.
+// Exported for use in witness/daemon code that needs to skip hardcoded
+// Claude start commands when a non-Claude agent is configured.
+func IsResolvedAgentClaude(rc *RuntimeConfig) bool {
+	if rc == nil {
+		return true // Default to Claude when config is unavailable
+	}
+	return isClaudeAgent(rc)
+}
+
 // isClaudeAgent returns true if the RuntimeConfig represents a Claude agent.
 // When Provider is explicitly set, it's authoritative. When empty, the Command
 // is checked: bare "claude", a path ending in "/claude" (or "\claude" on Windows),

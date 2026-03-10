@@ -1041,6 +1041,7 @@ listener:
 data_dir: "%s"
 
 behavior:
+  dolt_transaction_commit: true
   auto_gc_behavior:
     enable: true
     archive_level: 1
@@ -2480,6 +2481,9 @@ func EnsureMetadata(townRoot, rigName string) error {
 		_ = json.Unmarshal(data, &existing) // best effort
 	}
 
+	// Resolve the authoritative server config (config.yaml > env > daemon.json > default).
+	config := DefaultConfig(townRoot)
+
 	// Patch dolt server fields. Only write when values actually change so tracked
 	// metadata.json files in source repos stay clean.
 	changed := false
@@ -2497,6 +2501,21 @@ func EnsureMetadata(townRoot, rigName string) error {
 	}
 	if existing["dolt_database"] == nil || existing["dolt_database"] == "" {
 		existing["dolt_database"] = rigName
+		changed = true
+	}
+
+	// Ensure server connection fields match the authoritative config.
+	// bd reads dolt_server_host and dolt_server_port from metadata.json to
+	// connect to the Dolt server. Stale values (e.g., port 13729 from a
+	// previous bd init) cause "connection refused" errors.
+	wantHost := config.EffectiveHost()
+	wantPort := float64(config.Port) // JSON numbers are float64
+	if existing["dolt_server_host"] != wantHost {
+		existing["dolt_server_host"] = wantHost
+		changed = true
+	}
+	if existing["dolt_server_port"] != wantPort {
+		existing["dolt_server_port"] = wantPort
 		changed = true
 	}
 

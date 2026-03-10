@@ -208,7 +208,14 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	}
 	_ = t.SetEnvironment(sessionID, "GT_RUN", runID)
 	// Apply role config env vars if present (non-fatal).
+	// Skip keys already set by AgentEnv — AgentEnv is the single source of truth
+	// for identity vars (GT_ROLE, BD_ACTOR, etc.) and produces fully-qualified
+	// values (e.g., "beacon/witness"). TOML [env] sections contain unqualified
+	// values (e.g., "witness") that would overwrite the correct ones.
 	for key, value := range roleConfigEnvVars(roleConfig, townRoot, m.rig.Name) {
+		if _, alreadySet := envVars[key]; alreadySet {
+			continue
+		}
 		_ = t.SetEnvironment(sessionID, key, value)
 	}
 	// Apply CLI env overrides (highest priority, non-fatal).
@@ -294,7 +301,14 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOver
 		roleConfig = nil
 	}
 	if roleConfig != nil && roleConfig.StartCommand != "" {
-		return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness", session.PrefixFor(rigName)), nil
+		// Skip the hardcoded start_command when a non-Claude agent is configured.
+		// Built-in role TOMLs hardcode "exec claude ..." which bypasses the
+		// declarative agent resolution system. Fall through to
+		// BuildStartupCommandFromConfig so the correct agent command is built.
+		rc := config.ResolveRoleAgentConfig("witness", townRoot, rigPath)
+		if config.IsResolvedAgentClaude(rc) {
+			return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness", session.PrefixFor(rigName)), nil
+		}
 	}
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("witness", "", rigName),
