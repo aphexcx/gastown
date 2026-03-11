@@ -97,7 +97,7 @@ if [ -n "$BEADS_DIR" ]; then
 fi
 
 case "$*" in
-  "list --type=convoy --json --all")
+  "list --type=convoy --json --all --flat")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
       exit 1
