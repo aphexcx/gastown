@@ -919,9 +919,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             slingArgs,
+		Vars:             append([]string(nil), slingVars...),
 		AttachedMolecule: attachedMoleculeID,
 		AttachedFormula:  formulaName,
 		NoMerge:          slingNoMerge,
+		FormulaVars:      strings.Join(slingVars, "\n"),
 	}
 	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
 		// Warn but don't fail - polecat will still complete work

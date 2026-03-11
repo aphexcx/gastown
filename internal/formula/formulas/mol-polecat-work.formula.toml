@@ -52,7 +52,7 @@ stale, the refinery falls through to normal gate execution.
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work"
-version = 8
+version = 9
 
 [[steps]]
 id = "load-context"
@@ -82,13 +82,31 @@ gt mail inbox
 # Read any HANDOFF or assignment messages
 ```
 
-**4. Understand the requirements:**
+**4. Check for prior merge failure context:**
+
+If the bead notes contain "MERGE REJECTION", a previous polecat's work was
+rejected by the refinery. Read the failure details carefully:
+- **Failure-Type**: what broke (tests, build, lint, typecheck)
+- **Error**: the actual error output
+- **Branch**: the previous branch may still exist with the original work
+
+If a prior branch exists, check it out instead of creating a new one:
+```bash
+git fetch origin
+git branch -a | grep <branch-from-notes>
+# If it exists: git checkout <branch> && git rebase origin/{{base_branch}}
+```
+
+This lets you make a targeted fix rather than starting from scratch.
+
+**5. Understand the requirements:**
 - What exactly needs to be done?
 - What files are likely involved?
 - Are there dependencies or blockers?
 - What does "done" look like?
+- If this is a rework: what specifically failed and why?
 
-**5. Verify you can proceed:**
+**6. Verify you can proceed:**
 - No unresolved blockers on the issue
 - You understand what to do
 - Required resources are available
@@ -114,7 +132,20 @@ git status
 git branch --show-current
 ```
 
-**2. If not on a feature branch, create one:**
+**2. Check for a prior branch from a rejected MR:**
+
+If the bead notes contain "MERGE REJECTION" with a branch name, check if that
+branch still exists on the remote. Reusing it preserves all previous work:
+```bash
+git fetch origin
+# Check for prior branch
+git branch -r | grep <prior-branch>
+# If found, check it out:
+git checkout -b <prior-branch> origin/<prior-branch>
+git rebase origin/{{base_branch}}
+```
+
+**If no prior branch, create a fresh one:**
 ```bash
 git fetch origin
 git checkout -b polecat/<name> origin/{{base_branch}}
@@ -224,7 +255,17 @@ id = "self-review"
 title = "Self-review changes"
 needs = ["implement"]
 description = """
-Review your own changes before the build check.
+Review your own changes before the build check. Use `/review --branch` for
+structured grading, or do a manual review.
+
+**Option A: Use /review (recommended)**
+```bash
+/review --branch
+```
+This gives you a structured grade (A-F) with CRITICAL/MAJOR/MINOR findings
+and specific fix suggestions. Fix any CRITICAL or MAJOR issues before proceeding.
+
+**Option B: Manual review**
 
 **1. Review the diff:**
 ```bash
@@ -253,7 +294,8 @@ git diff --stat origin/{{base_branch}}...HEAD
 
 If you accidentally modified unrelated files, remove those changes.
 
-**Exit criteria:** Changes are clean, reviewed, and ready for build check."""
+**Exit criteria:** Changes are clean, reviewed (Grade B or better if using /review),
+and ready for build check."""
 
 [[steps]]
 id = "build-check"

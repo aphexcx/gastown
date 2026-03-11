@@ -67,6 +67,12 @@ type TownSettings struct {
 	// Example: {"mayor": "claude-opus", "witness": "claude-haiku", "polecat": "claude-sonnet"}
 	RoleAgents map[string]string `json:"role_agents,omitempty"`
 
+	// CrewAgents maps individual crew worker names to agent aliases at the town level.
+	// This allows town-wide per-crew agent assignment without modifying each rig's config.
+	// Resolution: --agent flag > rig WorkerAgents > town CrewAgents > role agents > defaults.
+	// Example: {"bob": "codex", "alice": "claude"}
+	CrewAgents map[string]string `json:"crew_agents,omitempty"`
+
 	// AgentEmailDomain is the domain used for agent git identity emails.
 	// Agent addresses like "gastown/crew/jack" become "gastown.crew.jack@{domain}".
 	// Default: "gastown.local"
@@ -1228,7 +1234,7 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		IntegrationBranchRefineryEnabled: boolPtr(true),
 		OnConflict:                       OnConflictAssignBack,
 		RunTests:                         boolPtr(true),
-		TestCommand:                      "go test ./...",
+		TestCommand:                      "",
 		DeleteMergedBranches:             boolPtr(true),
 		RetryFlakyTests:                  1,
 		PollInterval:                     "30s",
@@ -1418,6 +1424,12 @@ type EscalationContacts struct {
 	HumanEmail   string `json:"human_email,omitempty"`   // email address for email:human action
 	HumanSMS     string `json:"human_sms,omitempty"`     // phone number for sms:human action
 	SlackWebhook string `json:"slack_webhook,omitempty"` // webhook URL for slack action
+	SMTPHost     string `json:"smtp_host,omitempty"`     // SMTP server host (e.g. "smtp.gmail.com")
+	SMTPPort     string `json:"smtp_port,omitempty"`     // SMTP server port (default "587")
+	SMTPFrom     string `json:"smtp_from,omitempty"`     // sender address for email notifications
+	SMTPUser     string `json:"smtp_user,omitempty"`     // SMTP auth username (optional)
+	SMTPPass     string `json:"smtp_pass,omitempty"`     // SMTP auth password (optional)
+	SMSWebhook   string `json:"sms_webhook,omitempty"`   // webhook URL for SMS delivery (e.g. Twilio)
 }
 
 // CurrentEscalationVersion is the current schema version for EscalationConfig.

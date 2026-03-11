@@ -13,6 +13,8 @@ import (
 
 func TestBuildBdInitArgs_AlwaysIncludesServerPort(t *testing.T) {
 	townDir := t.TempDir()
+	t.Setenv("GT_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
 
 	args := buildBdInitArgs(townDir)
 
@@ -83,7 +85,7 @@ func TestEnsureBeadsConfigYAML_CreatesWhenMissing(t *testing.T) {
 	}
 
 	got := string(data)
-	want := "prefix: hq\nissue-prefix: hq\n"
+	want := "prefix: hq\nissue-prefix: hq\ndolt.idle-timeout: \"0\"\n"
 	if got != want {
 		t.Fatalf("config.yaml = %q, want %q", got, want)
 	}

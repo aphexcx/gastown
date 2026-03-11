@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -44,6 +45,9 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 }
 
 var fetcherRunCmd = runCmd
+var fetcherGetSessionEnv = func(sessionName, key string) (string, error) {
+	return tmux.NewTmux().GetEnvironment(sessionName, key)
+}
 
 // runBdCmd executes a bd command with the configured cmdTimeout in the specified beads directory.
 func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Buffer, error) {
@@ -259,7 +263,6 @@ type trackedIssueInfo struct {
 	LastActivity time.Time
 	UpdatedAt    time.Time // Fallback for activity when no assignee
 }
-
 
 // getTrackedIssues fetches tracked issues for a convoy.
 func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInfo, error) {
@@ -1341,7 +1344,7 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 // FetchSessions returns active tmux sessions with role detection.
 func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		return nil, nil // tmux not running or no sessions
 	}
@@ -1484,12 +1487,76 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 		}
 	}
 
-	// Try to detect runtime from mayor config or session
 	if status.IsAttached {
-		status.Runtime = "claude" // Default; could enhance to detect actual runtime
+		status.Runtime = f.resolveMayorRuntime(mayorSessionName)
 	}
 
 	return status, nil
+}
+
+func (f *LiveConvoyFetcher) resolveMayorRuntime(sessionName string) string {
+	if agentName, err := fetcherGetSessionEnv(sessionName, "GT_AGENT"); err == nil && strings.TrimSpace(agentName) != "" {
+		agentName = strings.TrimSpace(agentName)
+		rc, _, resolveErr := config.ResolveAgentConfigWithOverride(f.townRoot, "", agentName)
+		if resolveErr == nil {
+			return runtimeLabelForRuntimeConfig(rc, agentName)
+		}
+		if roleRC := config.ResolveRoleAgentConfig(constants.RoleMayor, f.townRoot, ""); roleRC != nil && strings.TrimSpace(roleRC.ResolvedAgent) == agentName {
+			return runtimeLabelForRuntimeConfig(roleRC, agentName)
+		}
+		return agentName
+	}
+
+	return runtimeLabelForRuntimeConfig(config.ResolveRoleAgentConfig(constants.RoleMayor, f.townRoot, ""), "")
+}
+
+func runtimeLabelForRuntimeConfig(rc *config.RuntimeConfig, fallback string) string {
+	if rc == nil {
+		if fallback != "" {
+			return fallback
+		}
+		return "claude"
+	}
+	if fallback == "" {
+		fallback = rc.ResolvedAgent
+	}
+	return runtimeLabelFromConfig(rc.Command, rc.Args, fallback)
+}
+
+func runtimeLabelFromConfig(command string, args []string, fallback string) string {
+	command = strings.TrimSpace(command)
+	cmd := ""
+	if command != "" {
+		cmd = strings.TrimSpace(filepath.Base(command))
+	}
+	if cmd == "" {
+		cmd = fallback
+	}
+	if cmd == "" {
+		cmd = "claude"
+	}
+	if cmd == "cgroup-wrap" && len(args) > 0 {
+		cmd = filepath.Base(args[0])
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if (arg == "--model" || arg == "-m") && i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
+			return cmd + "/" + strings.TrimSpace(args[i+1])
+		}
+		if strings.HasPrefix(arg, "--model=") {
+			if v := strings.TrimSpace(strings.TrimPrefix(arg, "--model=")); v != "" {
+				return cmd + "/" + v
+			}
+		}
+		if strings.HasPrefix(arg, "-m=") {
+			if v := strings.TrimSpace(strings.TrimPrefix(arg, "-m=")); v != "" {
+				return cmd + "/" + v
+			}
+		}
+	}
+
+	return cmd
 }
 
 // FetchIssues returns open issues (the backlog).

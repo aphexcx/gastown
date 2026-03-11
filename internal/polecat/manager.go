@@ -1225,8 +1225,10 @@ func forceRemoveDir(dir string) error {
 		}
 		// Make writable (0755 for dirs, 0644 for files)
 		if d.IsDir() {
+			//nolint:gosec // Controlled cleanup of a path inside the allocated polecat directory.
 			_ = os.Chmod(path, 0755)
 		} else {
+			//nolint:gosec // Controlled cleanup of a path inside the allocated polecat directory.
 			_ = os.Chmod(path, 0644)
 		}
 		return nil
@@ -1543,10 +1545,25 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 		return nil, fmt.Errorf("start point %s not found — fall back to full repair", startPoint)
 	}
 
+	// Clean worktree state before branch switch — the worktree may have stale
+	// state from a previous dog/pool dispatch (uncommitted changes, detached HEAD,
+	// or checked out on an old dog/alpha-* branch).
+	_ = polecatGit.ResetHard("HEAD")
+
 	// Create fresh branch from start point (branch-only, no worktree add/remove)
 	branchName := m.buildBranchName(name, opts.HookBead)
 	if err := polecatGit.CheckoutNewBranch(branchName, startPoint); err != nil {
-		return nil, fmt.Errorf("creating branch %s from %s: %w", branchName, startPoint, err)
+		// checkout -b fails if we're in detached HEAD or branch already exists.
+		// Fall back to: create branch separately, then checkout.
+		_ = polecatGit.Checkout(startPoint)
+		if err2 := polecatGit.CheckoutNewBranch(branchName, startPoint); err2 != nil {
+			return nil, fmt.Errorf("creating branch %s from %s (retry after cleanup): %w", branchName, startPoint, err2)
+		}
+	}
+
+	// Verify the worktree is actually on the expected branch
+	if actual, err := polecatGit.CurrentBranch(); err == nil && actual != branchName {
+		return nil, fmt.Errorf("branch mismatch after checkout: expected %s, got %s", branchName, actual)
 	}
 
 	// Reset agent bead for reuse

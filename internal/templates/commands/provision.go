@@ -50,6 +50,16 @@ var Commands = []Command{
 			// opencode: no extra fields, just description
 		},
 	},
+	{
+		Name:        "review",
+		Description: "Review code changes with structured grading (A-F)",
+		AgentFields: map[string][]Field{
+			"claude": {
+				{"allowed-tools", "Bash(git diff:*), Bash(git rev-parse:*), Bash(gh pr diff:*)"},
+				{"argument-hint", "[--staged | --branch | --pr <url>]"},
+			},
+		},
+	},
 }
 
 // BuildCommand assembles frontmatter + body for an agent.
@@ -128,6 +138,16 @@ func MissingFor(workspacePath, agent string) []string {
 	}
 
 	return missing
+}
+
+// FindByName returns the command with the given name, or nil if not found.
+func FindByName(name string) *Command {
+	for i := range Commands {
+		if Commands[i].Name == name {
+			return &Commands[i]
+		}
+	}
+	return nil
 }
 
 // Names returns the names of all registered commands.

@@ -40,8 +40,11 @@ func TestGetPatrolRigs_FiltersNonOperationalRigs(t *testing.T) {
 
 	got := d.getPatrolRigs("witness")
 	slices.Sort(got)
-	want := []string{"alpha"}
+	// When Dolt is unavailable, isRigOperational() fails safe and returns false
+	// for all rigs (can't verify docked status). This prevents witnesses from
+	// starting for potentially docked rigs during Dolt outages.
+	want := []string{}
 	if !slices.Equal(got, want) {
-		t.Fatalf("getPatrolRigs() = %v, want %v (parked/docked rigs should be filtered here)", got, want)
+		t.Fatalf("getPatrolRigs() = %v, want %v (all rigs excluded when Dolt unavailable - fail-safe)", got, want)
 	}
 }

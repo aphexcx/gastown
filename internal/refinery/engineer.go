@@ -966,8 +966,12 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
-	// 2. Delete source branch if configured (local and remote)
-	if e.config.DeleteMergedBranches && mr.Branch != "" {
+	// 2. Delete source branch (local and remote).
+	// Polecat branches (polecat/*) are always cleaned up — they are ephemeral
+	// work branches that should never persist after merge. Other branches
+	// respect the DeleteMergedBranches config.
+	isPolecat := strings.HasPrefix(mr.Branch, "polecat/")
+	if mr.Branch != "" && (e.config.DeleteMergedBranches || isPolecat) {
 		if err := e.git.DeleteBranch(mr.Branch, true); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete local branch %s: %v\n", mr.Branch, err)
 		} else {
@@ -985,7 +989,17 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// Run convoy check to auto-close and notify subscribers.
 	e.postMergeConvoyCheck(mr)
 
-	// 4. Log success
+	// 4. Nudge mayor about successful merge so dispatcher can unblock
+	// dependent work. Without this, mayor only discovers completion by polling.
+	// Uses nudge (not mail) to avoid permanent Dolt commits for routine signals (GH#2434).
+	nudgeMsg := fmt.Sprintf("MERGED: %s issue=%s branch=%s", mr.ID, mr.SourceIssue, mr.Branch)
+	nudgeCmd := exec.Command("gt", "nudge", "mayor/", nudgeMsg)
+	nudgeCmd.Dir = e.workDir
+	if err := nudgeCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about merge: %v\n", err)
+	}
+
+	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
 }
 

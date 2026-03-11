@@ -2033,13 +2033,26 @@ func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 // getTrackedIssues uses bd dep list to get issues tracked by a convoy.
 // Returns issue details including status, type, and worker info.
 func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
-	// Use bd dep list to get tracked dependencies
-	// Run from town root (parent of .beads) so bd routes correctly
 	townRoot := filepath.Dir(townBeads)
-	out, err := runBdJSON(townRoot, "dep", "list", convoyID, "--direction=down", "--type=tracks", "--json")
-	if err != nil {
-		return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
+	env := filterEnvKey(os.Environ(), "BEADS_DIR")
+	depArgs := beads.MaybePrependAllowStaleWithEnv(env, []string{
+		"dep", "list", convoyID, "--direction=down", "--type=tracks", "--json",
+	})
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("bd", depArgs...)
+	cmd.Dir = townRoot
+	cmd.Env = env
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
+			return nil, fmt.Errorf("querying tracked issues for %s: bd dep: %s", convoyID, errMsg)
+		}
+		return nil, fmt.Errorf("querying tracked issues for %s: bd dep: %w", convoyID, err)
 	}
+
+	out := stdout.Bytes()
 
 	// Parse the JSON output - bd dep list returns full issue details
 	var deps []trackedDependency
@@ -2047,10 +2060,14 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, err)
 	}
 
-	// Unwrap external:prefix:id format from dep IDs before use
 	for i := range deps {
 		deps[i].ID = beads.ExtractIssueID(deps[i].ID)
 	}
+
+	// Merge tracked dependencies from bd show fallback. Some cross-rig tracked IDs
+	// can remain unresolved externals in dep-list output and only appear under
+	// show.dependencies; include both sources to avoid under-counting progress.
+	deps = mergeTrackedDependencies(deps, trackedDependenciesFromShow(townRoot, convoyID))
 
 	// Refresh status via cross-rig lookup. bd dep list returns status from
 	// the dependency record in HQ beads which is never updated when cross-rig
@@ -2099,6 +2116,77 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 	}
 
 	return tracked, nil
+}
+
+// trackedDependenciesFromShow reads convoy dependencies from bd show and returns
+// only "tracks" relations as trackedDependency values.
+func trackedDependenciesFromShow(townRoot, convoyID string) []trackedDependency {
+	out, err := runBdJSON(townRoot, "show", convoyID, "--json")
+	if err != nil {
+		return nil
+	}
+
+	var issues []beads.Issue
+	if err := json.Unmarshal(out, &issues); err != nil || len(issues) == 0 {
+		return nil
+	}
+
+	var tracked []trackedDependency
+	for _, dep := range issues[0].Dependencies {
+		if dep.DependencyType != "tracks" {
+			continue
+		}
+		tracked = append(tracked, trackedDependency{
+			ID:             dep.ID,
+			Title:          dep.Title,
+			Status:         dep.Status,
+			IssueType:      dep.Type,
+			DependencyType: dep.DependencyType,
+		})
+	}
+	return tracked
+}
+
+// mergeTrackedDependencies combines dep-list and show-derived tracked deps,
+// normalizes external IDs, and de-duplicates by normalized issue ID.
+func mergeTrackedDependencies(primary, fallback []trackedDependency) []trackedDependency {
+	seen := make(map[string]int, len(primary)+len(fallback))
+	merged := make([]trackedDependency, 0, len(primary)+len(fallback))
+
+	appendNormalized := func(dep trackedDependency) {
+		id := beads.ExtractIssueID(dep.ID)
+		if id == "" {
+			return
+		}
+		dep.ID = id
+		if idx, ok := seen[id]; ok {
+			// Keep the first occurrence order; backfill missing metadata.
+			if merged[idx].Title == "" {
+				merged[idx].Title = dep.Title
+			}
+			if merged[idx].Status == "" {
+				merged[idx].Status = dep.Status
+			}
+			if merged[idx].IssueType == "" {
+				merged[idx].IssueType = dep.IssueType
+			}
+			if merged[idx].DependencyType == "" {
+				merged[idx].DependencyType = dep.DependencyType
+			}
+			return
+		}
+		seen[id] = len(merged)
+		merged = append(merged, dep)
+	}
+
+	for _, dep := range primary {
+		appendNormalized(dep)
+	}
+	for _, dep := range fallback {
+		appendNormalized(dep)
+	}
+
+	return merged
 }
 
 type issueDependency struct {

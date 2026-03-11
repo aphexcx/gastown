@@ -239,11 +239,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Ensure beads metadata and port files are correct BEFORE agents start.
+	// Ensure beads metadata is correct BEFORE agents start.
 	// This prevents bd from seeing stale config and spawning orphan servers.
 	if doltOK {
 		_, _ = doltserver.EnsureAllMetadata(townRoot)
-		_ = doltserver.SyncPortFiles(townRoot, cfg.Port)
 	}
 
 	// Phase 2: Start all agents in parallel (Dolt is now ready)

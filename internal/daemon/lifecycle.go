@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -464,7 +465,23 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 		}
 		rc := config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath)
 		if config.IsResolvedAgentClaude(rc) {
-			return beads.ExpandRolePattern(roleConfig.StartCommand, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
+			cmd := beads.ExpandRolePattern(roleConfig.StartCommand, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
+			// Prepend env sanitization: CLAUDECODE causes Claude Code to
+			// reject startup (nested session detection) when inherited from
+			// tmux server environment. NODE_OPTIONS can contain debugger flags
+			// that crash Claude's Node.js runtime.
+			//
+			// The start_command may begin with "exec " (a shell builtin). Since
+			// env(1) treats its first non-option argument as the binary to run,
+			// "env ... exec claude" fails (exec is not a binary). We strip the
+			// "exec " prefix and re-add it before env so the shell processes it:
+			//   exec env -u CLAUDECODE NODE_OPTIONS='' claude ...
+			if strings.HasPrefix(cmd, "exec ") {
+				cmd = "exec env -u CLAUDECODE NODE_OPTIONS='' " + cmd[len("exec "):]
+			} else {
+				cmd = "env -u CLAUDECODE NODE_OPTIONS='' " + cmd
+			}
+			return cmd
 		}
 	}
 
@@ -552,9 +569,15 @@ func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.Rol
 		_ = d.tmux.SetEnvironment(sessionName, "GT_PANE_ID", paneID)
 	}
 
-	// Set any custom env vars from role config
+	// Set any custom env vars from role config.
+	// Skip keys already set by AgentEnv to prevent TOML [env] from clobbering
+	// canonical qualified values (e.g., GT_ROLE). See: https://github.com/steveyegge/gastown/issues/2492
 	if roleConfig != nil {
 		for k, v := range roleConfig.EnvVars {
+			if existing, alreadySet := envVars[k]; alreadySet {
+				log.Printf("daemon env: skipping TOML %s=%q (AgentEnv already set %q)", k, v, existing)
+				continue
+			}
 			expanded := beads.ExpandRolePattern(v, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 			_ = d.tmux.SetEnvironment(sessionName, k, expanded)
 		}
@@ -998,8 +1021,21 @@ func mergeAgentBeadJSON(wispJSON, issuesJSON []byte) []byte {
 // progressing. This is a GUPP violation: agents with hooked work must execute.
 // The daemon detects these and notifies the relevant Witness for remediation.
 func (d *Daemon) checkGUPPViolations() {
-	// Check polecat agents - they're the ones with work-on-hook
+	// Check if any rigs are operational before querying agent beads
 	rigs := d.getKnownRigs()
+	hasOperationalRig := false
+	for _, rigName := range rigs {
+		if operational, _ := d.isRigOperational(rigName); operational {
+			hasOperationalRig = true
+			break
+		}
+	}
+
+	// Skip entirely if no rigs are operational (all docked/parked)
+	if !hasOperationalRig {
+		return
+	}
+
 	for _, rigName := range rigs {
 		d.checkRigGUPPViolations(rigName)
 	}
@@ -1020,6 +1056,7 @@ func (d *Daemon) checkRigGUPPViolations(rigName string) {
 	}
 
 	if err := d.listAgentBeadsJSON(&agents); err != nil {
+		// Suppress warning when there are simply no agent beads (expected when all rigs are docked)
 		d.logger.Printf("Warning: listing agent beads failed for GUPP check: %v", err)
 		return
 	}
@@ -1092,8 +1129,21 @@ Action needed: Check if agent is alive and responsive. Consider restarting if st
 // Orphaned work needs to be reassigned or the agent needs to be restarted.
 // Per gt-zecmc: derive agent liveness from tmux, not agent_state.
 func (d *Daemon) checkOrphanedWork() {
-	// Check all polecat agents with hooked work
+	// Check if any rigs are operational before querying agent beads
 	rigs := d.getKnownRigs()
+	hasOperationalRig := false
+	for _, rigName := range rigs {
+		if operational, _ := d.isRigOperational(rigName); operational {
+			hasOperationalRig = true
+			break
+		}
+	}
+
+	// Skip entirely if no rigs are operational (all docked/parked)
+	if !hasOperationalRig {
+		return
+	}
+
 	for _, rigName := range rigs {
 		d.checkRigOrphanedWork(rigName)
 	}

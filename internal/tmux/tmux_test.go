@@ -2171,3 +2171,29 @@ func TestCheckSessionHealth_ActivityCheck(t *testing.T) {
 	// without needing a real Claude process.
 }
 
+func TestValidateCommandBinary(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		cmd     string
+		wantErr bool
+	}{
+		{"empty", "", false},
+		{"relative binary", "echo hello", false},
+		{"valid absolute", "/bin/sh -c 'echo hi'", false},
+		{"missing absolute", "/nonexistent/binary --flag", true},
+		{"exec env missing", "exec env GT_TEST=1 /nonexistent/claude-code --settings /tmp", true},
+		{"exec env valid", "exec env GT_TEST=1 /bin/sh -c 'echo hi'", false},
+		{"env vars only", "exec env FOO=bar BAZ=1", false},
+		{"bare exec", "exec /bin/sh", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCommandBinary(tc.cmd)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateCommandBinary(%q) error = %v, wantErr = %v", tc.cmd, err, tc.wantErr)
+			}
+		})
+	}
+}
+

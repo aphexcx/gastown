@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/bin:$PATH\" && gt prime --hook && gt mail check --inject"
+            "command": "export PATH=\"$HOME/go/bin:$HOME/bin:$PATH\" GT_SESSION_ID=${GT_SESSION_ID:-$(uuidgen)} GT_HOOK_SOURCE=startup && gt prime --hook && gt mail check --inject"
           }
         ]
       }
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/bin:$PATH\" && gt prime --hook"
+            "command": "export PATH=\"$HOME/go/bin:$HOME/bin:$PATH\" GT_HOOK_SOURCE=compact && gt prime --hook"
           }
         ]
       }

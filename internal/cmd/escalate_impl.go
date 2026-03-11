@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/smtp"
 	"os"
 	"strings"
 	"time"
@@ -128,8 +130,8 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Process external notification actions (email:, sms:, slack)
-	executeExternalActions(actions, escalationConfig, issue.ID, severity, description)
+	// Process external notification actions (email:, sms:, slack, log)
+	executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)
 
 	// Log to activity feed
 	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
@@ -553,41 +555,164 @@ func extractMailTargetsFromActions(actions []string) []string {
 	return targets
 }
 
-// executeExternalActions processes external notification actions (email:, sms:, slack).
-// For now, this logs warnings if contacts aren't configured - actual sending is future work.
-func executeExternalActions(actions []string, cfg *config.EscalationConfig, _, _, _ string) {
+// executeExternalActions processes external notification actions (email:, sms:, slack, log).
+func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, townRoot string) {
 	for _, action := range actions {
 		switch {
 		case strings.HasPrefix(action, "email:"):
 			if cfg.Contacts.HumanEmail == "" {
 				style.PrintWarning("email action '%s' skipped: contacts.human_email not configured in settings/escalation.json", action)
+			} else if cfg.Contacts.SMTPHost == "" {
+				style.PrintWarning("email action '%s' skipped: contacts.smtp_host not configured in settings/escalation.json", action)
 			} else {
-				// TODO: Implement actual email sending
-				fmt.Printf("  📧 Would send email to %s (not yet implemented)\n", cfg.Contacts.HumanEmail)
+				if err := sendEscalationEmail(cfg, beadID, severity, description); err != nil {
+					style.PrintWarning("email send failed: %v", err)
+				} else {
+					fmt.Printf("  📧 Email sent to %s\n", cfg.Contacts.HumanEmail)
+				}
 			}
 
 		case strings.HasPrefix(action, "sms:"):
 			if cfg.Contacts.HumanSMS == "" {
 				style.PrintWarning("sms action '%s' skipped: contacts.human_sms not configured in settings/escalation.json", action)
+			} else if cfg.Contacts.SMSWebhook == "" {
+				style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
 			} else {
-				// TODO: Implement actual SMS sending
-				fmt.Printf("  📱 Would send SMS to %s (not yet implemented)\n", cfg.Contacts.HumanSMS)
+				if err := sendEscalationSMS(cfg, beadID, severity, description); err != nil {
+					style.PrintWarning("sms send failed: %v", err)
+				} else {
+					fmt.Printf("  📱 SMS sent to %s\n", cfg.Contacts.HumanSMS)
+				}
 			}
 
 		case action == "slack":
 			if cfg.Contacts.SlackWebhook == "" {
 				style.PrintWarning("slack action skipped: contacts.slack_webhook not configured in settings/escalation.json")
 			} else {
-				// TODO: Implement actual Slack webhook posting
-				fmt.Printf("  💬 Would post to Slack (not yet implemented)\n")
+				if err := sendEscalationSlack(cfg, beadID, severity, description); err != nil {
+					style.PrintWarning("slack post failed: %v", err)
+				} else {
+					fmt.Printf("  💬 Posted to Slack\n")
+				}
 			}
 
 		case action == "log":
-			// Log action always succeeds - writes to escalation log file
-			// TODO: Implement actual log file writing
-			fmt.Printf("  📝 Logged to escalation log\n")
+			if err := writeEscalationLog(townRoot, beadID, severity, description); err != nil {
+				style.PrintWarning("log write failed: %v", err)
+			} else {
+				fmt.Printf("  📝 Logged to escalation log\n")
+			}
 		}
 	}
+}
+
+// sendEscalationEmail sends an escalation notification via SMTP.
+func sendEscalationEmail(cfg *config.EscalationConfig, beadID, severity, description string) error {
+	host := cfg.Contacts.SMTPHost
+	port := cfg.Contacts.SMTPPort
+	if port == "" {
+		port = "587"
+	}
+	from := cfg.Contacts.SMTPFrom
+	if from == "" {
+		from = "gastown@localhost"
+	}
+	to := cfg.Contacts.HumanEmail
+	subject := fmt.Sprintf("[Gas Town %s] %s", strings.ToUpper(severity), description)
+
+	body := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n"+
+		"Gas Town Escalation\r\n"+
+		"====================\r\n"+
+		"Bead: %s\r\n"+
+		"Severity: %s\r\n"+
+		"Description: %s\r\n\r\n"+
+		"Acknowledge: gt escalate ack %s\r\n",
+		from, to, subject, beadID, strings.ToUpper(severity), description, beadID)
+
+	addr := fmt.Sprintf("%s:%s", host, port)
+
+	var auth smtp.Auth
+	if cfg.Contacts.SMTPUser != "" {
+		auth = smtp.PlainAuth("", cfg.Contacts.SMTPUser, cfg.Contacts.SMTPPass, host)
+	}
+
+	return smtp.SendMail(addr, auth, from, []string{to}, []byte(body))
+}
+
+// sendEscalationSlack posts an escalation notification to a Slack webhook.
+func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, description string) error {
+	severityEmoji := map[string]string{
+		"critical": "🔴",
+		"high":     "🟠",
+		"medium":   "🟡",
+	}
+	emoji := severityEmoji[severity]
+	if emoji == "" {
+		emoji = "⚪"
+	}
+
+	payload := map[string]string{
+		"text": fmt.Sprintf("%s *[%s] Escalation %s*\n%s\n_Acknowledge: `gt escalate ack %s`_",
+			emoji, strings.ToUpper(severity), beadID, description, beadID),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshaling slack payload: %w", err)
+	}
+
+	resp, err := http.Post(cfg.Contacts.SlackWebhook, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("posting to slack: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("slack webhook returned %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// sendEscalationSMS posts an escalation notification via SMS webhook (e.g. Twilio).
+func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description string) error {
+	payload := map[string]string{
+		"to":   cfg.Contacts.HumanSMS,
+		"body": fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshaling sms payload: %w", err)
+	}
+
+	resp, err := http.Post(cfg.Contacts.SMSWebhook, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("posting to sms webhook: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("sms webhook returned %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// writeEscalationLog appends an escalation entry to the log file.
+func writeEscalationLog(townRoot, beadID, severity, description string) error {
+	logDir := fmt.Sprintf("%s/logs", townRoot)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return fmt.Errorf("creating log directory: %w", err)
+	}
+	logPath := fmt.Sprintf("%s/escalations.log", logDir)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("opening log file: %w", err)
+	}
+	defer f.Close()
+
+	entry := fmt.Sprintf("%s [%s] %s: %s\n", time.Now().Format(time.RFC3339), strings.ToUpper(severity), beadID, description)
+	_, err = f.WriteString(entry)
+	return err
 }
 
 func formatEscalationMailBody(beadID, severity, reason, from, related string) string {

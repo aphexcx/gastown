@@ -310,8 +310,8 @@ func (m *Mailbox) Get(id string) (*Message, error) {
 }
 
 func (m *Mailbox) getBeads(id string) (*Message, error) {
-	// Single DB query - wisps and persistent messages in same store
-	return m.getFromDir(id, m.beadsDir)
+	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
+	return m.getFromDir(id, beads.ResolveBeadsDirForID(m.beadsDir, id))
 }
 
 // getFromDir retrieves a message from a beads directory.
@@ -366,8 +366,8 @@ func (m *Mailbox) MarkRead(id string) error {
 }
 
 func (m *Mailbox) markReadBeads(id string) error {
-	// Single DB - wisps and persistent messages in same store
-	return m.closeInDir(id, m.beadsDir)
+	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
+	return m.closeInDir(id, beads.ResolveBeadsDirForID(m.beadsDir, id))
 }
 
 // closeInDir closes a message in a specific beads directory.
@@ -439,7 +439,7 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, m.workDir, m.beadsDir)
+	_, err := runBdCommand(ctx, args, m.workDir, beads.ResolveBeadsDirForID(m.beadsDir, id))
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound
@@ -466,7 +466,7 @@ func (m *Mailbox) markUnreadOnlyBeads(id string) error {
 
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, m.workDir, m.beadsDir)
+	_, err := runBdCommand(ctx, args, m.workDir, beads.ResolveBeadsDirForID(m.beadsDir, id))
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound
@@ -494,7 +494,7 @@ func (m *Mailbox) markUnreadBeads(id string) error {
 
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, m.workDir, m.beadsDir)
+	_, err := runBdCommand(ctx, args, m.workDir, beads.ResolveBeadsDirForID(m.beadsDir, id))
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
 			return ErrMessageNotFound

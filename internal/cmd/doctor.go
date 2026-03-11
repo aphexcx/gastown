@@ -178,11 +178,13 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewCustomStatusesCheck())
 	d.Register(doctor.NewRoleLabelCheck())
 	d.Register(doctor.NewFormulaCheck())
-	d.Register(doctor.NewRigsJSONCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
+	d.Register(doctor.NewRigConfigSyncCheck()) // Check all registered rigs have config.json
+	d.Register(doctor.NewStaleDoltPortCheck()) // Check for stale Dolt port files
 	d.Register(doctor.NewPrefixMismatchCheck())
 	d.Register(doctor.NewDatabasePrefixCheck())
+	d.Register(doctor.NewIdleTimeoutCheck()) // Verify dolt.idle-timeout: "0" for all rigs
 	d.Register(doctor.NewRoutesCheck())
 	d.Register(doctor.NewRigRoutesJSONLCheck())
 	d.Register(doctor.NewRoutingModeCheck())
@@ -195,6 +197,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewCheckJSONLBloat())
 	d.Register(doctor.NewStaleBeadsRedirectCheck())
 	d.Register(doctor.NewBeadsRedirectTargetCheck())
+	d.Register(doctor.NewStaleRuntimeFilesCheck())
 	d.Register(doctor.NewBranchCheck())
 	d.Register(doctor.NewCloneDivergenceCheck())
 	d.Register(doctor.NewDefaultBranchAllRigsCheck())
@@ -254,7 +257,6 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewHooksSyncCheck())
 
 	// Dolt data health checks (binary + server reachability moved to top as prerequisites)
-	d.Register(doctor.NewDoltPortFileCheck())
 	d.Register(doctor.NewDoltMetadataCheck())
 	d.Register(doctor.NewDoltOrphanedDatabaseCheck())
 	d.Register(doctor.NewUnregisteredBeadsDirsCheck())

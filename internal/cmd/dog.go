@@ -1115,6 +1115,20 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending plugin mail to dog: %w", err)
 	}
 
+	// Ensure dog session is running so it can read the mail.
+	// Without this, dispatched work sits in mail with no session to read it.
+	t := tmux.NewTmux()
+	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
+	sessOpts := dog.SessionStartOptions{
+		WorkDesc: workDesc,
+	}
+	if _, sessErr := sessMgr.EnsureRunning(targetDog.Name, sessOpts); sessErr != nil {
+		// Non-fatal: work is assigned and mail is sent, session may start later
+		if !dogDispatchJSON {
+			style.PrintWarning("could not start dog session: %v", sessErr)
+		}
+	}
+
 	// Success - output result
 	if dogDispatchJSON {
 		return json.NewEncoder(os.Stdout).Encode(result)

@@ -300,9 +300,11 @@ var (
 	rigAddBranch       string
 	rigAddPushURL      string
 	rigAddUpstreamURL  string
-	rigAddAdopt        bool
-	rigAddAdoptURL     string
-	rigAddAdoptForce   bool
+	rigAddAdopt           bool
+	rigAddAdoptURL       string
+	rigAddAdoptForce     bool
+	rigAddFilter         string
+	rigAddSparseCheckout []string
 	rigResetHandoff    bool
 	rigResetMail       bool
 	rigResetStale      bool
@@ -363,6 +365,8 @@ func init() {
 	rigAddCmd.Flags().BoolVar(&rigAddAdopt, "adopt", false, "Adopt an existing directory instead of creating new")
 	rigAddCmd.Flags().StringVar(&rigAddAdoptURL, "url", "", "Git remote URL for --adopt (default: auto-detected from origin)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdoptForce, "force", false, "With --adopt, register even if git remote cannot be detected")
+	rigAddCmd.Flags().StringVar(&rigAddFilter, "filter", "", "Partial clone filter (e.g. \"blob:none\", \"tree:0\") to reduce clone size")
+	rigAddCmd.Flags().StringSliceVar(&rigAddSparseCheckout, "sparse-checkout", nil, "Sparse checkout paths (cone mode); comma-separated or repeated")
 
 	rigResetCmd.Flags().BoolVar(&rigResetHandoff, "handoff", false, "Clear handoff content")
 	rigResetCmd.Flags().BoolVar(&rigResetMail, "mail", false, "Clear stale mail messages")
@@ -532,17 +536,38 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid upstream URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddUpstreamURL)
 	}
 
+	// Validate clone filter if provided
+	if rigAddFilter != "" {
+		validFilters := []string{"blob:none", "tree:0"}
+		valid := false
+		for _, f := range validFilters {
+			if rigAddFilter == f {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("invalid --filter %q: supported values are %v", rigAddFilter, validFilters)
+		}
+		fmt.Printf("  Partial clone: --filter=%s\n", rigAddFilter)
+	}
+	if len(rigAddSparseCheckout) > 0 {
+		fmt.Printf("  Sparse checkout: %v\n", rigAddSparseCheckout)
+	}
+
 	startTime := time.Now()
 
 	// Add the rig
 	newRig, err := mgr.AddRig(rig.AddRigOptions{
-		Name:          name,
-		GitURL:        gitURL,
-		PushURL:       rigAddPushURL,
-		UpstreamURL:   rigAddUpstreamURL,
-		BeadsPrefix:   rigAddPrefix,
-		LocalRepo:     rigAddLocalRepo,
-		DefaultBranch: rigAddBranch,
+		Name:           name,
+		GitURL:         gitURL,
+		PushURL:        rigAddPushURL,
+		UpstreamURL:    rigAddUpstreamURL,
+		BeadsPrefix:    rigAddPrefix,
+		LocalRepo:      rigAddLocalRepo,
+		DefaultBranch:  rigAddBranch,
+		CloneFilter:    rigAddFilter,
+		SparseCheckout: rigAddSparseCheckout,
 	})
 	if err != nil {
 		return fmt.Errorf("adding rig: %w", err)
@@ -586,12 +611,39 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 			rigBeadID := beads.RigBeadIDWithPrefix(newRig.Config.Prefix, name)
 			fmt.Printf("  Created rig identity bead: %s\n", rigBeadID)
 		}
+
+		// Create agent beads for the rig (witness, refinery)
+		// This ensures they exist before the daemon tries to start them
+		prefix := newRig.Config.Prefix
+		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
+		if _, err := bd.CreateAgentBead(witnessID,
+			fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
+			&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
+		); err != nil {
+			fmt.Printf("  %s Could not create witness agent bead: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  Created agent bead: %s\n", witnessID)
+		}
+
+		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
+		if _, err := bd.CreateAgentBead(refineryID,
+			fmt.Sprintf("Refinery for %s - processes merge queue.", name),
+			&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
+		); err != nil {
+			fmt.Printf("  %s Could not create refinery agent bead: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  Created agent bead: %s\n", refineryID)
+		}
 	}
 
 	// Sync hooks for the new rig's targets
 	if err := syncRigHooks(townRoot, name); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks for new rig: %v\n", err)
 	}
+
+	// Commit town-level config changes (rigs.json, daemon.json, routes.jsonl)
+	// so they aren't reverted by git restore/checkout operations.
+	commitTownConfigChanges(townRoot, name)
 
 	// Refresh tmux cycle bindings on all running sessions so the new rig's
 	// prefix is recognized by C-b n/p. Without this, existing sessions have
@@ -1006,6 +1058,10 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		}
 	}
 
+	// Commit town-level config changes (rigs.json, daemon.json, routes.jsonl)
+	// so they aren't reverted by git restore/checkout operations.
+	commitTownConfigChanges(townRoot, name)
+
 	// Check for tracked beads and initialize database if missing (Issue #72)
 	rigPath := filepath.Join(townRoot, name)
 	beadsDirCandidates := []string{
@@ -1116,6 +1172,59 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			fmt.Printf("  %s Could not init beads database: %v\n", style.Warning.Render("!"), err)
 		} else {
 			fmt.Printf("  %s Initialized beads database\n", style.Success.Render("✓"))
+		}
+	}
+
+	// Create rig identity bead if prefix is set
+	if result.BeadsPrefix != "" {
+		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
+		beadsWorkDir := rigPath
+		if _, err := os.Stat(mayorRigBeads); err == nil {
+			beadsWorkDir = filepath.Join(rigPath, "mayor", "rig")
+		}
+
+		bd := beads.New(beadsWorkDir)
+		rigBeadID := beads.RigBeadIDWithPrefix(result.BeadsPrefix, name)
+
+		// Check if bead already exists
+		if _, err := bd.Show(rigBeadID); err != nil {
+			fields := &beads.RigFields{
+				Repo:   result.GitURL,
+				Prefix: result.BeadsPrefix,
+				State:  beads.RigStateActive,
+			}
+			if _, err := bd.CreateRigBead(name, fields); err != nil {
+				fmt.Printf("  %s Could not create rig identity bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created rig identity bead: %s\n", style.Success.Render("✓"), rigBeadID)
+			}
+		}
+
+		// Create agent beads for the rig (witness, refinery)
+		// This ensures they exist before the daemon tries to start them
+		prefix := result.BeadsPrefix
+		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
+		if _, err := bd.Show(witnessID); err != nil {
+			if _, err := bd.CreateAgentBead(witnessID,
+				fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
+				&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
+			); err != nil {
+				fmt.Printf("  %s Could not create witness agent bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), witnessID)
+			}
+		}
+
+		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
+		if _, err := bd.Show(refineryID); err != nil {
+			if _, err := bd.CreateAgentBead(refineryID,
+				fmt.Sprintf("Refinery for %s - processes merge queue.", name),
+				&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
+			); err != nil {
+				fmt.Printf("  %s Could not create refinery agent bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), refineryID)
+			}
 		}
 	}
 
@@ -2044,8 +2153,17 @@ func getRigOperationalState(townRoot, rigName string) (state string, source stri
 
 	// Try to find the rig identity bead
 	// Convention: <prefix>-rig-<rigName>
+	// Try to get prefix from rig config.json, fall back to rigs.json registry
+	var prefix string
 	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
-		rigBeadID := fmt.Sprintf("%s-rig-%s", rigCfg.Beads.Prefix, rigName)
+		prefix = rigCfg.Beads.Prefix
+	} else {
+		// Fall back to registry (mayor/rigs.json) when config.json is missing
+		prefix = config.GetRigPrefix(townRoot, rigName)
+	}
+
+	if prefix != "" {
+		rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 		if issue, err := bd.Show(rigBeadID); err == nil {
 			for _, label := range issue.Labels {
 				if strings.HasPrefix(label, "status:") {
@@ -2106,6 +2224,44 @@ func findRigSessions(t *tmux.Tmux, rigName string) ([]string, error) {
 		}
 	}
 	return matches, nil
+}
+
+// commitTownConfigChanges commits town-level config files (rigs.json, daemon.json,
+// routes.jsonl) to the town repo after rig add/adopt. Without this commit, changes
+// are silently reverted by any process that does a git restore/checkout.
+func commitTownConfigChanges(townRoot, rigName string) {
+	g := git.NewGit(townRoot)
+
+	// Collect the town-level files that rig add/adopt modifies.
+	files := []string{
+		filepath.Join("mayor", "rigs.json"),
+		filepath.Join("mayor", "daemon.json"),
+		filepath.Join(".beads", "routes.jsonl"),
+	}
+
+	// Only stage files that actually exist (adopt may not touch all of them).
+	var toAdd []string
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(townRoot, f)); err == nil {
+			toAdd = append(toAdd, f)
+		}
+	}
+	if len(toAdd) == 0 {
+		return
+	}
+
+	if err := g.Add(toAdd...); err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: could not stage town config files: %v\n", err)
+		return
+	}
+
+	msg := fmt.Sprintf("chore: register rig %s in town config", rigName)
+	if err := g.Commit(msg); err != nil {
+		// If nothing changed (already committed), git commit returns an error — that's fine.
+		if !strings.Contains(err.Error(), "nothing to commit") {
+			fmt.Fprintf(os.Stderr, "  Warning: could not commit town config files: %v\n", err)
+		}
+	}
 }
 
 // isGitRemoteURL returns true if s looks like a remote git URL rather than a

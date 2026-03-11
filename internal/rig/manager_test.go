@@ -469,7 +469,7 @@ exit 1
 	if err != nil {
 		t.Fatalf("reading config.yaml: %v", err)
 	}
-	want := "prefix: gt\nissue-prefix: gt\n"
+	want := "prefix: gt\nissue-prefix: gt\ndolt.idle-timeout: \"0\"\n"
 	if string(config) != want {
 		t.Fatalf("config.yaml = %q, want %q", string(config), want)
 	}

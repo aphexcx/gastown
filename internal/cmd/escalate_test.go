@@ -412,9 +412,34 @@ func TestExecuteExternalActions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
 			// Should not panic
-			executeExternalActions(tt.actions, tt.cfg, "hq-test", "high", "Test escalation")
+			executeExternalActions(tt.actions, tt.cfg, "hq-test", "high", "Test escalation", tmpDir)
 		})
+	}
+}
+
+func TestWriteEscalationLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	err := writeEscalationLog(tmpDir, "hq-abc", "critical", "Test failure")
+	if err != nil {
+		t.Fatalf("writeEscalationLog returned error: %v", err)
+	}
+
+	logPath := tmpDir + "/logs/escalations.log"
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading log file: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "[CRITICAL]") {
+		t.Errorf("log entry missing severity, got: %s", content)
+	}
+	if !strings.Contains(content, "hq-abc") {
+		t.Errorf("log entry missing bead ID, got: %s", content)
+	}
+	if !strings.Contains(content, "Test failure") {
+		t.Errorf("log entry missing description, got: %s", content)
 	}
 }
 

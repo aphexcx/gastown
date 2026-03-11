@@ -164,6 +164,7 @@ type cloneOptions struct {
 	singleBranch bool   // Pass --single-branch to git clone (only fetch default branch)
 	depth        int    // Pass --depth N to git clone (shallow clone); 0 means full history
 	branch       string // Pass --branch <name> to git clone (checkout specific branch)
+	filter       string // Pass --filter=<spec> to git clone (e.g. "blob:none", "tree:0")
 }
 
 // cloneInternal runs `git clone` in an isolated temp directory, moves the result
@@ -196,6 +197,9 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 	}
 	if opts.singleBranch {
 		args = append(args, "--single-branch")
+	}
+	if opts.filter != "" {
+		args = append(args, "--filter="+opts.filter)
 	}
 	if opts.depth > 0 {
 		args = append(args, "--depth", fmt.Sprintf("%d", opts.depth))
@@ -266,6 +270,27 @@ func (g *Git) CloneBranchWithReference(url, dest, branch, reference string) erro
 // This is used for the shared repo architecture where all worktrees share a single git database.
 func (g *Git) CloneBare(url, dest string) error {
 	return g.cloneInternal(url, dest, cloneOptions{bare: true, singleBranch: true, depth: 1})
+}
+
+// CloneBarePartial clones a bare repo with a partial clone filter (e.g. "blob:none", "tree:0").
+// Does not use --depth since partial clones handle size reduction via the filter.
+func (g *Git) CloneBarePartial(url, dest, filter string) error {
+	return g.cloneInternal(url, dest, cloneOptions{bare: true, singleBranch: true, filter: filter})
+}
+
+// CloneBarePartialWithReference clones a bare repo with a partial clone filter and local reference.
+func (g *Git) CloneBarePartialWithReference(url, dest, filter, reference string) error {
+	return g.cloneInternal(url, dest, cloneOptions{bare: true, singleBranch: true, filter: filter, reference: reference})
+}
+
+// CloneBranchPartialWithReference clones a specific branch with a partial clone filter and reference.
+func (g *Git) CloneBranchPartialWithReference(url, dest, branch, filter, reference string) error {
+	return g.cloneInternal(url, dest, cloneOptions{singleBranch: true, filter: filter, branch: branch, reference: reference})
+}
+
+// CloneBranchPartial clones a specific branch with a partial clone filter.
+func (g *Git) CloneBranchPartial(url, dest, branch, filter string) error {
+	return g.cloneInternal(url, dest, cloneOptions{singleBranch: true, filter: filter, branch: branch})
 }
 
 // configureHooksPath sets core.hooksPath to use the repo's .githooks directory
@@ -1682,6 +1707,27 @@ func InitSubmodules(repoPath string) error {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("initializing submodules: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// InitSparseCheckout initializes sparse checkout with cone mode and configures
+// the given paths. If paths is empty, initializes with cone mode only (checkout root files).
+func InitSparseCheckout(repoPath string, paths []string) error {
+	// Initialize sparse checkout in cone mode
+	cmd := exec.Command("git", "-C", repoPath, "sparse-checkout", "init", "--cone")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("initializing sparse checkout: %s", strings.TrimSpace(stderr.String()))
+	}
+	if len(paths) > 0 {
+		args := append([]string{"-C", repoPath, "sparse-checkout", "set"}, paths...)
+		cmd = exec.Command("git", args...)
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("setting sparse checkout paths: %s", strings.TrimSpace(stderr.String()))
+		}
 	}
 	return nil
 }

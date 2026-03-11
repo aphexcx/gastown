@@ -272,6 +272,18 @@ func Pending(townRoot, session string) (int, error) {
 	return count, nil
 }
 
+// QueueLen returns the number of pending nudges for a session without draining.
+// Returns 0 on error — callers use this for quick checks. Missing queue
+// directories are expected (no nudges yet) and silenced; other filesystem
+// errors are logged to stderr so they don't go unnoticed.
+func QueueLen(townRoot, session string) int {
+	n, err := Pending(townRoot, session)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: nudge queue check failed for %s: %v\n", session, err)
+	}
+	return n
+}
+
 // FormatForInjection formats queued nudges as a system-reminder block
 // suitable for Claude Code hook output.
 func FormatForInjection(nudges []QueuedNudge) string {

@@ -75,9 +75,10 @@ Delivery modes (--mode):
              but guarantees immediate delivery. Use only when you need to
              break through (e.g., stuck agent, emergency).
 
-Queue and wait-idle modes require the target agent to support hooks
-(UserPromptSubmit) for drain. Agents without hook support should use
---mode=immediate.
+Queue and wait-idle modes require a drain mechanism. Claude agents drain
+via UserPromptSubmit hook; other agents use a background nudge-poller
+that periodically drains and injects via tmux. If neither is available,
+use --mode=immediate.
 
 This is the ONLY way to send messages to Claude sessions.
 Do not use raw tmux send-keys elsewhere.
@@ -123,6 +124,18 @@ const ifFreshMaxAge = 60 * time.Second
 // This is a var (not const) so tests can override it to avoid 15s waits.
 var waitIdleTimeout = 15 * time.Second
 
+// idleWatcherTimeout is how long the background idle watcher polls after
+// queuing a nudge. If the agent becomes idle within this window, the watcher
+// drains the queue and delivers directly. This covers the gap where an agent
+// finishes work after WaitForIdle's timeout but before anyone sends new input
+// (so UserPromptSubmit never fires and the queue never drains).
+// Var so tests can override.
+var idleWatcherTimeout = 60 * time.Second
+
+// idleWatcherPollInterval is how often the background watcher checks for idle.
+// Var so tests can override.
+var idleWatcherPollInterval = 1 * time.Second
+
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -155,8 +168,15 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// Try to wait for idle
 		err := t.WaitForIdle(sessionName, waitIdleTimeout)
 		if err == nil {
-			// Agent is idle — safe to deliver directly
-			return t.NudgeSession(sessionName, prefixedMessage)
+			// Agent is idle — deliver directly. Format as system-reminder
+			// so the agent processes it as a background notification rather
+			// than a user interruption/correction.
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}})
+			return t.NudgeSession(sessionName, formatted)
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
@@ -172,13 +192,80 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// Queue failed — fall back to immediate as last resort.
 			// Better to interrupt than lose the message entirely.
 			fmt.Fprintf(os.Stderr, "Warning: queue fallback failed (%v), delivering immediately\n", qErr)
-			return t.NudgeSession(sessionName, prefixedMessage)
+			// Still use FormatForInjection so the agent sees a consistent
+			// <system-reminder> format regardless of delivery path.
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}})
+			return t.NudgeSession(sessionName, formatted)
 		}
+		// Run watcher synchronously: polls for idle over a longer window.
+		// The UserPromptSubmit hook drains the queue on agent input, but an
+		// idle agent receives no input — so queued nudges are lost without
+		// this watcher. It exits on: delivery, session death, or timeout.
+		// Must be synchronous (not a goroutine) because gt nudge is a CLI
+		// command — the process exits after return, killing any goroutines.
+		watchAndDeliver(t, townRoot, sessionName)
 		return nil
 
 	default: // NudgeModeImmediate
 		return t.NudgeSession(sessionName, prefixedMessage)
 	}
+}
+
+// watchAndDeliver polls a session for idle state over idleWatcherTimeout.
+// When the agent becomes idle, it drains the nudge queue and sends the
+// formatted content directly via NudgeSession. This bypasses the
+// UserPromptSubmit hook entirely — that hook does not fire for tmux
+// send-keys input, so we cannot rely on it.
+//
+// This runs synchronously — gt nudge blocks until the watcher exits.
+// Errors are logged to stderr rather than returned since delivery failure
+// after successful queue write is non-fatal (queue persists for next drain).
+//
+// Exit conditions:
+//   - Agent becomes idle: drain queue and deliver formatted content, exit.
+//   - Queue is empty (someone else drained it): exit.
+//   - Session disappears: exit (nothing to deliver to).
+//   - Timeout: exit (queue stays for next input or watcher cycle).
+func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
+	deadline := time.Now().Add(idleWatcherTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(idleWatcherPollInterval)
+
+		// If queue is already empty, someone else drained it.
+		if nudge.QueueLen(townRoot, sessionName) == 0 {
+			return
+		}
+
+		// Check if session still exists — no point watching a dead session.
+		if exists, _ := t.HasSession(sessionName); !exists {
+			return
+		}
+
+		// Use WaitForIdle with a short timeout instead of single-snapshot
+		// IsIdle to get the consecutive-poll guard (2 polls 200ms apart).
+		// This avoids false positives during inter-tool-call gaps where
+		// the prompt briefly appears while Claude Code is still working.
+		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
+			// Drain atomically claims queued entries (rename-based).
+			// If another process raced and drained first, we get an
+			// empty slice and skip delivery to avoid duplicates.
+			drained, _ := nudge.Drain(townRoot, sessionName)
+			if len(drained) == 0 {
+				return
+			}
+			formatted := nudge.FormatForInjection(drained)
+			if err := t.NudgeSession(sessionName, formatted); err != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+			}
+			return
+		}
+	}
+	// Timeout — nudge stays in queue for next watcher or manual drain.
 }
 
 // validNudgeModes is the set of allowed --mode values.

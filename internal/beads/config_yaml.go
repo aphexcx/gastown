@@ -86,10 +86,13 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	wantPrefix := "prefix: " + prefix
 	wantIssuePrefix := "issue-prefix: " + prefix
+	// Gas Town rigs should disable idle-monitor to use centralized Dolt server
+	wantIdleTimeout := "dolt.idle-timeout: \"0\""
 
 	data, err := os.ReadFile(configPath)
 	if os.IsNotExist(err) {
-		content := wantPrefix + "\n" + wantIssuePrefix + "\n"
+		// New config: include all Gas Town defaults
+		content := wantPrefix + "\n" + wantIssuePrefix + "\n" + wantIdleTimeout + "\n"
 		return os.WriteFile(configPath, []byte(content), 0644)
 	}
 	if err != nil {
@@ -103,6 +106,7 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 	lines := strings.Split(content, "\n")
 	foundPrefix := false
 	foundIssuePrefix := false
+	foundIdleTimeout := false
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -116,6 +120,11 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 			foundIssuePrefix = true
 			continue
 		}
+		if strings.HasPrefix(trimmed, "dolt.idle-timeout:") {
+			lines[i] = wantIdleTimeout
+			foundIdleTimeout = true
+			continue
+		}
 	}
 
 	if !foundPrefix {
@@ -123,6 +132,9 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 	}
 	if !foundIssuePrefix {
 		lines = append(lines, wantIssuePrefix)
+	}
+	if !foundIdleTimeout {
+		lines = append(lines, wantIdleTimeout)
 	}
 
 	newContent := strings.Join(lines, "\n")

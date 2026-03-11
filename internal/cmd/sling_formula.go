@@ -202,7 +202,9 @@ func runSlingFormula(ctx context.Context, args []string) error {
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:      actor,
 		Args:            slingArgs,
+		Vars:            append([]string(nil), slingVars...),
 		AttachedFormula: formulaName,
+		FormulaVars:     strings.Join(slingVars, "\n"),
 	}
 	if err := storeFieldsInBead(wispRootID, fieldUpdates); err != nil {
 		fmt.Printf("%s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)

@@ -25,6 +25,23 @@ func skipIfAgentBinaryMissing(t *testing.T, agents ...string) {
 	}
 }
 
+func writeAgentStub(t *testing.T, binDir, name string) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(binDir, name+".cmd")
+		if err := os.WriteFile(path, []byte("@echo off\r\nexit /b 0\r\n"), 0644); err != nil {
+			t.Fatalf("write %s stub: %v", name, err)
+		}
+		return
+	}
+
+	path := filepath.Join(binDir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write %s stub: %v", name, err)
+	}
+}
+
 // isClaudeCommand checks if a command is claude (either "claude" or a path ending in "/claude").
 // This handles the case where resolveClaudePath returns the full path to the claude binary.
 // Also handles Windows paths with .exe extension.
@@ -403,8 +420,8 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	if !cfg.IsRunTestsEnabled() {
 		t.Error("IsRunTestsEnabled should be true by default")
 	}
-	if cfg.TestCommand != "go test ./..." {
-		t.Errorf("TestCommand = %q, want 'go test ./...'", cfg.TestCommand)
+	if cfg.TestCommand != "" {
+		t.Errorf("TestCommand = %q, want empty (language-agnostic default)", cfg.TestCommand)
 	}
 	if !cfg.IsDeleteMergedBranchesEnabled() {
 		t.Error("IsDeleteMergedBranchesEnabled should be true by default")
@@ -1621,10 +1638,7 @@ func TestResolveWorkerAgentConfig_WorkerSpecificOverridesRole(t *testing.T) {
 
 	// Create a fake codex binary so ValidateAgentConfig passes
 	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
+	writeAgentStub(t, binDir, "codex")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	settings := NewRigSettings()
@@ -1684,10 +1698,7 @@ func TestBuildStartupCommand_WorkerAgentsViaCrew(t *testing.T) {
 
 	// Create a fake codex binary
 	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
+	writeAgentStub(t, binDir, "codex")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	settings := NewRigSettings()
@@ -1725,6 +1736,60 @@ func TestBuildStartupCommand_WorkerAgentsViaCrew(t *testing.T) {
 		cmd := BuildStartupCommand(envVars, rigPath, "")
 		if strings.Contains(cmd, "codex") {
 			t.Errorf("expected non-codex when GT_CREW not set, got: %q", cmd)
+		}
+	})
+}
+
+func TestResolveWorkerAgentConfig_TownCrewAgents(t *testing.T) {
+	// Cannot use t.Parallel — uses t.Setenv
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+
+	// Create a fake codex binary
+	binDir := t.TempDir()
+	codexPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Set up town settings with crew_agents but NO rig worker_agents
+	townSettings := NewTownSettings()
+	townSettings.CrewAgents = map[string]string{"bob": "codex"}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("saving town settings: %v", err)
+	}
+
+	// Save rig settings without worker_agents
+	rigSettings := NewRigSettings()
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("saving rig settings: %v", err)
+	}
+
+	t.Run("town crew_agents resolves for named worker", func(t *testing.T) {
+		rc := ResolveWorkerAgentConfig("bob", townRoot, rigPath)
+		if rc.Provider != "codex" && !strings.Contains(rc.Command, "codex") {
+			t.Errorf("expected codex for crew worker bob via town crew_agents, got provider=%q command=%q", rc.Provider, rc.Command)
+		}
+	})
+
+	t.Run("worker not in town crew_agents falls through to defaults", func(t *testing.T) {
+		rc := ResolveWorkerAgentConfig("alice", townRoot, rigPath)
+		if !isClaudeCommand(rc.Command) {
+			t.Errorf("expected claude fallback for alice (not in crew_agents), got command=%q", rc.Command)
+		}
+	})
+
+	t.Run("rig worker_agents takes priority over town crew_agents", func(t *testing.T) {
+		// Add rig-level worker_agents that should override town crew_agents
+		rigSettings2 := NewRigSettings()
+		rigSettings2.WorkerAgents = map[string]string{"bob": "claude"}
+		if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings2); err != nil {
+			t.Fatalf("saving rig settings: %v", err)
+		}
+		rc := ResolveWorkerAgentConfig("bob", townRoot, rigPath)
+		if !isClaudeCommand(rc.Command) {
+			t.Errorf("expected claude for bob (rig worker_agents should override town crew_agents), got command=%q", rc.Command)
 		}
 	})
 }
