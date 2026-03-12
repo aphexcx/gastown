@@ -3,6 +3,7 @@
 package acp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -637,6 +638,220 @@ done
 	}
 
 	return createTempScript(t, script)
+}
+
+// MockAgent simulates an ACP-compatible agent for testing.
+// It reads JSON-RPC messages from In and writes responses to Out.
+type MockAgent struct {
+	t            *testing.T
+	sessionID    string
+	protocolVer  int
+	capabilities map[string]any
+	in           *bufio.Reader
+	out          io.Writer
+	err          io.Writer
+
+	// mu protects the fields below
+	mu sync.Mutex
+	// Handlers can be provided to override default behavior for specific methods
+	Handlers map[string]func(*JSONRPCMessage) *JSONRPCMessage
+	// MessagesReceived captures all messages received by the agent
+	MessagesReceived []*JSONRPCMessage
+	// ResponsesSent captures all responses sent by the agent
+	ResponsesSent []*JSONRPCMessage
+}
+
+func NewMockAgent(t *testing.T, in io.Reader, out io.Writer) *MockAgent {
+	return &MockAgent{
+		t:            t,
+		sessionID:    "mock-session-id-12345",
+		protocolVer:  1,
+		capabilities: make(map[string]any),
+		in:           bufio.NewReader(in),
+		out:          out,
+		Handlers:     make(map[string]func(*JSONRPCMessage) *JSONRPCMessage),
+	}
+}
+
+func (m *MockAgent) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			err := m.Step()
+			if err != nil {
+				if err == io.EOF {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+func (m *MockAgent) Step() error {
+	line, err := m.in.ReadString('\n')
+	if err != nil {
+		return err
+	}
+
+	var msg JSONRPCMessage
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return fmt.Errorf("unmarshal request: %w", err)
+	}
+
+	m.mu.Lock()
+	m.MessagesReceived = append(m.MessagesReceived, &msg)
+	handler, ok := m.Handlers[msg.Method]
+	m.mu.Unlock()
+
+	var resp *JSONRPCMessage
+	if ok {
+		resp = handler(&msg)
+	} else {
+		resp = m.defaultHandler(&msg)
+	}
+
+	if resp != nil {
+		m.mu.Lock()
+		m.ResponsesSent = append(m.ResponsesSent, resp)
+		m.mu.Unlock()
+
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return fmt.Errorf("marshal response: %w", err)
+		}
+		if _, err := fmt.Fprintf(m.out, "%s\n", data); err != nil {
+			return fmt.Errorf("write response: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (m *MockAgent) defaultHandler(msg *JSONRPCMessage) *JSONRPCMessage {
+	switch msg.Method {
+	case "initialize":
+		return &JSONRPCMessage{
+			JSONRPC: "2.0",
+			ID:      msg.ID,
+			Result:  json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d,"capabilities":{}}`, m.protocolVer)),
+		}
+	case "session/new":
+		return &JSONRPCMessage{
+			JSONRPC: "2.0",
+			ID:      msg.ID,
+			Result:  json.RawMessage(fmt.Sprintf(`{"sessionId":"%s"}`, m.sessionID)),
+		}
+	case "session/prompt":
+		return &JSONRPCMessage{
+			JSONRPC: "2.0",
+			ID:      msg.ID,
+			Result:  json.RawMessage(`{}`),
+		}
+	case "session/cancel":
+		return nil // Notifications don't get responses
+	default:
+		// For requests with IDs, send a generic successful result if not handled
+		if msg.ID != nil {
+			return &JSONRPCMessage{
+				JSONRPC: "2.0",
+				ID:      msg.ID,
+				Result:  json.RawMessage(`{}`),
+			}
+		}
+		return nil
+	}
+}
+
+func (m *MockAgent) GetMessages() []*JSONRPCMessage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msgs := make([]*JSONRPCMessage, len(m.MessagesReceived))
+	copy(msgs, m.MessagesReceived)
+	return msgs
+}
+
+func setupProxyWithMockAgent(t *testing.T) (*Proxy, *MockAgent) {
+	p := NewProxy()
+
+	// Agent side pipes: Proxy's perspective
+	// Proxy.agentStdin (io.WriteCloser) -> agentStdinR (io.Reader)
+	// agentStdoutW (io.Writer) -> Proxy.agentStdout (io.ReadCloser)
+	agentStdinR, agentStdinW := io.Pipe()
+	agentStdoutR, agentStdoutW := io.Pipe()
+
+	p.agentStdin = agentStdinW
+	p.agentStdout = agentStdoutR
+
+	m := NewMockAgent(t, agentStdinR, agentStdoutW)
+
+	// Mock p.cmd by starting a real process so that isProcessAlive() returns true.
+	// We use a command that doesn't do much and will be killed on shutdown.
+	p.cmd = exec.Command("sleep", "60")
+	if err := p.cmd.Start(); err != nil {
+		t.Fatalf("failed to start mock command: %v", err)
+	}
+
+	return p, m
+}
+
+func TestProxy_HandshakeWithMockAgent(t *testing.T) {
+	p, m := setupProxyWithMockAgent(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// UI side pipes - needed to avoid panics in forwardFromAgent when encoding to UI
+	uiStdoutR, uiStdoutW := io.Pipe()
+	p.setStreams(nil, uiStdoutW)
+	go func() {
+		_, _ = io.Copy(io.Discard, uiStdoutR)
+	}()
+
+	go func() {
+		_ = m.Run(ctx)
+	}()
+
+	// Run forwardFromAgent to process responses from the mock agent
+	p.wg.Add(1)
+	go p.forwardFromAgent()
+
+	// 1. Send initialize
+	initReq := &JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":1}`),
+	}
+	if err := p.writeToAgent(initReq); err != nil {
+		t.Fatalf("failed to write initialize: %v", err)
+	}
+
+	// 2. Send session/new
+	sessionReq := &JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "session/new",
+	}
+	if err := p.writeToAgent(sessionReq); err != nil {
+		t.Fatalf("failed to write session/new: %v", err)
+	}
+
+	// Wait for session ID to be extracted
+	waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer waitCancel()
+	err := p.WaitForSessionID(waitCtx)
+	if err != nil {
+		t.Fatalf("failed to get session ID: %v", err)
+	}
+
+	if sid := p.SessionID(); sid != "mock-session-id-12345" {
+		t.Errorf("expected session ID mock-session-id-12345, got %q", sid)
+	}
+
+	p.Shutdown()
 }
 
 func createTempScript(t *testing.T, content string) string {
