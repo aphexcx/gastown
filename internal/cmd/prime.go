@@ -29,6 +29,7 @@ var primeDryRun bool
 var primeState bool
 var primeStateJSON bool
 var primeExplain bool
+var primeStructuredSessionStartOutput bool
 
 // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
 // when running in hook mode. Used to provide lighter output on compaction/resume.
@@ -70,16 +71,26 @@ Role detection:
 This command is typically used in shell prompts or agent initialization.
 
 HOOK MODE (--hook):
-  When called as an LLM runtime hook, use --hook to enable session ID handling.
-  This reads session metadata from stdin and persists it for the session.
+  When called as an LLM runtime hook, use --hook to enable session ID handling,
+  agent-ready signaling, and session persistence.
+
+  Session ID resolution (first match wins):
+    1. GT_SESSION_ID env var
+    2. CLAUDE_SESSION_ID env var
+    3. Persisted .runtime/session_id (from prior SessionStart)
+    4. Stdin JSON (Claude Code format)
+    5. Auto-generated UUID
+
+  Source resolution: GT_HOOK_SOURCE env var, then stdin JSON "source" field.
 
   Claude Code integration (in .claude/settings.json):
     "SessionStart": [{"hooks": [{"type": "command", "command": "gt prime --hook"}]}]
+    Claude sends JSON on stdin: {"session_id":"uuid","source":"startup|resume|compact"}
 
-  Claude Code sends JSON on stdin:
-    {"session_id": "uuid", "transcript_path": "/path", "source": "startup|resume"}
-
-  Other agents can set GT_SESSION_ID environment variable instead.`,
+  Gemini CLI / other runtimes (in .gemini/settings.json):
+    "SessionStart": "export GT_SESSION_ID=$(uuidgen) GT_HOOK_SOURCE=startup && gt prime --hook"
+    "PreCompress":  "export GT_HOOK_SOURCE=compact && gt prime --hook"
+    Set GT_SESSION_ID + GT_HOOK_SOURCE as env vars to skip the stdin read entirely.`,
 	RunE: runPrime,
 }
 
@@ -153,7 +164,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	// any new mail. This keeps PreCompress hooks under 1s for non-Claude
 	// runtimes that have short hook timeouts (Gemini CLI).
 	if isCompactResume() {
-		runPrimeCompactResume(ctx, cwd)
+		runPrimeCompactResume(ctx)
 		return nil
 	}
 
@@ -205,7 +216,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 // Unlike the full prime path, this outputs a brief recovery line instead of
 // the full AUTONOMOUS WORK MODE block. This prevents agents from re-announcing
 // and re-initializing after compaction. (GH#1965)
-func runPrimeCompactResume(ctx RoleContext, cwd string) {
+func runPrimeCompactResume(ctx RoleContext) {
 	// Brief identity confirmation
 	actor := getAgentIdentity(ctx)
 	source := primeHookSource
@@ -282,10 +293,24 @@ func handlePrimeHookMode(townRoot, cwd string) {
 	primeHookSource = source
 
 	explain(true, "Session beacon: hook mode enabled, session ID from stdin")
-	fmt.Printf("[session:%s]\n", sessionID)
-	if source != "" {
-		fmt.Printf("[source:%s]\n", source)
+	for _, line := range hookSessionBeaconLines(sessionID, source) {
+		fmt.Println(line)
 	}
+}
+
+// hookSessionBeaconLines returns the bracketed session/source markers used by
+// the normal hook path. Structured SessionStart output skips them because Codex
+// tries to auto-detect JSON, sees the leading '[', and misclassifies the startup
+// stream as JSON instead of plain text metadata.
+func hookSessionBeaconLines(sessionID, source string) []string {
+	if primeStructuredSessionStartOutput {
+		return nil
+	}
+	lines := []string{fmt.Sprintf("[session:%s]", sessionID)}
+	if source != "" {
+		lines = append(lines, fmt.Sprintf("[source:%s]", source))
+	}
+	return lines
 }
 
 // signalAgentReady sets GT_AGENT_READY=1 in the current tmux session environment.
@@ -1031,7 +1056,7 @@ func setTmuxWorkContext(workRig, workBead, workMol string) {
 // This is called on Mayor startup to surface issues needing human attention.
 func checkPendingEscalations(ctx RoleContext) {
 	// Query for open escalations using bd list with tag filter
-	cmd := exec.Command("bd", "list", "--status=open", "--tag=escalation", "--json")
+	cmd := exec.Command("bd", "list", "--status=open", "--tag=escalation", "--json", "--flat")
 	cmd.Dir = ctx.WorkDir
 	cmd.Env = os.Environ()
 

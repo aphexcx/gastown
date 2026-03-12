@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -65,9 +67,12 @@ type BdCli struct {
 func DefaultBdCli() *BdCli {
 	return &BdCli{
 		Exec: func(workDir string, args ...string) (string, error) {
+			// bd v0.59+ requires --flat for list --json to produce JSON
+			args = beads.InjectFlatForListJSON(args)
 			return util.ExecWithOutput(workDir, "bd", args...)
 		},
 		Run: func(workDir string, args ...string) error {
+			args = beads.InjectFlatForListJSON(args)
 			return util.ExecRun(workDir, "bd", args...)
 		},
 	}
@@ -238,12 +243,20 @@ func handlePolecatDonePendingMR(bd *BdCli, workDir, rigName string, payload *Pol
 	return result
 }
 
-// notifyRefineryMergeReady nudges the Refinery to check the merge queue.
-// Previously sent MERGE_READY mail (creating permanent Dolt commits); now
-// just nudges. The Refinery discovers pending MRs from beads queries.
+// notifyRefineryMergeReady emits a MERGE_READY channel event and nudges the
+// Refinery to check the merge queue. The channel event unblocks the refinery's
+// await-event loop instantly; the tmux nudge is a belt-and-suspenders fallback
+// for when the refinery is at the Claude prompt rather than in await-event.
 // Errors are non-fatal (Refinery will still pick up work on next patrol cycle).
 func notifyRefineryMergeReady(workDir, rigName string, result *HandlerResult) {
 	townRoot, _ := workspace.Find(workDir)
+	// Emit file-based event so refinery's await-event unblocks instantly.
+	if townRoot != "" {
+		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
+			"source=witness",
+			"rig=" + rigName,
+		})
+	}
 	if nudgeErr := nudgeRefinery(townRoot, rigName); nudgeErr != nil {
 		if result.Error == nil {
 			result.Error = fmt.Errorf("nudging refinery: %w (non-fatal)", nudgeErr)
@@ -737,11 +750,19 @@ func RestartPolecatSession(workDir, rigName, polecatName string) error {
 // NukePolecat executes the actual nuke operation for a polecat.
 // This kills the tmux session, removes the worktree, and cleans up beads.
 // Refuses to nuke polecats with pending MRs in the refinery queue (gt-6a9d).
+// Refuses to nuke if Mayor ACP session is active (gt-qnp).
 func NukePolecat(bd *BdCli, workDir, rigName, polecatName string) error {
+	// Persistence interlock (gt-qnp): veto cleanup if Mayor ACP session is active.
+	townRoot := workDirToTownRoot(workDir)
+	checker := mayor.NewCleanupVetoChecker(townRoot)
+	if vetoed, reason := checker.ShouldVetoCleanup(); vetoed {
+		return fmt.Errorf("refusing to nuke %s/%s: %s", rigName, polecatName, reason)
+	}
+
 	// Safety gate (gt-6a9d): refuse to nuke if MR is pending in refinery.
 	// Nuking deletes the remote branch, which the refinery needs to merge.
 	initRegistryFromWorkDir(workDir)
-	prefix := beads.GetPrefixForRig(workDirToTownRoot(workDir), rigName)
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
 	agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
 	if hasPendingMR(bd, workDir, rigName, polecatName, agentBeadID) {
 		return fmt.Errorf("refusing to nuke %s/%s: MR pending in refinery (gt-6a9d)", rigName, polecatName)
@@ -1305,9 +1326,27 @@ func isZombieState(agentState beads.AgentState, hookBead string) bool {
 // between concurrent patrol cycles. The cleanup wisp is created first as an atomic
 // interlock, then checked for duplicates. Deterministic winner selection (lowest
 // wisp ID) ensures exactly one patrol proceeds with the restart.
+//
+// gt-qnp: If Mayor ACP session is active, vetoes automatic cleanup to allow Mayor review.
 func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult) {
 	zombie.CleanupStatus = cleanupStatus
 	skipRestart := false
+
+	// Persistence interlock (gt-qnp): check if Mayor ACP session is active before cleanup.
+	townRoot := workDirToTownRoot(workDir)
+	if mayor.IsACPActive(townRoot) {
+		existingWisp := findAnyCleanupWisp(bd, workDir, polecatName)
+		if existingWisp != "" {
+			zombie.Action = fmt.Sprintf("cleanup-deferred-acp (cleanup_status=%s, existing-wisp=%s)", cleanupStatus, existingWisp)
+			return
+		}
+		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
+		if wispErr != nil {
+			zombie.Error = wispErr
+		}
+		zombie.Action = fmt.Sprintf("cleanup-deferred-acp:%s (Mayor ACP session active)", wispID)
+		return
+	}
 
 	switch cleanupStatus {
 	case "clean", "":
@@ -1865,6 +1904,7 @@ func getBeadStatus(bd *BdCli, workDir, beadID string) string {
 // 3. Clears assignee
 // 4. Sends mail to deacon for re-dispatch (includes respawn count; SPAWN_STORM
 //    prefix and Urgent priority when count exceeds max bead respawns config)
+//
 // Returns true if the bead was recovered.
 func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName string, router *mail.Router) bool {
 	if hookBead == "" {

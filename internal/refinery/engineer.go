@@ -453,7 +453,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 	if len(subChanges) > 0 {
 		// Ensure submodules are initialized in the refinery worktree
-		if initErr := git.InitSubmodules(e.git.WorkDir()); initErr != nil {
+		// Use mayor/rig as reference to avoid re-fetching from remote
+		mayorRig := filepath.Join(e.rig.Path, "mayor", "rig")
+		if initErr := git.InitSubmodules(e.git.WorkDir(), mayorRig); initErr != nil {
 			return ProcessResult{
 				Success: false,
 				Error:   fmt.Sprintf("failed to init submodules in refinery worktree: %v", initErr),
@@ -977,10 +979,15 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted local branch: %s\n", mr.Branch)
 		}
-		if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
+		// Remote delete — only polecat branches. Non-polecat branches may belong
+		// to contributor forks with open upstream PRs; deleting them from origin
+		// causes GitHub to auto-close those PRs via head_ref_delete. (GH#2669)
+		if isPolecat {
+			if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
+			}
 		}
 	}
 
@@ -1285,7 +1292,7 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 	// Query beads for all open merge-request issues.
 	// Cannot use ReadyWithType here because bd ready excludes ephemeral beads,
 	// and MRs are ephemeral by design. Use List + manual blocker check instead.
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1, // No priority filter
@@ -1348,7 +1355,7 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 // This queries beads for blocked merge-request issues.
 func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 	// Query all merge-request issues (both ready and blocked)
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1, // No priority filter
@@ -1390,7 +1397,7 @@ func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 // so agents can detect orphaned MRs. Designed for agent-side queue health analysis
 // (ZFC: Go transports data, agent decides what's interesting).
 func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1,
@@ -1426,7 +1433,7 @@ func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
 // ListQueueAnomalies finds stale claims and orphaned branches in open MRs.
 // This gives Witness/Refinery patrols deterministic signals for deadlock risk.
 func (e *Engineer) ListQueueAnomalies(now time.Time) ([]*MRAnomaly, error) {
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1,
@@ -1596,7 +1603,7 @@ type convoyInfo struct {
 // are complete. Returns the list of convoys that were closed.
 func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []convoyInfo {
 	// List all open convoys
-	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json")
+	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json", "--flat")
 	listCmd.Dir = townBeads
 	var stdout bytes.Buffer
 	listCmd.Stdout = &stdout

@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -21,6 +22,19 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+func hasACPSessionByName(townRoot, sessionName string) bool {
+	if townRoot == "" {
+		return false
+	}
+
+	// Currently only the Mayor supports ACP.
+	if sessionName == session.MayorSessionName() {
+		return mayor.IsACPActive(townRoot)
+	}
+
+	return false
+}
 
 var (
 	nudgeMessageFlag  string
@@ -143,12 +157,19 @@ var idleWatcherPollInterval = 1 * time.Second
 func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 	townRoot, _ := workspace.FindFromCwd()
 
+	// Use the requested mode, but force queue mode for ACP sessions.
+	// ACP agents don't have tmux panes to send-keys to.
+	mode := nudgeModeFlag
+	if hasACPSessionByName(townRoot, sessionName) {
+		mode = NudgeModeQueue
+	}
+
 	// For direct tmux delivery, prefix with sender attribution.
 	// Queue-based delivery stores Sender as a separate field and
 	// FormatForInjection adds the prefix, so we must NOT double-prefix.
 	prefixedMessage := fmt.Sprintf("[from %s] %s", sender, message)
 
-	switch nudgeModeFlag {
+	switch mode {
 	case NudgeModeQueue:
 		if townRoot == "" {
 			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
@@ -164,6 +185,39 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// wait-idle needs workspace for queue fallback — fail explicitly
 			// rather than silently degrading to immediate (destructive) delivery.
 			return fmt.Errorf("--mode=wait-idle requires a Gas Town workspace")
+		}
+		// Check if the target agent supports prompt-based idle detection.
+		// WaitForIdle uses Claude Code's prompt pattern (❯) and status bar (⏵⏵).
+		// Non-Claude agents (Gemini, Codex, etc.) have no ReadyPromptPrefix,
+		// so WaitForIdle produces false positives — it sees no busy indicator
+		// and matches stale prompt characters in the pane buffer. (GH#gt-5ey3)
+		// Degrade to queue mode for agents without prompt-based detection.
+		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
+			preset := config.GetAgentPresetByName(agentName)
+			if preset != nil && preset.ReadyPromptPrefix == "" {
+				fmt.Fprintf(os.Stderr, "wait-idle: %s agent %q has no prompt detection, using queue mode\n", sessionName, agentName)
+				if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+					Sender:   sender,
+					Message:  message,
+					Priority: nudgePriorityFlag,
+				}); qErr != nil {
+					formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+						Sender:   sender,
+						Message:  message,
+						Priority: nudgePriorityFlag,
+					}})
+					return t.NudgeSession(sessionName, formatted)
+				}
+				// Ensure a nudge-poller is running so the queue actually drains.
+				// The poller is normally started by gt crew start, but if the
+				// session was started manually (or the poller crashed), queued
+				// nudges sit undelivered forever. StartPoller is idempotent —
+				// it no-ops if a poller is already alive for this session.
+				if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
+					fmt.Fprintf(os.Stderr, "wait-idle: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
+				}
+				return nil
+			}
 		}
 		// Try to wait for idle
 		err := t.WaitForIdle(sessionName, waitIdleTimeout)
@@ -367,6 +421,13 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Check DND status for target (unless force flag or channel target)
 	townRoot, _ := workspace.FindFromCwd()
+	if townRoot != "" {
+		// Initialize tmux socket and prefix registry so NewTmux() connects
+		// to the correct town socket. Without this, nudge from non-agent
+		// contexts (e.g., crew workspaces without GT_TOWN_SOCKET) falls
+		// through to the sentinel socket and fails to find sessions.
+		_ = session.InitRegistry(townRoot)
+	}
 	if townRoot != "" && !nudgeForceFlag {
 		shouldSend, level, _ := shouldNudgeTarget(townRoot, target, nudgeForceFlag)
 		if !shouldSend {
@@ -403,12 +464,14 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	// Special case: "deacon" target maps to the Deacon session
 	if target == constants.RoleDeacon {
 		deaconSession := session.DeaconSessionName()
-		// Check if Deacon session exists
-		exists, err := t.HasSession(deaconSession)
-		if err != nil {
-			return fmt.Errorf("checking deacon session: %w", err)
+		// Check if Deacon session exists (tmux or ACP)
+		hasACP := hasACPSessionByName(townRoot, deaconSession)
+		exists := false
+		if !hasACP {
+			exists, _ = t.HasSession(deaconSession)
 		}
-		if !exists {
+
+		if !hasACP && !exists {
 			// Deacon not running - this is not an error, just log and return
 			fmt.Printf("%s Deacon not running, nudge skipped\n", style.Dim.Render("○"))
 			return nil
@@ -471,7 +534,8 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		// For queue/wait-idle modes, verify session exists before enqueuing.
 		// Without this, queue mode silently succeeds for nonexistent sessions —
 		// the file is written but never drained.
-		if nudgeModeFlag != NudgeModeImmediate {
+		// ACP sessions are always allowed as they use queue mode.
+		if nudgeModeFlag != NudgeModeImmediate && !hasACPSessionByName(townRoot, sessionName) {
 			exists, err := t.HasSession(sessionName)
 			if err != nil {
 				return fmt.Errorf("checking session: %w", err)
@@ -495,12 +559,17 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload(rigName, target, message))
 	} else {
 		// Raw session name (legacy)
-		exists, err := t.HasSession(target)
-		if err != nil {
-			return fmt.Errorf("checking session: %w", err)
-		}
-		if !exists {
-			return fmt.Errorf("session %q not found", target)
+		// Check for ACP session - ACP agents don't have tmux sessions but can receive nudges via queue
+		hasACP := hasACPSessionByName(townRoot, target)
+
+		if !hasACP {
+			exists, err := t.HasSession(target)
+			if err != nil {
+				return fmt.Errorf("checking session: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("session %q not found", target)
+			}
 		}
 
 		if err := deliverNudge(t, target, message, sender); err != nil {
@@ -635,6 +704,7 @@ func runNudgeChannel(channelName, message, sender string) error {
 //   - Wildcard: "gastown/polecats/*" → all polecat sessions in gastown
 //   - Role: "*/witness" → all witness sessions
 //   - Special: "mayor", "deacon" → gt-{town}-mayor, gt-{town}-deacon
+//
 // townName is used to generate the correct session names for mayor/deacon.
 func resolveNudgePattern(pattern string, agents []*AgentSession) []string {
 	var results []string

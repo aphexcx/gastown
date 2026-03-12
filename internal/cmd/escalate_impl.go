@@ -664,7 +664,7 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 	if err != nil {
 		return fmt.Errorf("posting to slack: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -688,7 +688,7 @@ func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, descripti
 	if err != nil {
 		return fmt.Errorf("posting to sms webhook: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)

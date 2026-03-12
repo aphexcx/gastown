@@ -18,7 +18,7 @@ func TestBuildWitnessStartCommand_UsesRoleConfig(t *testing.T) {
 		t.Fatalf("buildWitnessStartCommand: %v", err)
 	}
 
-	want := "env -u CLAUDECODE NODE_OPTIONS='' exec run --town /town --rig gastown --role witness"
+	want := "exec env -u CLAUDECODE NODE_OPTIONS='' run --town /town --rig gastown --role witness"
 	if got != want {
 		t.Errorf("buildWitnessStartCommand = %q, want %q", got, want)
 	}

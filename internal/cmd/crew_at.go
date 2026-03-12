@@ -68,7 +68,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		fmt.Printf("[DEBUG] after detection: name=%q, crewRig=%q\n", name, crewRig)
 	}
 
-	crewMgr, r, err := getCrewManager(crewRig)
+	crewMgr, r, err := getCrewManagerForMember(crewRig, name)
 	if err != nil {
 		return err
 	}

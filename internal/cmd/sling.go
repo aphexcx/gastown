@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -759,7 +760,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("Would set convoy merge strategy: %s\n", slingMerge)
 				}
 			} else {
-				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge)
+				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge, slingBaseBranch)
 				if err != nil {
 					// Log warning but don't fail - convoy is optional
 					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
@@ -897,6 +898,20 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
 	if err := hookBeadWithRetry(beadID, targetAgent, hookDir); err != nil {
 		return err
+	}
+
+	// Emit a propulsion signal if the target is the mayor.
+	// This allows the ACP propeller to react to hook changes event-driven.
+	if targetAgent == "mayor/" {
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			session := "hq-mayor"
+			message := fmt.Sprintf("Hook updated: attached bead %s", beadID)
+			_ = nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+				Sender:   "sling",
+				Message:  message,
+				Priority: nudge.PriorityNormal,
+			})
+		}
 	}
 
 	fmt.Printf("%s Work attached to hook (status=hooked)\n", style.Bold.Render("✓"))

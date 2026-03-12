@@ -1049,7 +1049,8 @@ func TestBuildAgentStartupCommand(t *testing.T) {
 	if !strings.Contains(cmd, "BD_ACTOR=gastown/witness") {
 		t.Error("expected BD_ACTOR in command")
 	}
-	if !strings.Contains(cmd, "claude --dangerously-skip-permissions") {
+	parts := strings.Fields(cmd)
+	if len(parts) < 2 || !isClaudeCommand(parts[len(parts)-2]) || parts[len(parts)-1] != "--dangerously-skip-permissions" {
 		t.Error("expected claude command in output")
 	}
 }
@@ -1157,10 +1158,75 @@ func TestResolveAgentConfigWithOverride(t *testing.T) {
 		}
 	})
 
+	t.Run("override uses custom codex hooks alias", func(t *testing.T) {
+		townSettings := NewTownSettings()
+		townSettings.Agents["codex-worker-hooks"] = &RuntimeConfig{
+			Command:    "codex",
+			Args:       []string{"--dangerously-bypass-approvals-and-sandbox"},
+			PromptMode: "arg",
+			Hooks: &RuntimeHooksConfig{
+				Provider:     "codex",
+				Dir:          ".codex",
+				SettingsFile: "hooks.json",
+			},
+		}
+		if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+			t.Fatalf("SaveTownSettings: %v", err)
+		}
+
+		rc, name, err := ResolveAgentConfigWithOverride(townRoot, rigPath, "codex-worker-hooks")
+		if err != nil {
+			t.Fatalf("ResolveAgentConfigWithOverride: %v", err)
+		}
+		if name != "codex-worker-hooks" {
+			t.Fatalf("name = %q, want %q", name, "codex-worker-hooks")
+		}
+		if rc.Command != "codex" {
+			t.Fatalf("rc.Command = %q, want %q", rc.Command, "codex")
+		}
+		if rc.PromptMode != "arg" {
+			t.Fatalf("rc.PromptMode = %q, want %q", rc.PromptMode, "arg")
+		}
+		if rc.Hooks == nil {
+			t.Fatal("expected hooks config")
+		}
+		if rc.Hooks.Provider != "codex" || rc.Hooks.Dir != ".codex" || rc.Hooks.SettingsFile != "hooks.json" {
+			t.Fatalf("unexpected hooks config: %+v", rc.Hooks)
+		}
+		args := rc.BuildArgsWithPrompt("start here")
+		if len(args) == 0 || args[len(args)-1] != "start here" {
+			t.Fatalf("BuildArgsWithPrompt should append prompt positionally, got %v", args)
+		}
+	})
+
 	t.Run("unknown override errors", func(t *testing.T) {
 		_, _, err := ResolveAgentConfigWithOverride(townRoot, rigPath, "nope-not-an-agent")
 		if err == nil {
 			t.Fatal("expected error for unknown agent override")
+		}
+	})
+
+	t.Run("override with subcommand", func(t *testing.T) {
+		rc, name, err := ResolveAgentConfigWithOverride(townRoot, rigPath, "opencode acp")
+		if err != nil {
+			t.Fatalf("ResolveAgentConfigWithOverride: %v", err)
+		}
+		if name != "opencode" {
+			t.Fatalf("name = %q, want %q", name, "opencode")
+		}
+		if rc.Command != "opencode" {
+			t.Fatalf("rc.Command = %q, want %q", rc.Command, "opencode")
+		}
+		// Verify "acp" was appended to Args
+		found := false
+		for _, arg := range rc.Args {
+			if arg == "acp" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("rc.Args = %v, want it to contain %q", rc.Args, "acp")
 		}
 	})
 }
@@ -1540,8 +1606,8 @@ func TestResolveRoleAgentConfig_FallsBackOnInvalidAgent(t *testing.T) {
 
 	// Should fall back to default (claude) when agent is invalid
 	rc := ResolveRoleAgentConfig(constants.RoleRefinery, townRoot, rigPath)
-	// Command can be "claude" or full path to claude
-	if rc.Command != "claude" && !strings.HasSuffix(rc.Command, "/claude") {
+	// Command can be "claude" or a resolved platform-specific claude binary path.
+	if !isClaudeCommand(rc.Command) {
 		t.Errorf("expected fallback to claude or path ending in /claude, got: %s", rc.Command)
 	}
 }
@@ -1745,11 +1811,19 @@ func TestResolveWorkerAgentConfig_TownCrewAgents(t *testing.T) {
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "myrig")
 
-	// Create a fake codex binary
+	// Create fake agent binaries (needs .exe on Windows for exec.LookPath).
+	// Both codex and claude stubs are needed: codex for town crew_agents,
+	// claude for the rig worker_agents override subtest.
 	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
-		t.Fatalf("write codex stub: %v", err)
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	for _, name := range []string{"codex", "claude"} {
+		stubPath := filepath.Join(binDir, name+ext)
+		if err := os.WriteFile(stubPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatalf("write %s stub: %v", name, err)
+		}
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -3655,8 +3729,8 @@ func TestResolveRoleAgentConfig(t *testing.T) {
 
 	t.Run("town-level role (no rigPath) uses town RoleAgents", func(t *testing.T) {
 		rc := ResolveRoleAgentConfig("mayor", townRoot, "")
-		// mayor is in town's RoleAgents - command can be "claude" or full path to claude
-		if rc.Command != "claude" && !strings.HasSuffix(rc.Command, "/claude") {
+		// mayor is in town's RoleAgents and may resolve to a platform-specific claude binary path.
+		if !isClaudeCommand(rc.Command) {
 			t.Errorf("Command = %q, want claude or path ending in /claude", rc.Command)
 		}
 	})
@@ -4992,5 +5066,74 @@ func TestResolveRoleAgentConfig_EphemeralDefaultPreservesNonClaudeOverride(t *te
 	// preserve explicit non-Claude overrides
 	if rc.Command != "gemini" {
 		t.Errorf("expected gemini for polecat (non-Claude rig override with tier default), got Command=%q", rc.Command)
+	}
+}
+
+func TestBuildStartupCommand_ExecWrapper(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	// Create a rig settings with exec_wrapper configured
+	rigSettings := NewRigSettings()
+	rigSettings.Runtime = &RuntimeConfig{
+		Command:     "claude",
+		ExecWrapper: []string{"exitbox", "run", "--profile=gastown-polecat", "--"},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd := BuildStartupCommand(map[string]string{"GT_ROLE": "polecat"}, rigPath, "hello")
+
+	// Must contain exec wrapper tokens
+	if !strings.Contains(cmd, "exitbox run --profile=gastown-polecat --") {
+		t.Errorf("expected exec wrapper in command, got: %q", cmd)
+	}
+
+	// The wrapper + agent command should appear as a contiguous sequence
+	// "exitbox run --profile=gastown-polecat -- claude"
+	if !strings.Contains(cmd, "exitbox run --profile=gastown-polecat -- claude") {
+		t.Errorf("expected wrapper immediately before claude command, got: %q", cmd)
+	}
+
+	// Env vars (exec env ...) must appear before the wrapper
+	envIdx := strings.Index(cmd, "exec env")
+	wrapperIdx := strings.Index(cmd, "exitbox run")
+	if envIdx == -1 || wrapperIdx == -1 || envIdx >= wrapperIdx {
+		t.Errorf("expected 'exec env' before wrapper, got: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverride_ExecWrapper(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	// Create rig settings with exec_wrapper
+	rigSettings := NewRigSettings()
+	rigSettings.Runtime = &RuntimeConfig{
+		Command:     "claude",
+		ExecWrapper: []string{"daytona", "exec", "furiosa-ws", "--"},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "polecat"},
+		rigPath, "hello", "",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "daytona exec furiosa-ws --") {
+		t.Errorf("expected exec wrapper in command, got: %q", cmd)
+	}
+
+	// The wrapper + agent command should appear as a contiguous sequence
+	if !strings.Contains(cmd, "daytona exec furiosa-ws -- claude") {
+		t.Errorf("expected wrapper immediately before claude command, got: %q", cmd)
 	}
 }
