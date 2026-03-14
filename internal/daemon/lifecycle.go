@@ -870,6 +870,28 @@ func (d *Daemon) getAgentHookBead(agentBeadID string) string {
 	return issues[0].HookBead
 }
 
+// getBeadStatus returns the status of a bead by ID (e.g., "open", "closed").
+// Returns empty string on error. Used by the daemon to check if a polecat's
+// hooked bead is already closed (completed normally, not a crash).
+func (d *Daemon) getBeadStatus(beadID string) string {
+	cmd := exec.Command(d.bdPath, "show", beadID, "--json")
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = os.Environ()
+
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var issues []struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
+		return ""
+	}
+	return issues[0].Status
+}
+
 // identityToAgentBeadID maps a daemon identity to an agent bead ID.
 // Uses parseIdentity to extract components, then uses beads package helpers.
 func (d *Daemon) identityToAgentBeadID(identity string) string {
