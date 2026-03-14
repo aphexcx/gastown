@@ -106,6 +106,15 @@ for RIG in $RIG_NAMES; do
           echo "  SKIP $SESSION_NAME: agent_state=spawning (sling in progress)"
           continue
         fi
+
+        # Check if hooked bead is already closed — polecat completed normally
+        BEAD_STATUS=$(bd show "$HOOK_BEAD" --json 2>/dev/null \
+          | jq -r '.status // empty' 2>/dev/null)
+        if [ "$BEAD_STATUS" = "closed" ]; then
+          echo "  SKIP $SESSION_NAME: hook bead $HOOK_BEAD is closed (completed normally)"
+          continue
+        fi
+
         CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
         echo "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
       fi

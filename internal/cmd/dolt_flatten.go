@@ -65,7 +65,7 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 	}
 
 	config := doltserver.DefaultConfig(townRoot)
-	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
+	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=300s&writeTimeout=300s",
 		config.User, config.HostPort(), dbName)
 
 	db, err := sql.Open("mysql", dsn)
@@ -74,8 +74,8 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	// Verify database exists by querying it.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Context for the entire flatten operation.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	var dummy int
 	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&dummy); err != nil {
@@ -181,7 +181,7 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 
 // flattenGetRowCounts returns table -> row count for all user tables.
 func flattenGetRowCounts(db *sql.DB, dbName string) (map[string]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	query := fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name NOT LIKE 'dolt_%%'", dbName)
