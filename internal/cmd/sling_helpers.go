@@ -31,18 +31,14 @@ import (
 // resolveBeadDir returns the directory to run bd commands for a given bead ID.
 // Uses prefix-based routing to find the correct rig directory.
 // Falls back to rigs.json prefix mapping, then town root.
-func resolveBeadDir(beadID string) string {
+func resolveBeadDir(_ string) string {
+	// Always return town root. bd's own prefix routing (routes.jsonl at town
+	// level) handles dispatching to the correct rig database. Returning the
+	// rig path caused bd to discover rig-local .beads/ with broken nested
+	// routing, leading to "bead not found" errors for valid sc-/st-/etc IDs.
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return "."
-	}
-	prefix := beads.ExtractPrefix(beadID)
-	if rigPath := beads.GetRigPathForPrefix(townRoot, prefix); rigPath != "" {
-		return rigPath
-	}
-	// Fallback: consult rigs.json for prefix-to-rig mapping
-	if rigDir := resolveBeadDirFromRigsJSON(townRoot, prefix); rigDir != "" {
-		return rigDir
 	}
 	return townRoot
 }
@@ -1184,4 +1180,31 @@ func updateAgentMode(agentID, mode, workDir, townBeadsDir string) {
 	if err := bd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{Mode: &mode}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s mode: %v\n", agentBeadID, err)
 	}
+}
+
+// lookupPriorAttempt checks if there are existing open MRs for the given issue.
+// If found, returns formula variables with the prior branch name so the new
+// polecat can cherry-pick or reference prior work instead of starting from scratch.
+// Returns nil if no prior attempt exists. (GH#gt-zqvj)
+func lookupPriorAttempt(beadsDir, issueID string) []string {
+	bd := beads.New(beadsDir)
+	mrs, err := bd.FindOpenMRsForIssue(issueID)
+	if err != nil || len(mrs) == 0 {
+		return nil
+	}
+
+	// Use the most recent MR (last in list) as the prior attempt.
+	prior := mrs[len(mrs)-1]
+	fields := beads.ParseMRFields(prior)
+	if fields == nil || fields.Branch == "" {
+		return nil
+	}
+
+	vars := []string{
+		fmt.Sprintf("prior_branch=%s", fields.Branch),
+	}
+	if fields.CloseReason != "" {
+		vars = append(vars, fmt.Sprintf("prior_failure=%s", fields.CloseReason))
+	}
+	return vars
 }

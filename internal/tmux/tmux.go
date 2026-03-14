@@ -1519,12 +1519,12 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
 }
 
-// AcceptStartupDialogs dismisses all Claude Code startup dialogs that can block
-// automated sessions. Currently handles (in order):
-//  1. Workspace trust dialog ("Quick safety check" / "trust this folder") — v2.1.55+
+// AcceptStartupDialogs dismisses startup dialogs that can block automated
+// sessions. Currently handles (in order):
+//  1. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
 //  2. Bypass permissions warning ("Bypass Permissions mode") — requires Down+Enter
 //
-// Call this after starting Claude and waiting for it to initialize (WaitForCommand),
+// Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
 	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
@@ -1536,14 +1536,13 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 	return nil
 }
 
-// AcceptWorkspaceTrustDialog dismisses the Claude Code workspace trust dialog.
-// Starting with Claude Code v2.1.55, a "Quick safety check" dialog appears on first launch
-// in a workspace, asking the user to confirm they trust the folder. Option 1 ("Yes, I trust
-// this folder") is pre-selected, so we just need to press Enter to accept.
-// This dialog appears BEFORE the bypass permissions warning, so call this first.
+// AcceptWorkspaceTrustDialog dismisses workspace trust dialogs for supported
+// agents. Claude shows "Quick safety check"; Codex shows
+// "Do you trust the contents of this directory?". In both cases the safe
+// continue option is pre-selected, so Enter accepts the dialog.
 //
 // Uses a polling loop instead of a single check to handle the race condition where
-// Claude hasn't rendered the dialog yet when we first check. Exits early if the
+// the agent hasn't rendered the dialog yet when we first check. Exits early if the
 // agent prompt appears (indicating no dialog will be shown).
 func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 	deadline := time.Now().Add(constants.DialogPollTimeout)
@@ -1554,8 +1553,10 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 			continue
 		}
 
-		// Look for characteristic trust dialog text
-		if strings.Contains(content, "trust this folder") || strings.Contains(content, "Quick safety check") {
+		// Look for characteristic trust dialog text before prompt detection.
+		// Codex trust screens include a leading ">" banner line, so prompt
+		// detection alone would exit too early.
+		if containsWorkspaceTrustDialog(content) {
 			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
 			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
 				return err
@@ -1577,6 +1578,12 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 
 	// Timeout — no dialog detected, safe to proceed
 	return nil
+}
+
+func containsWorkspaceTrustDialog(content string) bool {
+	return strings.Contains(content, "trust this folder") ||
+		strings.Contains(content, "Quick safety check") ||
+		strings.Contains(content, "Do you trust the contents of this directory?")
 }
 
 // promptSuffixes are strings that indicate a shell or agent prompt is visible.

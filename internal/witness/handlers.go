@@ -945,9 +945,10 @@ type ZombieResult struct {
 
 // DetectZombiePolecatsResult contains the results of a zombie detection sweep.
 type DetectZombiePolecatsResult struct {
-	Checked int
-	Zombies []ZombieResult
-	Errors  []error // Transient errors that prevented checking some polecats
+	Checked        int
+	Zombies        []ZombieResult
+	ConvoyFailures []ConvoyFailureResult // Mountain-Eater Layer 1: convoy failure tracking (gt-cfq)
+	Errors         []error               // Transient errors that prevented checking some polecats
 }
 
 // DetectZombiePolecats cross-references polecat agent state with tmux session
@@ -1068,6 +1069,11 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
+
+	// Mountain-Eater Layer 1 (gt-cfq): Track polecat failures for convoy-tracked issues.
+	// For each zombie with an active hook_bead (polecat failed without completing work),
+	// check if the issue belongs to a convoy and track the failure.
+	trackConvoyFailures(bd, workDir, result)
 
 	return result
 }

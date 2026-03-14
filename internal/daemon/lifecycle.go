@@ -943,7 +943,7 @@ const GUPPViolationTimeout = constants.GUPPViolationTimeout
 // The wisps query is best-effort (gracefully ignored if table doesn't exist).
 func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	// Query issues table (backward compat during migration)
-	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
+	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ()
 
@@ -1077,6 +1077,12 @@ func (d *Daemon) checkRigGUPPViolations(rigName string) {
 			continue // No hooked work - no GUPP violation possible
 		}
 
+		// Skip nuked agents — they're intentionally terminated and should not
+		// trigger alerts even if stale hook_bead data remains in the database.
+		if beads.AgentState(agent.AgentState) == beads.AgentStateNuked {
+			continue
+		}
+
 		// Per gt-zecmc: derive running state from tmux, not agent_state
 		// Extract polecat name from agent ID (<prefix>-<rig>-polecat-<name> -> <name>)
 		polecatName := strings.TrimPrefix(agent.ID, prefix)
@@ -1153,10 +1159,11 @@ func (d *Daemon) checkOrphanedWork() {
 func (d *Daemon) checkRigOrphanedWork(rigName string) {
 	// List polecat agent beads (issues + wisps tables)
 	var agents []struct {
-		ID       string   `json:"id"`
-		HookBead string   `json:"hook_bead"`
-		Labels   []string `json:"labels"`
-		Type     string   `json:"issue_type"`
+		ID         string   `json:"id"`
+		HookBead   string   `json:"hook_bead"`
+		AgentState string   `json:"agent_state"`
+		Labels     []string `json:"labels"`
+		Type       string   `json:"issue_type"`
 	}
 
 	if err := d.listAgentBeadsJSON(&agents); err != nil {
@@ -1176,6 +1183,12 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {
 
 		// No hooked work = nothing to orphan
 		if agent.HookBead == "" {
+			continue
+		}
+
+		// Skip nuked agents — they're intentionally terminated and should not
+		// trigger alerts even if stale hook_bead data remains in the database.
+		if beads.AgentState(agent.AgentState) == beads.AgentStateNuked {
 			continue
 		}
 

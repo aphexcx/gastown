@@ -267,13 +267,47 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 }
 
 // exportTableToJsonl runs a query and writes the result as JSONL to {dir}/{table}.jsonl.
+// Connects to the running Dolt server via --host/--port to get current committed data,
+// falling back to embedded mode (cmd.Dir=dataDir) if no server config is available.
 // Returns the number of records exported.
 func (d *Daemon) exportTableToJsonl(table, query, dir, dataDir string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), jsonlExportTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "dolt", "sql", "-r", "json", "-q", query)
-	cmd.Dir = dataDir
+	// Prefer querying the running server (accurate, up-to-date data) over embedded
+	// mode (reads on-disk state which may lag behind server commits).
+	host := "127.0.0.1"
+	port := 3307
+	user := "root"
+	password := ""
+	useServer := false
+	if d.doltServer != nil && d.doltServer.IsEnabled() {
+		if d.doltServer.config.Host != "" {
+			host = d.doltServer.config.Host
+		}
+		if d.doltServer.config.Port != 0 {
+			port = d.doltServer.config.Port
+		}
+		if d.doltServer.config.User != "" {
+			user = d.doltServer.config.User
+		}
+		password = d.doltServer.config.Password
+		useServer = true
+	}
+
+	var cmd *exec.Cmd
+	if useServer {
+		cmd = exec.CommandContext(ctx, "dolt",
+			"--host", host,
+			"--port", strconv.Itoa(port),
+			"--no-tls",
+			"-u", user,
+			"-p", password,
+			"sql", "-r", "json", "-q", query)
+	} else {
+		cmd = exec.CommandContext(ctx, "dolt", "sql", "-r", "json", "-q", query)
+		cmd.Dir = dataDir
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

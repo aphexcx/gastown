@@ -354,10 +354,28 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Find beads directory
+	// Find beads directory.
+	// First try CWD-based discovery, then resolve to the correct rig database
+	// based on the agent's identity. Without this, CWD at the town root (~/gt)
+	// queries the hq database instead of the rig's database where hooked beads
+	// actually live. See bd-hook-status-cwd-bug.
 	workDir, err := findLocalBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
+	}
+
+	// Resolve to the agent's rig beads directory if CWD-based discovery
+	// found the wrong database. This matches runHookShow's resolution logic.
+	if !isTownLevelRole(target) && townRoot != "" {
+		agentBeadID := buildAgentBeadID(target, roleCtx.Role, townRoot)
+		if agentBeadID != "" {
+			rigName := strings.Split(target, "/")[0]
+			fallbackPath := filepath.Join(townRoot, rigName)
+			resolvedDir := beads.ResolveHookDir(townRoot, agentBeadID, fallbackPath)
+			if resolvedDir != "" {
+				workDir = resolvedDir
+			}
+		}
 	}
 
 	b := beads.New(workDir)
@@ -542,6 +560,11 @@ func buildAgentIdentity(ctx RoleContext) string {
 		return ctx.Rig + "/polecats/" + ctx.Polecat
 	case RoleCrew:
 		return ctx.Rig + "/crew/" + ctx.Polecat
+	case RoleDog:
+		if ctx.Polecat == "" {
+			return ""
+		}
+		return "deacon/dogs/" + ctx.Polecat
 	default:
 		return ""
 	}

@@ -217,6 +217,28 @@ func (r *Router) ensureCustomTypes(beadsDir string) error {
 	return nil
 }
 
+func (r *Router) buildLabels(msg *Message) []string {
+	var labels []string
+	labels = append(labels, "gt:message")
+	if msg.Type == TypeEscalation {
+		labels = append(labels, "gt:escalation")
+	}
+	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, "msg-type:"+string(msg.Type))
+	labels = append(labels, DeliverySendLabels()...)
+	if msg.ThreadID != "" {
+		labels = append(labels, "thread:"+msg.ThreadID)
+	}
+	if msg.ReplyTo != "" {
+		labels = append(labels, "reply-to:"+msg.ReplyTo)
+	}
+	for _, cc := range msg.CC {
+		ccIdentity := AddressToIdentity(cc)
+		labels = append(labels, "cc:"+ccIdentity)
+	}
+	return labels
+}
+
 // isTownLevelAddress returns true if the address is for a town-level agent or the overseer.
 func isTownLevelAddress(address string) bool {
 	addr := strings.TrimSuffix(address, "/")
@@ -707,7 +729,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 // queryAgentsInDir queries agent beads in a specific beads directory with optional description filtering.
 // Queries both the issues and wisps tables, merging results.
 func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, error) {
-	args := []string{"list", "--label=gt:agent", "--json", "--flat", "--limit=0"}
+	args := []string{"list", "--label=gt:agent", "--json", "--limit=0"}
 
 	if descContains != "" {
 		args = append(args, "--desc-contains="+descContains)
@@ -1078,21 +1100,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	}
 
 	// Build labels for type, from/thread/reply-to/cc
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
-	labels = append(labels, DeliverySendLabels()...)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	// Add CC labels (one per recipient)
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
+	labels := r.buildLabels(msg)
 
 	// Build command: bd create --assignee=<recipient> -d <body> --labels=gt:message,... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1595,7 +1603,8 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
 		}
 
-		notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
+		notification := formatNotificationMessage(msg)
+		priority := nudgePriorityForMailPriority(msg.Priority)
 
 		// Wait-idle-first delivery: try direct nudge if the agent is idle,
 		// fall back to cooperative queue if busy. WaitForIdle requires 2
@@ -1621,8 +1630,12 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			// Timeout (agent busy) — queue for cooperative delivery
 			// at the next turn boundary.
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:  msg.From,
-				Message: notification,
+				Sender:   msg.From,
+				Message:  notification,
+				Priority: priority,
+				Kind:     nudgeKindForMessage(msg),
+				ThreadID: msg.ThreadID,
+				Severity: prioritySeverityLabel(msg.Priority),
 			}); err != nil {
 				return err
 			}
@@ -1639,14 +1652,54 @@ func (r *Router) notifyRecipient(msg *Message) error {
 	// No tmux session found - enqueue nudge for ACP/propeller delivery
 	// This handles headless ACP mode where there's no tmux session
 	if r.townRoot != "" && len(sessionIDs) > 0 {
-		notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
+		notification := formatNotificationMessage(msg)
 		return nudge.Enqueue(r.townRoot, sessionIDs[0], nudge.QueuedNudge{
-			Sender:  msg.From,
-			Message: notification,
+			Sender:   msg.From,
+			Message:  notification,
+			Priority: nudgePriorityForMailPriority(msg.Priority),
+			Kind:     nudgeKindForMessage(msg),
+			ThreadID: msg.ThreadID,
+			Severity: prioritySeverityLabel(msg.Priority),
 		})
 	}
 
 	return nil // No active session found
+}
+
+func nudgeKindForMessage(msg *Message) string {
+	if msg.Type == TypeEscalation {
+		return "escalation"
+	}
+	return "mail"
+}
+
+func nudgePriorityForMailPriority(priority Priority) string {
+	switch priority {
+	case PriorityUrgent, PriorityHigh:
+		return nudge.PriorityUrgent
+	default:
+		return nudge.PriorityNormal
+	}
+}
+
+func formatNotificationMessage(msg *Message) string {
+	if msg.Type == TypeEscalation {
+		return fmt.Sprintf("🚨 Escalation mail from %s. ID: %s. Severity: %s. Subject: %s. Run 'gt mail read %s' or 'gt escalate ack %s'.", msg.From, msg.ThreadID, prioritySeverityLabel(msg.Priority), msg.Subject, msg.ThreadID, msg.ThreadID)
+	}
+	return fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
+}
+
+func prioritySeverityLabel(priority Priority) string {
+	switch priority {
+	case PriorityUrgent:
+		return "critical"
+	case PriorityHigh:
+		return "high"
+	case PriorityLow:
+		return "low"
+	default:
+		return "medium"
+	}
 }
 
 // enqueueReplyReminder queues a deferred nudge reminding the recipient to reply
@@ -1805,4 +1858,3 @@ func AddressToSessionIDs(address string) []string {
 		session.PolecatSessionName(rigPrefix, target), // <prefix>-name
 	}
 }
-

@@ -840,7 +840,10 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find workspaces with broken Dolt configuration
-	broken := doltserver.FindBrokenWorkspaces(townRoot)
+	broken, verifyWarning := doltserver.FindBrokenWorkspaces(townRoot)
+	if verifyWarning != "" {
+		fmt.Printf("  %s %s\n\n", style.Bold.Render("⚠"), verifyWarning)
+	}
 
 	// Check for orphaned databases regardless of broken workspaces
 	orphans, orphanErr := doltserver.FindOrphanedDatabases(townRoot)
@@ -873,6 +876,12 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 
 	repaired := 0
 	for _, ws := range broken {
+		if ws.NotServed {
+			fmt.Printf("  %s %s: database %q exists on disk but is not served by the running Dolt server\n",
+				style.Bold.Render("!"), ws.RigName, ws.ConfiguredDB)
+			fmt.Printf("    Try restarting the server: %s\n", style.Dim.Render("gt dolt restart"))
+			continue
+		}
 		fmt.Printf("  %s %s: metadata.json → database %q (missing from .dolt-data/)\n",
 			style.Bold.Render("!"), ws.RigName, ws.ConfiguredDB)
 		if ws.HasLocalData {

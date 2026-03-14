@@ -638,13 +638,17 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 		return "", err
 	}
 
+	// Resolve the actual .beads directory (follows redirects) before calling
+	// EnsureCustomTypes/Statuses, which expect a .beads path, not a workspace root.
+	resolvedBeads := beads.ResolveBeadsDir(townBeads)
+
 	// Ensure custom types (including 'convoy') are registered in town beads.
-	if err := beads.EnsureCustomTypes(townBeads); err != nil {
+	if err := beads.EnsureCustomTypes(resolvedBeads); err != nil {
 		return "", fmt.Errorf("ensuring custom types: %w", err)
 	}
 
 	// Ensure custom statuses (staged_ready, staged_warnings) are registered.
-	if err := beads.EnsureCustomStatuses(townBeads); err != nil {
+	if err := beads.EnsureCustomStatuses(resolvedBeads); err != nil {
 		return "", fmt.Errorf("ensuring custom statuses: %w", err)
 	}
 

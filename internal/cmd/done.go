@@ -523,6 +523,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+			// Push submodule changes before direct push (gt-dzs)
+			pushSubmoduleChanges(g, defaultBranch)
 			directRefspec := branch + ":" + defaultBranch
 			directPushErr := g.Push("origin", directRefspec, false)
 			if directPushErr != nil {
@@ -575,6 +577,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// isn't pushed yet, Refinery finds nothing to merge. The worktree gets
 		// nuked at the end of gt done, so the commits are lost forever.
 		//
+		// Auto-push submodule changes BEFORE parent push (gt-dzs).
+		// If the parent repo's submodule pointer references commits that don't
+		// exist on the submodule's remote, the Refinery MR will be broken.
+		// Detect modified submodules and push each one first.
+		pushSubmoduleChanges(g, defaultBranch)
+
 		// Use explicit refspec (branch:branch) to create the remote branch.
 		// Without refspec, git push follows the tracking config — polecat branches
 		// track origin/main, so a bare push sends commits to main directly,
@@ -1044,6 +1052,35 @@ notifyWitness:
 		fmt.Printf("  Witness will handle cleanup.\n")
 	}
 	return nil
+}
+
+// pushSubmoduleChanges detects submodules modified between origin/defaultBranch
+// and HEAD, and pushes each submodule's new commit to its remote before the
+// parent repo push. This prevents the parent's submodule pointer from
+// referencing commits that don't exist on the submodule's remote (gt-dzs).
+func pushSubmoduleChanges(g *git.Git, defaultBranch string) {
+	subChanges, err := g.SubmoduleChanges("origin/"+defaultBranch, "HEAD")
+	if err != nil {
+		// Non-fatal: repos without submodules return nil, nil.
+		// Only warn if the error is real (not just "no submodules").
+		style.PrintWarning("could not detect submodule changes: %v", err)
+		return
+	}
+	for _, sc := range subChanges {
+		if sc.NewSHA == "" {
+			continue // Submodule removed, nothing to push
+		}
+		shortSHA := sc.NewSHA
+		if len(shortSHA) > 8 {
+			shortSHA = shortSHA[:8]
+		}
+		fmt.Printf("Pushing submodule %s (%s)...\n", sc.Path, shortSHA)
+		if subPushErr := g.PushSubmoduleCommit(sc.Path, sc.NewSHA, "origin"); subPushErr != nil {
+			style.PrintWarning("submodule push failed for %s: %v (parent push may fail)", sc.Path, subPushErr)
+		} else {
+			fmt.Printf("%s Submodule %s pushed\n", style.Bold.Render("✓"), sc.Path)
+		}
+	}
 }
 
 // setDoneIntentLabel writes a done-intent:<type>:<unix-ts> label on the agent bead

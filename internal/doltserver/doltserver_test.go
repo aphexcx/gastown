@@ -2229,7 +2229,7 @@ func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 0 {
 		t.Errorf("expected 0 broken workspaces, got %d: %+v", len(broken), broken)
 	}
@@ -2260,7 +2260,7 @@ func TestFindBrokenWorkspaces_MissingDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
 	}
@@ -2306,7 +2306,7 @@ func TestFindBrokenWorkspaces_WithLocalData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
 	}
@@ -2338,7 +2338,7 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 0 {
 		t.Errorf("expected 0 broken workspaces for sqlite backend, got %d", len(broken))
 	}
@@ -2379,7 +2379,7 @@ func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace (rig-a only), got %d", len(broken))
 	}
