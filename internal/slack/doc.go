@@ -5,6 +5,5 @@
 // replies are written to a file-based outbox and posted to Slack with
 // per-agent display names via chat:write.customize.
 //
-// See docs/superpowers/specs/2026-04-10-gt-slack-router-design.md for the
-// full design.
+// Design doc: gt-slack-router (see Gas Town mayor docs/superpowers/specs).
 package slack
