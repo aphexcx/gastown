@@ -8,11 +8,3 @@
 // See docs/superpowers/specs/2026-04-10-gt-slack-router-design.md for the
 // full design.
 package slack
-
-import (
-	// Keep the slack-go/slack dependency pinned in go.mod until downstream
-	// tasks (see Task 9: Slack client wrapper) introduce a real import.
-	// This blank import ensures `go mod tidy` does not drop the dependency
-	// after Task 0's scaffolding lands.
-	_ "github.com/slack-go/slack"
-)
