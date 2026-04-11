@@ -22,9 +22,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "slack.json")
 
 	in := &Config{
-		BotToken:    "xoxb-test-bot",
-		AppToken:    "xapp-test-app",
-		OwnerUserID: "U0123ABC",
+		BotToken:      "xoxb-test-bot",
+		AppToken:      "xapp-test-app",
+		OwnerUserID:   "U0123ABC",
+		DefaultTarget: "mayor/",
 		Channels: map[string]ChannelConfig{
 			"C456": {Enabled: true, RequireMention: true},
 		},
@@ -41,6 +42,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	require.Equal(t, in.BotToken, out.BotToken)
 	require.Equal(t, in.AppToken, out.AppToken)
 	require.Equal(t, in.OwnerUserID, out.OwnerUserID)
+	require.Equal(t, in.DefaultTarget, out.DefaultTarget)
 	require.Equal(t, in.Channels, out.Channels)
 }
 

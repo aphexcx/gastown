@@ -56,3 +56,15 @@ func TestRequireMention_AlwaysTrueForChannels(t *testing.T) {
 	require.True(t, RequireMention(cfg, ConversationChannel, "C1"))
 	require.False(t, RequireMention(cfg, ConversationDM, "D1"))
 }
+
+func TestCheckSender_NilConfig(t *testing.T) {
+	require.False(t, CheckSender(nil, "U123"))
+}
+
+func TestCheckConversation_NilConfig(t *testing.T) {
+	// DM short-circuits before the cfg == nil check — this is intentional
+	// because the owner gate (CheckSender) already ran upstream.
+	require.True(t, CheckConversation(nil, ConversationDM, "D1"))
+	// Channels fall through to the cfg == nil guard and are refused.
+	require.False(t, CheckConversation(nil, ConversationChannel, "C1"))
+}
