@@ -31,20 +31,27 @@ func (r RoutingTable) Names() []string {
 	return out
 }
 
-// slackBotMentionPattern matches Slack's machine-readable bot mention format:
-// <@UABCDEF>. The daemon strips these before text-based @name parsing.
-var slackBotMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>`)
+// slackBotMentionPattern matches Slack's machine-readable user mention format,
+// including both the bare form <@UABCDEF> and the labeled form <@UABCDEF|name>
+// that Slack emits when the user has a display name set. The daemon strips
+// these before text-based @name parsing so they don't pollute the routing pass.
+var slackBotMentionPattern = regexp.MustCompile(`<@[A-Z0-9-]+(?:\|[^>]*)?>`)
 
 // textMentionPattern matches plain-text @name mentions. Names can contain
 // letters, digits, hyphens, and underscores — matching Slack's display name
-// rules for bot users.
-var textMentionPattern = regexp.MustCompile(`@([a-zA-Z0-9][a-zA-Z0-9_-]*)`)
+// rules for bot users. The leading `(?:^|[^A-Za-z0-9_])` requires a word
+// boundary before `@` so email addresses like `user@example.com` don't
+// produce false-positive mentions.
+var textMentionPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])@([a-zA-Z0-9][a-zA-Z0-9_-]*)`)
 
 // ParseMentions returns the text-based @names found in message text, in order.
-// It strips any <@botID> references for the given bot user ID (and any other
-// machine-format Slack mentions) before matching, so the bot's own mention
-// never counts as a routing hint.
-func ParseMentions(text, botUserID string) []string {
+// It strips all machine-format Slack mentions (`<@UID>` and `<@UID|label>`)
+// before matching so the bot's own mention never counts as a routing hint.
+//
+// The bot user ID parameter is currently unused: we strip every machine-format
+// mention, not just the bot's own. Kept in the signature so a future refactor
+// can tighten this to the specific bot ID without a breaking API change.
+func ParseMentions(text, _ string) []string {
 	cleaned := slackBotMentionPattern.ReplaceAllString(text, "")
 	matches := textMentionPattern.FindAllStringSubmatch(cleaned, -1)
 	out := make([]string, 0, len(matches))

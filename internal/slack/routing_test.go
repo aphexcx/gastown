@@ -31,6 +31,29 @@ func TestParseMentions_UnderscoresAndDashes(t *testing.T) {
 	require.Equal(t, []string{"houmanoids-refinery"}, got)
 }
 
+func TestParseMentions_IgnoresEmailAddresses(t *testing.T) {
+	// Plain email address should not produce a mention.
+	require.Empty(t, ParseMentions("contact user@example.com today", "BOTID"))
+
+	// Email address mixed with a real mention: only the real mention counts.
+	got := ParseMentions("email me at foo@bar.com and @cody too", "BOTID")
+	require.Equal(t, []string{"cody"}, got)
+}
+
+func TestParseMentions_StripsBotIDLabeledForm(t *testing.T) {
+	// Slack emits <@UID|label> when the bot user has a display name set.
+	// The daemon must strip both the bare and labeled forms.
+	got := ParseMentions("<@U0BOTBOT|cogbot> @cody review the PR", "U0BOTBOT")
+	require.Equal(t, []string{"cody"}, got)
+}
+
+func TestParseMentions_DoubleAtPrefix(t *testing.T) {
+	// "@@cody" should still extract "cody" — the second @ is a word boundary
+	// because it's a non-alphanumeric before the mention.
+	got := ParseMentions("@@cody look at this", "BOTID")
+	require.Equal(t, []string{"cody"}, got)
+}
+
 func TestRoutingTable_Resolve(t *testing.T) {
 	rt := RoutingTable{
 		"cody":  "houmanoids_www/crew/cody",
