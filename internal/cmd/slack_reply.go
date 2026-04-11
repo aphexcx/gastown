@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -43,14 +44,17 @@ func init() {
 }
 
 func runSlackReply(cmd *cobra.Command, args []string) error {
-	chatID := args[0]
+	// Trim whitespace from chat-id (Slack channel IDs never contain spaces).
+	// Trim-check text so whitespace-only messages are rejected — almost
+	// certainly a bug if an agent sends one.
+	chatID := strings.TrimSpace(args[0])
 	text := args[1]
 
 	if chatID == "" {
 		return fmt.Errorf("chat-id is required")
 	}
-	if text == "" {
-		return fmt.Errorf("text is required")
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("text is required (whitespace-only not allowed)")
 	}
 
 	// Validate each file exists and is readable — fail fast before writing
