@@ -14,6 +14,7 @@ require (
 	github.com/gofrs/flock v0.13.0
 	github.com/google/uuid v1.6.0
 	github.com/muesli/termenv v0.16.0
+	github.com/slack-go/slack v0.21.1
 	github.com/spf13/cobra v1.10.2
 	github.com/steveyegge/beads v0.63.3
 	github.com/stretchr/testify v1.11.1
@@ -72,6 +73,7 @@ require (
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
