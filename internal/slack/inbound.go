@@ -17,6 +17,10 @@ type IncomingMessage struct {
 	ChannelName  string           // pretty name for nudge body, e.g. "crew-chat"
 	Text         string
 	ThreadTS     string
+
+	// Attachments are file metadata pulled off the Slack event. Empty if
+	// the message has no files.
+	Attachments []AttachmentMeta
 }
 
 // InboundHandler runs the filter → resolve → enqueue pipeline. It has no
@@ -50,6 +54,12 @@ type InboundHandler struct {
 	// that the spec explicitly rules out. The daemon wires this to
 	// (*tmux.Tmux).HasSession.
 	CheckSession func(sessionName string) (bool, error)
+
+	// DownloadAttachment is called once per file the handler decides to
+	// fetch eagerly. The daemon wires this to DownloadInboundAttachment
+	// with a real Client; tests pass a fake. A nil hook means the handler
+	// only reports attachments as metadata and never downloads.
+	DownloadAttachment func(ctx context.Context, m AttachmentMeta) (string, error)
 }
 
 // Handle runs one inbound message through the pipeline. It never returns
@@ -132,6 +142,35 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		return
 	}
 
+	// 7a. Attachment handling: download small files, record metadata for
+	// larger ones. Downloads are best-effort — a failure never drops the
+	// whole message, we just fall back to metadata-only for that file.
+	var downloaded []string
+	var metaLines []string
+	for _, m := range msg.Attachments {
+		switch DecideAttachment(m) {
+		case AttachmentActionDownload:
+			if h.DownloadAttachment == nil {
+				metaLines = append(metaLines, fmt.Sprintf(
+					"  [%s] %s (%.1f KB, %s) — no downloader configured",
+					m.ID, m.Name, float64(m.Size)/1024.0, m.MimeType))
+				continue
+			}
+			path, err := h.DownloadAttachment(ctx, m)
+			if err != nil {
+				metaLines = append(metaLines, fmt.Sprintf(
+					"  [%s] %s — download failed: %v", m.ID, m.Name, err))
+				continue
+			}
+			downloaded = append(downloaded, path)
+		default:
+			metaLines = append(metaLines, fmt.Sprintf(
+				"  [%s] %s (%.1f MB, %s) — larger than %d MB limit, not downloaded",
+				m.ID, m.Name, float64(m.Size)/(1024.0*1024.0), m.MimeType,
+				EagerDownloadLimit/(1024*1024)))
+		}
+	}
+
 	// 7. Build reply command string.
 	reply := fmt.Sprintf("gt slack reply %s \"...\"", msg.ChatID)
 	if msg.ThreadTS != "" {
@@ -158,6 +197,15 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		"[slack from %s in %s]\n\n%s\n\nTo reply: %s",
 		senderLabel, where, msg.Text, reply,
 	)
+	if len(downloaded) > 0 {
+		body += "\n\nDownloaded files:\n"
+		for _, p := range downloaded {
+			body += "  " + p + "\n"
+		}
+	}
+	if len(metaLines) > 0 {
+		body += "\n\nAttachment metadata:\n" + strings.Join(metaLines, "\n")
+	}
 
 	// 9. Enqueue.
 	if err := h.EnqueueNudge(sessionName, body); err != nil {

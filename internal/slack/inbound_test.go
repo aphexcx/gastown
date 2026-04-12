@@ -253,6 +253,40 @@ func TestInbound_DeadSessionSurfaces(t *testing.T) {
 	require.Contains(t, deps.sentToSlack[0].text, "no active session")
 }
 
+func TestInbound_EagerDownloadsSmallFiles(t *testing.T) {
+	cfg := &Config{
+		OwnerUserID: "UOWNER",
+		Channels:    map[string]ChannelConfig{"C1": {Enabled: true}},
+	}
+	rt := RoutingTable{"cody": "houmanoids/crew/cody"}
+	deps := &fakeDeps{}
+	h := testHandler(t, cfg, rt, deps)
+
+	var downloaded []AttachmentMeta
+	h.DownloadAttachment = func(ctx context.Context, m AttachmentMeta) (string, error) {
+		downloaded = append(downloaded, m)
+		return "/tmp/fake-" + m.ID, nil
+	}
+
+	h.Handle(context.Background(), IncomingMessage{
+		SenderUserID: "UOWNER",
+		Kind:         ConversationChannel,
+		ChatID:       "C1",
+		Text:         "@cody look at this",
+		Attachments: []AttachmentMeta{
+			{ID: "F1", Name: "a.png", MimeType: "image/png", Size: 1024, URLPrivate: "https://slack/file/F1"},
+			{ID: "F2", Name: "huge.zip", MimeType: "application/zip", Size: 20 * 1024 * 1024, URLPrivate: "https://slack/file/F2"},
+		},
+	})
+	require.Len(t, deps.enqueued, 1)
+	body := deps.enqueued[0].body
+	require.Contains(t, body, "/tmp/fake-F1")      // eager downloaded
+	require.Contains(t, body, "huge.zip")          // metadata only
+	require.Contains(t, body, "larger than 5 MB")  // size hint
+	require.Len(t, downloaded, 1)
+	require.Equal(t, "F1", downloaded[0].ID)
+}
+
 func TestInbound_ConfigReRead(t *testing.T) {
 	// GetConfig is a func, so a config change mid-flight takes effect on the
 	// next Handle without restarting the handler. This satisfies the spec's
