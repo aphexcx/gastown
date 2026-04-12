@@ -18,7 +18,8 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 }
 
 func TestSaveLoadRoundTrip(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "config")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
 	path := filepath.Join(dir, "slack.json")
 
 	in := &Config{
@@ -82,4 +83,18 @@ func TestValidate(t *testing.T) {
 			require.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+func TestLoadConfig_WideDirectoryPermissions(t *testing.T) {
+	dir := t.TempDir()
+	// Create a subdirectory with wide permissions.
+	configDir := filepath.Join(dir, "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	path := filepath.Join(configDir, "slack.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"bot_token":"xoxb-x","app_token":"xapp-x","owner_user_id":"U123"}`), 0o600))
+
+	_, err := LoadConfig(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "config directory")
+	require.Contains(t, err.Error(), "permissions")
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -148,8 +149,10 @@ func (p *Publisher) processOne(ctx context.Context, path string) {
 	msg, err := ReadOutboxMessage(claim)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "slack: read claim %s: %v\n", claim, err)
-		// Malformed — dead-letter so it doesn't jam the queue.
-		_ = DeadLetterOutboxMessage(claim, fmt.Sprintf("malformed: %v", err))
+		// Malformed JSON — can't use DeadLetterOutboxMessage (it re-reads
+		// the file and would fail the same way). Move the raw file directly
+		// to failed/ so it doesn't jam the queue in an infinite loop.
+		quarantineRawClaim(p.OutboxDir, claim)
 		p.refreshFailedCount()
 		return
 	}
@@ -174,21 +177,13 @@ func (p *Publisher) processOne(ctx context.Context, path string) {
 		return
 	}
 
-	// Upload any attached files into the same thread.
+	// Upload any attached files in the same thread. Text + files is treated
+	// as one atomic delivery unit: if ANY upload fails transiently, unclaim
+	// the whole message for retry. If permanent, dead-letter the whole thing.
 	for _, file := range msg.Files {
 		if err := p.Poster.UploadFile(ctx, msg.ChatID, msg.ThreadTS, file); err != nil {
-			// A permanent file error after a successful text post still
-			// counts as partial success — nudge the agent but don't
-			// dead-letter (text already went through).
-			if p.NudgeAgent != nil {
-				p.NudgeAgent(msg.From,
-					fmt.Sprintf("slack file upload failed: %s: %v", filepath.Base(file), err))
-			}
-			if !IsTransient(err) {
-				continue
-			}
-			// Transient: log and continue to next file.
-			fmt.Fprintf(os.Stderr, "slack: transient upload error for %s: %v\n", file, err)
+			p.handlePostError(claim, msg, err)
+			return
 		}
 	}
 
@@ -205,7 +200,7 @@ func (p *Publisher) handlePostError(claim string, msg *OutboxMessage, err error)
 		if unerr := UnclaimOutboxMessage(claim); unerr != nil {
 			fmt.Fprintf(os.Stderr, "slack: unclaim after transient error: %v\n", unerr)
 		}
-		fmt.Fprintf(os.Stderr, "slack: transient post error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "slack: transient error, will retry: %v\n", err)
 		return
 	}
 	// Permanent (or unclassified): dead-letter + nudge the sender.
@@ -232,4 +227,24 @@ func (p *Publisher) refreshFailedCount() {
 		}
 	}
 	p.failed.Store(n)
+}
+
+// quarantineRawClaim moves a claimed file that can't be parsed as JSON
+// directly into the failed/ directory. Unlike DeadLetterOutboxMessage, this
+// does NOT attempt to re-read or re-marshal the file — it just renames it.
+func quarantineRawClaim(outboxDir, claim string) {
+	failedDir := filepath.Join(outboxDir, "failed")
+	if err := os.MkdirAll(failedDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "slack: mkdir failed/ for quarantine: %v\n", err)
+		return
+	}
+	base := filepath.Base(claim)
+	// Strip .claimed.* suffix to get a clean filename in failed/.
+	if idx := strings.Index(base, ".claimed."); idx > 0 {
+		base = base[:idx]
+	}
+	dest := filepath.Join(failedDir, base)
+	if err := os.Rename(claim, dest); err != nil {
+		fmt.Fprintf(os.Stderr, "slack: quarantine %s: %v\n", claim, err)
+	}
 }

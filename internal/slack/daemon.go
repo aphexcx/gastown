@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -363,13 +364,15 @@ func buildRoutingTable(tm *tmux.Tmux) (RoutingTable, error) {
 		if addr == "" || addr == "overseer" {
 			continue
 		}
-		// First writer wins when two sessions share a display name
-		// (e.g. two rigs with a crew member named "cody") — we keep
-		// whichever tmux listed first. The operator can disambiguate
-		// later by renaming one of them, or by typing the full address.
-		if _, exists := rt[displayName]; !exists {
-			rt[displayName] = addr
+		key := strings.ToLower(displayName)
+		if existing, exists := rt[key]; exists {
+			fmt.Fprintf(os.Stderr, "slack: WARNING: duplicate display name %q — "+
+				"@%s routes to %s (first seen), ignoring %s. "+
+				"Rename one agent or use different crew names to resolve.\n",
+				displayName, displayName, existing, addr)
+			continue
 		}
+		rt[key] = addr
 	}
 	return rt, nil
 }

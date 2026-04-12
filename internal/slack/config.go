@@ -38,6 +38,15 @@ func LoadConfig(path string) (*Config, error) {
 			path, mode, path)
 	}
 
+	// Also check parent directory — spec requires mode ≤0700.
+	dirInfo, err := os.Stat(filepath.Dir(path))
+	if err == nil {
+		if dirMode := dirInfo.Mode().Perm(); dirMode&^0o700 != 0 {
+			return nil, fmt.Errorf("config directory %s has permissions %o, want 0700 or stricter — run chmod 0700 %s",
+				filepath.Dir(path), dirMode, filepath.Dir(path))
+		}
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
