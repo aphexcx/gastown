@@ -41,9 +41,11 @@ type InboundHandler struct {
 	// the warning text.
 	Ephemeral func(chatID, userID, text string)
 
-	// EnqueueNudge hands the message off to internal/nudge. The daemon
-	// wires this to nudge.Enqueue with the resolved session name.
-	EnqueueNudge func(sessionName, body string) error
+	// EnqueueNudge delivers the inbound Slack message to the target agent.
+	// The daemon wires this to `gt nudge <address> --mode=wait-idle --stdin`
+	// so the message is pushed into the agent's tmux session promptly when
+	// the agent is idle, falling back to the file queue if the agent is busy.
+	EnqueueNudge func(address string, body string) error
 
 	// ResolveSession converts a gt address to a tmux session name. The
 	// daemon wires this to ResolveAddressToSession (routing.go).
@@ -171,13 +173,9 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		}
 	}
 
-	// 7. Build reply command string.
-	reply := fmt.Sprintf("gt slack reply %s \"...\"", msg.ChatID)
-	if msg.ThreadTS != "" {
-		reply += fmt.Sprintf(" --thread %s", msg.ThreadTS)
-	}
-
-	// 8. Build nudge body.
+	// 8. Build nudge body. The body is directive — it tells the agent this
+	// is a live conversation and they should reply back to Slack. Treat the
+	// inbound message like a user DM in their terminal.
 	senderLabel := msg.SenderName
 	if senderLabel == "" {
 		senderLabel = msg.SenderUserID
@@ -193,9 +191,23 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 			where = msg.ChatID
 		}
 	}
+
+	replyArgs := fmt.Sprintf("%s \"your response here\"", msg.ChatID)
+	if msg.ThreadTS != "" {
+		replyArgs += fmt.Sprintf(" --thread %s", msg.ThreadTS)
+	}
+
 	body := fmt.Sprintf(
-		"[slack from %s in %s]\n\n%s\n\nTo reply: %s",
-		senderLabel, where, msg.Text, reply,
+		"📨 Slack message from %s (%s):\n\n%s\n\n"+
+			"---\n"+
+			"This is a live Slack conversation. Treat this exactly like the "+
+			"user DMing you in your terminal — respond now. If it's a question, "+
+			"answer it. If it's a task, do it and report back. Either way, "+
+			"send your reply back to Slack when you're done by running:\n\n"+
+			"    gt slack reply %s\n\n"+
+			"Replace \"your response here\" with your actual reply. "+
+			"The --thread flag (if shown) keeps the reply in the right Slack thread.",
+		senderLabel, where, msg.Text, replyArgs,
 	)
 	if len(downloaded) > 0 {
 		body += "\n\nDownloaded files:\n"
@@ -207,8 +219,8 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		body += "\n\nAttachment metadata:\n" + strings.Join(metaLines, "\n")
 	}
 
-	// 9. Enqueue.
-	if err := h.EnqueueNudge(sessionName, body); err != nil {
+	// 9. Deliver.
+	if err := h.EnqueueNudge(address, body); err != nil {
 		h.Ephemeral(msg.ChatID, msg.SenderUserID,
 			fmt.Sprintf("⚠️ Couldn't deliver to %q: %v", address, err))
 		return

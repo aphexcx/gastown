@@ -25,18 +25,18 @@ type fakeEphemeral struct {
 }
 
 type fakeEnqueue struct {
-	session string
+	address string
 	body    string
 }
 
 func (f *fakeDeps) ephemeral(chatID, userID, text string) {
 	f.sentToSlack = append(f.sentToSlack, fakeEphemeral{chatID: chatID, userID: userID, text: text})
 }
-func (f *fakeDeps) enqueue(session, body string) error {
+func (f *fakeDeps) enqueue(address, body string) error {
 	if f.enqueueErr != nil {
 		return f.enqueueErr
 	}
-	f.enqueued = append(f.enqueued, fakeEnqueue{session: session, body: body})
+	f.enqueued = append(f.enqueued, fakeEnqueue{address: address, body: body})
 	return nil
 }
 func (f *fakeDeps) resolveSession(address string) (string, error) {
@@ -156,7 +156,7 @@ func TestInbound_DMWithoutMentionUsesDefault(t *testing.T) {
 		Text:         "hello agent",
 	})
 	require.Len(t, deps.enqueued, 1)
-	require.Equal(t, "session-mayor/", deps.enqueued[0].session)
+	require.Equal(t, "mayor/", deps.enqueued[0].address)
 }
 
 func TestInbound_ChannelWithoutMentionAsksForOne(t *testing.T) {

@@ -1,10 +1,12 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,7 +17,6 @@ import (
 	"github.com/slack-go/slack/socketmode"
 
 	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -107,17 +108,15 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 	outboxDir := filepath.Join(opts.TownRoot, constants.DirRuntime, "slack_outbox")
 	publisher := NewPublisher(outboxDir, client, rt)
 	publisher.NudgeAgent = func(address, reason string) {
-		// Best-effort nudge to the original sender so they see the error.
-		sessionName, rerr := ResolveAddressToSession(address)
-		if rerr != nil {
+		// Best-effort: route outbound failure back to the sending agent.
+		exe, err := os.Executable()
+		if err != nil {
 			return
 		}
-		_ = nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
-			Sender:   "slack:daemon",
-			Message:  fmt.Sprintf("[slack] %s", reason),
-			Kind:     "slack",
-			Priority: nudge.PriorityNormal,
-		})
+		cmd := exec.Command(exe, "nudge", address,
+			"--stdin", "--mode", "wait-idle", "--priority", "normal")
+		cmd.Stdin = strings.NewReader(fmt.Sprintf("[slack delivery failure] %s", reason))
+		_ = cmd.Run()
 	}
 
 	handler := &InboundHandler{
@@ -128,13 +127,25 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			// chat.postEphemeral (needs channel + user).
 			_ = client.PostEphemeral(context.Background(), chatID, userID, text)
 		},
-		EnqueueNudge: func(sessionName, body string) error {
-			return nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
-				Sender:   "slack",
-				Message:  body,
-				Kind:     "slack",
-				Priority: nudge.PriorityNormal,
-			})
+		EnqueueNudge: func(address, body string) error {
+			// Use `gt nudge --mode=wait-idle` so the message is delivered
+			// promptly via tmux when the agent is idle, falling back to the
+			// file queue if the agent is busy. This gives Slack inbound the
+			// same UX as DMing the agent directly in their tmux session.
+			exe, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("find gt binary: %w", err)
+			}
+			cmd := exec.Command(exe, "nudge", address,
+				"--stdin", "--mode", "wait-idle", "--priority", "normal")
+			cmd.Stdin = strings.NewReader(body)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("gt nudge %s: %w: %s",
+					address, err, strings.TrimSpace(stderr.String()))
+			}
+			return nil
 		},
 		ResolveSession: ResolveAddressToSession,
 		CheckSession:   tm.HasSession,
@@ -249,17 +260,28 @@ func (d *Daemon) dispatchSocketModeEvents(ctx context.Context, sm *socketmode.Cl
 			if !ok {
 				return
 			}
+			fmt.Fprintf(os.Stderr, "slack: event type=%s\n", ev.Type)
 			switch ev.Type {
 			case socketmode.EventTypeEventsAPI:
 				payload, ok := ev.Data.(slackevents.EventsAPIEvent)
 				if !ok {
+					fmt.Fprintf(os.Stderr, "slack: EventsAPI data assertion failed: %T\n", ev.Data)
 					continue
 				}
 				sm.Ack(*ev.Request)
+				fmt.Fprintf(os.Stderr, "slack: EventsAPI callback=%s inner=%s\n",
+					payload.Type, payload.InnerEvent.Type)
 				d.onEventsAPI(ctx, payload)
-			case socketmode.EventTypeConnected, socketmode.EventTypeConnecting,
-				socketmode.EventTypeConnectionError, socketmode.EventTypeDisconnect:
-				// Lifecycle events — log via client, don't dispatch.
+			case socketmode.EventTypeConnected:
+				fmt.Fprintf(os.Stderr, "slack: Socket Mode connected\n")
+			case socketmode.EventTypeConnecting:
+				fmt.Fprintf(os.Stderr, "slack: Socket Mode connecting...\n")
+			case socketmode.EventTypeConnectionError:
+				fmt.Fprintf(os.Stderr, "slack: Socket Mode connection error\n")
+			case socketmode.EventTypeDisconnect:
+				fmt.Fprintf(os.Stderr, "slack: Socket Mode disconnected\n")
+			default:
+				fmt.Fprintf(os.Stderr, "slack: unhandled event type: %s\n", ev.Type)
 			}
 		}
 	}
