@@ -80,6 +80,15 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		return
 	}
 
+	// 1b. Loop guard: drop messages that were posted via a Slack integration
+	// using a user token (e.g., Claude Code's Slack MCP plugin). When an
+	// agent replies through such an integration instead of `gt slack reply`,
+	// Slack appends "*Sent using* <@USER_ID>" to the message. These echoes
+	// would otherwise loop: agent replies → Slack → our daemon → agent → ...
+	if strings.Contains(msg.Text, "*Sent using* <@") {
+		return
+	}
+
 	// 2. Owner gate: silent drop (spec exception to no-silent-failures).
 	if !CheckSender(cfg, msg.SenderUserID) {
 		return
@@ -202,11 +211,16 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 			"---\n"+
 			"This is a live Slack conversation. Treat this exactly like the "+
 			"user DMing you in your terminal — respond now. If it's a question, "+
-			"answer it. If it's a task, do it and report back. Either way, "+
-			"send your reply back to Slack when you're done by running:\n\n"+
+			"answer it. If it's a task, do it and report back.\n\n"+
+			"⚠️ REPLY ONLY by running this exact command:\n\n"+
 			"    gt slack reply %s\n\n"+
 			"Replace \"your response here\" with your actual reply. "+
-			"The --thread flag (if shown) keeps the reply in the right Slack thread.",
+			"The --thread flag (if shown) keeps the reply in the right Slack thread.\n\n"+
+			"🚫 DO NOT use plugin:slack:slack, any Slack MCP integration, or any "+
+			"other Slack tool. Those post using the USER's token (not the Gas Town "+
+			"Router bot token) which causes message echo loops — your reply will "+
+			"come right back to you as a new Slack DM and you'll loop forever. "+
+			"The ONLY safe way to reply is `gt slack reply`.",
 		senderLabel, where, msg.Text, replyArgs,
 	)
 	if len(downloaded) > 0 {

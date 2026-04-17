@@ -1,12 +1,10 @@
 package slack
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +15,7 @@ import (
 	"github.com/slack-go/slack/socketmode"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -109,14 +108,16 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 	publisher := NewPublisher(outboxDir, client, rt)
 	publisher.NudgeAgent = func(address, reason string) {
 		// Best-effort: route outbound failure back to the sending agent.
-		exe, err := os.Executable()
-		if err != nil {
+		sessionName, rerr := ResolveAddressToSession(address)
+		if rerr != nil {
 			return
 		}
-		cmd := exec.Command(exe, "nudge", address,
-			"--stdin", "--mode", "wait-idle", "--priority", "normal")
-		cmd.Stdin = strings.NewReader(fmt.Sprintf("[slack delivery failure] %s", reason))
-		_ = cmd.Run()
+		_ = nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
+			Sender:   "slack:daemon",
+			Message:  fmt.Sprintf("[slack delivery failure] %s", reason),
+			Kind:     "slack",
+			Priority: nudge.PriorityNormal,
+		})
 	}
 
 	handler := &InboundHandler{
@@ -128,24 +129,20 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			_ = client.PostEphemeral(context.Background(), chatID, userID, text)
 		},
 		EnqueueNudge: func(address, body string) error {
-			// Use `gt nudge --mode=wait-idle` so the message is delivered
-			// promptly via tmux when the agent is idle, falling back to the
-			// file queue if the agent is busy. This gives Slack inbound the
-			// same UX as DMing the agent directly in their tmux session.
-			exe, err := os.Executable()
+			// Resolve address → session name, then file-enqueue. The nudge
+			// drains via either the agent's Claude Code UserPromptSubmit
+			// hook (when the user types) or a background nudge-poller for
+			// that session.
+			sessionName, err := ResolveAddressToSession(address)
 			if err != nil {
-				return fmt.Errorf("find gt binary: %w", err)
+				return fmt.Errorf("resolve address %s: %w", address, err)
 			}
-			cmd := exec.Command(exe, "nudge", address,
-				"--stdin", "--mode", "wait-idle", "--priority", "normal")
-			cmd.Stdin = strings.NewReader(body)
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("gt nudge %s: %w: %s",
-					address, err, strings.TrimSpace(stderr.String()))
-			}
-			return nil
+			return nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
+				Sender:   "slack",
+				Message:  body,
+				Kind:     "slack",
+				Priority: nudge.PriorityUrgent,
+			})
 		},
 		ResolveSession: ResolveAddressToSession,
 		CheckSession:   tm.HasSession,
