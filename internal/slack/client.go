@@ -47,12 +47,21 @@ func (c *Client) SetAssistantStatus(ctx context.Context, chatID, threadTS, statu
 	if chatID == "" || threadTS == "" {
 		return nil // no thread context — nothing to set status on
 	}
-	err := c.api.SetAssistantThreadsStatusContext(ctx, slackgo.AssistantThreadsSetStatusParameters{
+	// Slack has two indicator surfaces:
+	//   - Status: shown below the input box (single string).
+	//   - LoadingMessages: shown inline in the chatlog (cycles). If empty,
+	//     Slack falls back to a generic "Analyzing..." placeholder.
+	// We populate both with the same phrase so the inline indicator
+	// reflects the current activity instead of the generic default.
+	params := slackgo.AssistantThreadsSetStatusParameters{
 		ChannelID: chatID,
 		ThreadTS:  threadTS,
-		Status:    status, // empty string clears the indicator
-	})
-	if err != nil {
+		Status:    status, // empty string clears the footer indicator
+	}
+	if status != "" {
+		params.LoadingMessages = []string{status}
+	}
+	if err := c.api.SetAssistantThreadsStatusContext(ctx, params); err != nil {
 		return classifySlackError(err)
 	}
 	return nil
