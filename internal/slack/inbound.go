@@ -3,6 +3,7 @@ package slack
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -17,10 +18,17 @@ type IncomingMessage struct {
 	ChannelName  string           // pretty name for nudge body, e.g. "crew-chat"
 	Text         string
 	ThreadTS     string
+	MessageTS    string // the message's own timestamp; used as the thread key when ThreadTS is empty
 
 	// Attachments are file metadata pulled off the Slack event. Empty if
 	// the message has no files.
 	Attachments []AttachmentMeta
+
+	// BotMentioned is true when the message @mentions the router bot itself
+	// (e.g., "@Gas Town how many crew running"). Used to route channel
+	// messages with no specific agent mention to the default target — the
+	// bot-mention is an explicit signal that the user wants routing.
+	BotMentioned bool
 }
 
 // InboundHandler runs the filter → resolve → enqueue pipeline. It has no
@@ -56,6 +64,20 @@ type InboundHandler struct {
 	// that the spec explicitly rules out. The daemon wires this to
 	// (*tmux.Tmux).HasSession.
 	CheckSession func(sessionName string) (bool, error)
+
+	// SetThreadStatus posts a lightweight "thinking" indicator in the
+	// Slack thread while the agent is working. Pass an empty status to
+	// clear it. Best-effort — failures are silent (log only). The daemon
+	// wires this to client.SetAssistantStatus.
+	SetThreadStatus func(chatID, threadTS, status string)
+
+	// CanAccessConversation returns true if the bot is a formal member of
+	// the given chat (can call conversations.info on it). Used as a
+	// membership gate to prevent routing of events the bot receives from
+	// DMs it shouldn't have visibility into — a privacy issue discovered
+	// when Slack's Agent/Assistant mode delivered events from unrelated
+	// user↔user DMs. If nil, membership is not checked (backward compat).
+	CanAccessConversation func(chatID string) bool
 
 	// DownloadAttachment is called once per file the handler decides to
 	// fetch eagerly. The daemon wires this to DownloadInboundAttachment
@@ -94,6 +116,18 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		return
 	}
 
+	// 2a. Membership gate: silent drop if the bot isn't a formal member of
+	// this conversation. Slack's Agent/Assistant mode can deliver events
+	// for DMs the bot hasn't been invited to (e.g., between two humans),
+	// which would leak the owner's private conversations to agents. Drop
+	// any event the bot can't inspect via conversations.info.
+	if h.CanAccessConversation != nil && !h.CanAccessConversation(msg.ChatID) {
+		fmt.Fprintf(os.Stderr,
+			"slack: DROPPED event for chat %s — bot is not a member of this conversation (privacy gate)\n",
+			msg.ChatID)
+		return
+	}
+
 	// 3. Conversation gate.
 	if !CheckConversation(cfg, msg.Kind, msg.ChatID) {
 		// Channels not opted in → silent drop. The user should run
@@ -123,8 +157,13 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		h.Ephemeral(msg.ChatID, msg.SenderUserID,
 			"⚠️ No default target configured. @mention an agent or run 'gt slack configure' to set one.")
 		return
+	case msg.BotMentioned && cfg.DefaultTarget != "":
+		// Channel message that @mentions the bot itself (e.g., "@Gas Town
+		// how many crew running") with no specific agent — an explicit
+		// signal that the user wants routing. Send to default target.
+		address = cfg.DefaultTarget
 	default:
-		// Channel with no mention.
+		// Channel with no mention (neither agent nor bot).
 		h.Ephemeral(msg.ChatID, msg.SenderUserID,
 			"⚠️ Channel messages require an explicit @agent mention. "+
 				"Known: "+strings.Join(h.Routing.Names(), ", "))
@@ -156,28 +195,37 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 	// 7a. Attachment handling: download small files, record metadata for
 	// larger ones. Downloads are best-effort — a failure never drops the
 	// whole message, we just fall back to metadata-only for that file.
-	var downloaded []string
+	//
+	// IMPORTANT: we list file paths with a leading marker in the nudge body
+	// (not as bare absolute paths) to avoid Claude Code's auto-attach
+	// behavior, which reads the image on every turn and triggers
+	// "Could not process image" 400s from Anthropic when the image is
+	// malformed or just because of context carryover. Agents who actually
+	// want to look at an attachment must explicitly Read the file.
+	var downloadedLines []string
 	var metaLines []string
 	for _, m := range msg.Attachments {
 		switch DecideAttachment(m) {
 		case AttachmentActionDownload:
 			if h.DownloadAttachment == nil {
 				metaLines = append(metaLines, fmt.Sprintf(
-					"  [%s] %s (%.1f KB, %s) — no downloader configured",
-					m.ID, m.Name, float64(m.Size)/1024.0, m.MimeType))
+					"  - %s (%.1f KB, %s) [id=%s] — no downloader configured",
+					m.Name, float64(m.Size)/1024.0, m.MimeType, m.ID))
 				continue
 			}
 			path, err := h.DownloadAttachment(ctx, m)
 			if err != nil {
 				metaLines = append(metaLines, fmt.Sprintf(
-					"  [%s] %s — download failed: %v", m.ID, m.Name, err))
+					"  - %s [id=%s] — download failed: %v", m.Name, m.ID, err))
 				continue
 			}
-			downloaded = append(downloaded, path)
+			downloadedLines = append(downloadedLines, fmt.Sprintf(
+				"  - %s (%.1f KB, %s) [id=%s] saved at: %s",
+				m.Name, float64(m.Size)/1024.0, m.MimeType, m.ID, path))
 		default:
 			metaLines = append(metaLines, fmt.Sprintf(
-				"  [%s] %s (%.1f MB, %s) — larger than %d MB limit, not downloaded",
-				m.ID, m.Name, float64(m.Size)/(1024.0*1024.0), m.MimeType,
+				"  - %s (%.1f MB, %s) [id=%s] — larger than %d MB limit, not downloaded",
+				m.Name, float64(m.Size)/(1024.0*1024.0), m.MimeType, m.ID,
 				EagerDownloadLimit/(1024*1024)))
 		}
 	}
@@ -206,6 +254,15 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		replyArgs += fmt.Sprintf(" --thread %s", msg.ThreadTS)
 	}
 
+	thinkingArgs := fmt.Sprintf("%s \"short verb phrase\"", msg.ChatID)
+	threadTSForStatus := msg.ThreadTS
+	if threadTSForStatus == "" {
+		threadTSForStatus = msg.MessageTS
+	}
+	if threadTSForStatus != "" {
+		thinkingArgs += fmt.Sprintf(" --thread %s", threadTSForStatus)
+	}
+
 	body := fmt.Sprintf(
 		"📨 Slack message from %s (%s):\n\n%s\n\n"+
 			"---\n"+
@@ -216,21 +273,32 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 			"    gt slack reply %s\n\n"+
 			"Replace \"your response here\" with your actual reply. "+
 			"The --thread flag (if shown) keeps the reply in the right Slack thread.\n\n"+
+			"💭 OPTIONAL progress status (like Claude's \"Thinking…\" indicator): "+
+			"sprinkle these during your work so the user sees what you're doing:\n\n"+
+			"    gt slack thinking %s\n\n"+
+			"Use a short verb phrase each time (e.g. \"reading ace's pane\", "+
+			"\"checking beads\", \"drafting reply\"). No need to clear at the end — "+
+			"the daemon clears automatically when your `gt slack reply` posts.\n\n"+
 			"🚫 DO NOT use plugin:slack:slack, any Slack MCP integration, or any "+
 			"other Slack tool. Those post using the USER's token (not the Gas Town "+
 			"Router bot token) which causes message echo loops — your reply will "+
 			"come right back to you as a new Slack DM and you'll loop forever. "+
 			"The ONLY safe way to reply is `gt slack reply`.",
-		senderLabel, where, msg.Text, replyArgs,
+		senderLabel, where, msg.Text, replyArgs, thinkingArgs,
 	)
-	if len(downloaded) > 0 {
-		body += "\n\nDownloaded files:\n"
-		for _, p := range downloaded {
-			body += "  " + p + "\n"
+	if len(downloadedLines) > 0 || len(metaLines) > 0 {
+		body += "\n\n📎 Attachments (DO NOT auto-attach — only read if explicitly relevant):\n"
+		if len(downloadedLines) > 0 {
+			body += strings.Join(downloadedLines, "\n") + "\n"
 		}
-	}
-	if len(metaLines) > 0 {
-		body += "\n\nAttachment metadata:\n" + strings.Join(metaLines, "\n")
+		if len(metaLines) > 0 {
+			body += strings.Join(metaLines, "\n") + "\n"
+		}
+		body += "\nIf you need to examine an attachment, use the Read tool "+
+			"with the path shown above. Do NOT include these paths verbatim "+
+			"in your reply or in any other output — Claude Code may try to "+
+			"auto-attach the image, which can cause Anthropic API 400 errors "+
+			"if the image is malformed."
 	}
 
 	// 9. Deliver.
@@ -238,5 +306,19 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		h.Ephemeral(msg.ChatID, msg.SenderUserID,
 			fmt.Sprintf("⚠️ Couldn't deliver to %q: %v", address, err))
 		return
+	}
+
+	// 10. Set a "working..." thinking indicator in the Slack thread so the
+	// user gets immediate feedback that the message was received. The
+	// indicator is cleared when the agent's reply posts (publisher side).
+	// Best-effort: skip if no handler, log failures but don't block.
+	if h.SetThreadStatus != nil {
+		threadKey := msg.ThreadTS
+		if threadKey == "" {
+			threadKey = msg.MessageTS
+		}
+		if threadKey != "" {
+			h.SetThreadStatus(msg.ChatID, threadKey, "working...")
+		}
 	}
 }

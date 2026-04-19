@@ -36,6 +36,27 @@ type PostMessageArgs struct {
 	Username string // display name via chat:write.customize
 }
 
+// SetAssistantStatus posts a lightweight "thinking" indicator in the thread
+// via assistant.threads.setStatus. Pass empty status to clear the indicator
+// after the agent has replied. Requires the 'assistant:write' scope and
+// Assistant-mode enabled on the Slack app. Best-effort: a missing scope or
+// the API being unavailable should not block message delivery — callers
+// log and continue.
+func (c *Client) SetAssistantStatus(ctx context.Context, chatID, threadTS, status string) error {
+	if chatID == "" || threadTS == "" {
+		return nil // no thread context — nothing to set status on
+	}
+	err := c.api.SetAssistantThreadsStatusContext(ctx, slackgo.AssistantThreadsSetStatusParameters{
+		ChannelID: chatID,
+		ThreadTS:  threadTS,
+		Status:    status, // empty string clears the indicator
+	})
+	if err != nil {
+		return classifySlackError(err)
+	}
+	return nil
+}
+
 // PostEphemeral posts a user-visible warning via chat.postEphemeral. Only
 // the target user sees it. Used for inbound failure notices ("unknown
 // agent", "queue full", etc.) so they don't spam the channel for everyone.
@@ -67,6 +88,19 @@ func (c *Client) PostMessage(ctx context.Context, args PostMessageArgs) (string,
 		return "", classifySlackError(err)
 	}
 	return ts, nil
+}
+
+// CanAccessConversation returns true if the bot can inspect this
+// conversation via conversations.info. Used as a membership gate: if the
+// bot can't query a conversation, it shouldn't route messages from it.
+// This catches the case where Slack's Agent/Assistant mode delivers events
+// for DMs the bot isn't a formal member of (which would leak the user's
+// private conversations).
+func (c *Client) CanAccessConversation(ctx context.Context, chatID string) bool {
+	_, err := c.api.GetConversationInfoContext(ctx, &slackgo.GetConversationInfoInput{
+		ChannelID: chatID,
+	})
+	return err == nil
 }
 
 // UploadFile uploads a single local file to a channel (optionally threaded).

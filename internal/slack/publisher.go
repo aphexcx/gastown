@@ -34,6 +34,12 @@ type Publisher struct {
 	// about it. The daemon wires this to internal/nudge.Enqueue.
 	NudgeAgent func(address, reason string)
 
+	// ClearThreadStatus is called after a successful outbound post so the
+	// Slack "working..." thinking indicator is dismissed. Best-effort:
+	// failures are silent. Wired to client.SetAssistantStatus with empty
+	// status by the daemon. If nil, the hook is skipped.
+	ClearThreadStatus func(chatID, threadTS string)
+
 	// Metrics, atomic for cheap reads from `gt slack status`.
 	lastPost atomic.Int64 // unix nanos
 	failed   atomic.Int64
@@ -192,6 +198,12 @@ func (p *Publisher) processOne(ctx context.Context, path string) {
 		fmt.Fprintf(os.Stderr, "slack: remove claim %s: %v\n", claim, err)
 	}
 	p.lastPost.Store(time.Now().UnixNano())
+
+	// Clear the "working..." thread indicator set on inbound receipt.
+	// We use ThreadTS if set; otherwise there's no thread to clear.
+	if p.ClearThreadStatus != nil && msg.ThreadTS != "" {
+		p.ClearThreadStatus(msg.ChatID, msg.ThreadTS)
+	}
 }
 
 func (p *Publisher) handlePostError(claim string, msg *OutboxMessage, err error) {

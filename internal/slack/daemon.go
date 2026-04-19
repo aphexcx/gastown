@@ -106,6 +106,13 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 
 	outboxDir := filepath.Join(opts.TownRoot, constants.DirRuntime, "slack_outbox")
 	publisher := NewPublisher(outboxDir, client, rt)
+	publisher.ClearThreadStatus = func(chatID, threadTS string) {
+		// Best-effort: clear the "working..." indicator the handler set on
+		// inbound receipt. Empty status clears the indicator.
+		if err := client.SetAssistantStatus(context.Background(), chatID, threadTS, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "slack: clear thread status failed: %v\n", err)
+		}
+	}
 	publisher.NudgeAgent = func(address, reason string) {
 		// Best-effort: route outbound failure back to the sending agent.
 		sessionName, rerr := ResolveAddressToSession(address)
@@ -148,6 +155,21 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 		CheckSession:   tm.HasSession,
 		DownloadAttachment: func(ctx context.Context, m AttachmentMeta) (string, error) {
 			return DownloadInboundAttachment(ctx, client, opts.TownRoot, m)
+		},
+		SetThreadStatus: func(chatID, threadTS, status string) {
+			// Best-effort: log but don't block delivery on failure.
+			// Most common failure: missing 'assistant:write' scope or
+			// Assistant mode not enabled on the Slack app.
+			if err := client.SetAssistantStatus(context.Background(), chatID, threadTS, status); err != nil {
+				fmt.Fprintf(os.Stderr, "slack: set thread status failed: %v\n", err)
+			}
+		},
+		CanAccessConversation: func(chatID string) bool {
+			// Privacy gate: only route messages from conversations the bot
+			// is a formal member of. Slack's Agent/Assistant mode delivers
+			// events for DMs the bot isn't in; those would leak private
+			// conversations to agents if we routed them.
+			return client.CanAccessConversation(context.Background(), chatID)
 		},
 	}
 
@@ -291,13 +313,19 @@ func (d *Daemon) onEventsAPI(ctx context.Context, payload slackevents.EventsAPIE
 	inner := payload.InnerEvent
 	switch e := inner.Data.(type) {
 	case *slackevents.AppMentionEvent:
+		// AppMentionEvent fires specifically when the bot is @mentioned, so
+		// BotMentioned is trivially true here. This lets the handler route
+		// "@<bot> <text>" in a channel to the default target when no
+		// specific agent was also mentioned.
 		d.handler.Handle(ctx, IncomingMessage{
 			SenderUserID: e.User,
 			Kind:         classifyChannel(e.Channel),
 			ChatID:       e.Channel,
 			Text:         e.Text,
 			ThreadTS:     e.ThreadTimeStamp,
+			MessageTS:    e.TimeStamp,
 			Attachments:  extractAttachmentsFromSlackFiles(e.Files),
+			BotMentioned: true,
 		})
 	case *slackevents.MessageEvent:
 		// Ignore non-user message subtypes (joins, edits, etc.).
@@ -313,13 +341,17 @@ func (d *Daemon) onEventsAPI(ctx context.Context, payload slackevents.EventsAPIE
 		if e.SubType == "file_share" && e.Message != nil {
 			attachments = extractAttachmentsFromSlackFiles(e.Message.Files)
 		}
+		botMentioned := d.handler.BotUserID != "" &&
+			strings.Contains(e.Text, "<@"+d.handler.BotUserID+">")
 		d.handler.Handle(ctx, IncomingMessage{
 			SenderUserID: e.User,
 			Kind:         classifyChannel(e.Channel),
 			ChatID:       e.Channel,
 			Text:         e.Text,
 			ThreadTS:     e.ThreadTimeStamp,
+			MessageTS:    e.TimeStamp,
 			Attachments:  attachments,
+			BotMentioned: botMentioned,
 		})
 	}
 }
