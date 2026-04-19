@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
@@ -90,17 +91,32 @@ func (c *Client) PostMessage(ctx context.Context, args PostMessageArgs) (string,
 	return ts, nil
 }
 
-// CanAccessConversation returns true if the bot can inspect this
-// conversation via conversations.info. Used as a membership gate: if the
-// bot can't query a conversation, it shouldn't route messages from it.
-// This catches the case where Slack's Agent/Assistant mode delivers events
-// for DMs the bot isn't a formal member of (which would leak the user's
-// private conversations).
-func (c *Client) CanAccessConversation(ctx context.Context, chatID string) bool {
+// CanAccessConversation returns true if the bot is confirmed to have
+// access to this conversation, false if Slack says the bot is NOT a
+// member (channel_not_found), and an error for any other case (transient
+// network failure, unknown API error). Callers decide how to treat the
+// error case — for the privacy gate we fail closed (treat unknown as
+// no-access) to avoid leaking events on API hiccups.
+//
+// This is the documented pattern from Slack's assistant_thread_started
+// guidance: apps must call conversations.info to verify access, because
+// Agent/Assistant mode delivers events for conversations the bot isn't
+// formally in.
+func (c *Client) CanAccessConversation(ctx context.Context, chatID string) (bool, error) {
 	_, err := c.api.GetConversationInfoContext(ctx, &slackgo.GetConversationInfoInput{
 		ChannelID: chatID,
 	})
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	// "channel_not_found" is Slack's way of saying the bot isn't a member
+	// and shouldn't see this conversation. Definitively NOT accessible.
+	if strings.Contains(err.Error(), "channel_not_found") {
+		return false, nil
+	}
+	// Anything else (5xx, timeout, rate limit, unknown API code) is
+	// ambiguous — return the error so the caller decides.
+	return false, err
 }
 
 // UploadFile uploads a single local file to a channel (optionally threaded).

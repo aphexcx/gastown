@@ -222,6 +222,12 @@ func (p *Publisher) handlePostError(claim string, msg *OutboxMessage, err error)
 	if p.NudgeAgent != nil {
 		p.NudgeAgent(msg.From, fmt.Sprintf("slack post failed: %v", err))
 	}
+	// Clear any lingering "working..." thread indicator so the user in
+	// Slack isn't left staring at a perpetually-working status when the
+	// message is actually dead-lettered.
+	if p.ClearThreadStatus != nil && msg.ThreadTS != "" {
+		p.ClearThreadStatus(msg.ChatID, msg.ThreadTS)
+	}
 	p.refreshFailedCount()
 }
 

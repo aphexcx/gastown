@@ -169,7 +169,21 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			// is a formal member of. Slack's Agent/Assistant mode delivers
 			// events for DMs the bot isn't in; those would leak private
 			// conversations to agents if we routed them.
-			return client.CanAccessConversation(context.Background(), chatID)
+			//
+			// Fail closed: on channel_not_found we drop (correct).
+			// On transient errors we also drop but log loudly — failing
+			// open would leak events on Slack API hiccups, which is worse
+			// than a brief false-negative on legitimate events.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ok, err := client.CanAccessConversation(ctx, chatID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr,
+					"slack: membership check failed for %s (failing closed): %v\n",
+					chatID, err)
+				return false
+			}
+			return ok
 		},
 	}
 
@@ -341,8 +355,10 @@ func (d *Daemon) onEventsAPI(ctx context.Context, payload slackevents.EventsAPIE
 		if e.SubType == "file_share" && e.Message != nil {
 			attachments = extractAttachmentsFromSlackFiles(e.Message.Files)
 		}
+		// Detect both bare <@ID> and labeled <@ID|name> forms.
 		botMentioned := d.handler.BotUserID != "" &&
-			strings.Contains(e.Text, "<@"+d.handler.BotUserID+">")
+			(strings.Contains(e.Text, "<@"+d.handler.BotUserID+">") ||
+				strings.Contains(e.Text, "<@"+d.handler.BotUserID+"|"))
 		d.handler.Handle(ctx, IncomingMessage{
 			SenderUserID: e.User,
 			Kind:         classifyChannel(e.Channel),

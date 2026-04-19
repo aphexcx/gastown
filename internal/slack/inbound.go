@@ -249,18 +249,20 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		}
 	}
 
+	// Use the same thread key for both reply and thinking. If the inbound
+	// was inside an existing thread, keep the thread; otherwise use the
+	// message's own TS as the thread anchor. Always include --thread so
+	// OutboxMessage.ThreadTS is set, which lets the publisher clear the
+	// "working..." status indicator on successful post.
+	threadKey := msg.ThreadTS
+	if threadKey == "" {
+		threadKey = msg.MessageTS
+	}
 	replyArgs := fmt.Sprintf("%s \"your response here\"", msg.ChatID)
-	if msg.ThreadTS != "" {
-		replyArgs += fmt.Sprintf(" --thread %s", msg.ThreadTS)
-	}
-
 	thinkingArgs := fmt.Sprintf("%s \"short verb phrase\"", msg.ChatID)
-	threadTSForStatus := msg.ThreadTS
-	if threadTSForStatus == "" {
-		threadTSForStatus = msg.MessageTS
-	}
-	if threadTSForStatus != "" {
-		thinkingArgs += fmt.Sprintf(" --thread %s", threadTSForStatus)
+	if threadKey != "" {
+		replyArgs += fmt.Sprintf(" --thread %s", threadKey)
+		thinkingArgs += fmt.Sprintf(" --thread %s", threadKey)
 	}
 
 	body := fmt.Sprintf(
