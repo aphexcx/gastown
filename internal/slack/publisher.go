@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 // SlackPoster is the narrow Slack surface the publisher depends on.
@@ -163,10 +165,17 @@ func (p *Publisher) processOne(ctx context.Context, path string) {
 		return
 	}
 
-	// Look up display name. Missing → fall back to the raw address.
+	// Look up display name by the canonical address. We normalize via
+	// ParseAddress → Address() so inputs like "mayor/" (what detectSender
+	// returns for town-level roles) resolve to "mayor" (what the routing
+	// table stores). Missing → fall back to the raw address.
 	displayName := msg.From
+	lookupKey := msg.From
+	if id, err := session.ParseAddress(msg.From); err == nil {
+		lookupKey = id.Address()
+	}
 	for name, addr := range p.Routing {
-		if addr == msg.From {
+		if addr == lookupKey {
 			displayName = name
 			break
 		}
