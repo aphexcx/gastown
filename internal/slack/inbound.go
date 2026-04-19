@@ -275,41 +275,19 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 	}
 
 	body := fmt.Sprintf(
-		"📨 Slack message from %s (%s):\n\n%s\n\n"+
-			"---\n"+
-			"This is a live Slack conversation. Treat this exactly like the "+
-			"user DMing you in your terminal — respond now. If it's a question, "+
-			"answer it. If it's a task, do it and report back.\n\n"+
-			"⚠️ REPLY ONLY by running this exact command:\n\n"+
-			"    gt slack reply %s\n\n"+
-			"Replace \"your response here\" with your actual reply. "+
-			"The --thread flag (if shown) keeps the reply in the right Slack thread.\n\n"+
-			"💭 OPTIONAL progress status (like Claude's \"Thinking…\" indicator): "+
-			"sprinkle these during your work so the user sees what you're doing:\n\n"+
-			"    gt slack thinking %s\n\n"+
-			"Use a short verb phrase each time (e.g. \"reading ace's pane\", "+
-			"\"checking beads\", \"drafting reply\"). No need to clear at the end — "+
-			"the daemon clears automatically when your `gt slack reply` posts.\n\n"+
-			"🚫 DO NOT use plugin:slack:slack, any Slack MCP integration, or any "+
-			"other Slack tool. Those post using the USER's token (not the Gas Town "+
-			"Router bot token) which causes message echo loops — your reply will "+
-			"come right back to you as a new Slack DM and you'll loop forever. "+
-			"The ONLY safe way to reply is `gt slack reply`.",
-		senderLabel, where, msg.Text, replyArgs, thinkingArgs,
+		"📨 Slack [%s from %s]: %s\n\n"+
+			"Reply: gt slack reply %s\n"+
+			"Progress: gt slack thinking %s  (optional)",
+		where, senderLabel, msg.Text, replyArgs, thinkingArgs,
 	)
 	if len(downloadedLines) > 0 || len(metaLines) > 0 {
-		body += "\n\n📎 Attachments (DO NOT auto-attach — only read if explicitly relevant):\n"
+		body += "\nFiles (Read tool only if relevant; never paste paths into your reply):\n"
 		if len(downloadedLines) > 0 {
 			body += strings.Join(downloadedLines, "\n") + "\n"
 		}
 		if len(metaLines) > 0 {
 			body += strings.Join(metaLines, "\n") + "\n"
 		}
-		body += "\nIf you need to examine an attachment, use the Read tool "+
-			"with the path shown above. Do NOT include these paths verbatim "+
-			"in your reply or in any other output — Claude Code may try to "+
-			"auto-attach the image, which can cause Anthropic API 400 errors "+
-			"if the image is malformed."
 	}
 
 	// 9. Deliver.

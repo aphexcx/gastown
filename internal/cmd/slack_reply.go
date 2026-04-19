@@ -25,12 +25,25 @@ gt slack daemon picks it up and posts to Slack with your agent's display
 name.
 
 Inbound Slack messages arrive as nudges that include the exact command to
-run. You should copy that command verbatim — the chat-id and thread timestamp
-are required to route the reply to the right conversation.
+run — copy it verbatim. This command is fire-and-forget: it returns success
+as soon as the message is written to disk, not when Slack acknowledges the
+post. Check 'gt slack status' for delivery state.
 
-This command is fire-and-forget: it returns success as soon as the message
-is written to disk, not when Slack acknowledges the post. Check
-'gt slack status' for delivery state.`,
+RULES (these prevent the two known failure modes):
+
+  1. This is the ONLY sanctioned way to reply to Slack. Do not use
+     plugin:slack:slack, any Slack MCP integration, or any other Slack
+     tool. Those post via the USER's token (not the Gas Town Router bot),
+     causing echo loops where your reply comes back to you as a new DM.
+
+  2. If the inbound nudge references file attachments, use the Read tool
+     to examine them only if relevant. Never paste the raw absolute path
+     into your reply or other output — Claude Code auto-attaches images
+     on every turn when it sees such paths, which triggers Anthropic API
+     400 errors if the image is malformed and wedges the session.
+
+For dynamic progress indicators during long-running work, see
+'gt slack thinking --help'.`,
 	Args: cobra.ExactArgs(2),
 	RunE: runSlackReply,
 }
