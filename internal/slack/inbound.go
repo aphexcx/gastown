@@ -31,6 +31,20 @@ type IncomingMessage struct {
 	BotMentioned bool
 }
 
+// ThreadKey returns the Slack thread identifier to use for assistant
+// status updates and replies — ThreadTS if the message is in a thread,
+// otherwise the message's own timestamp.
+func (m IncomingMessage) ThreadKey() string {
+	if m.ThreadTS != "" {
+		return m.ThreadTS
+	}
+	return m.MessageTS
+}
+
+// statusWorking is the initial indicator posted when we enqueue a nudge.
+// Agents can overwrite it with more specific phrases via `gt slack thinking`.
+const statusWorking = "working..."
+
 // InboundHandler runs the filter → resolve → enqueue pipeline. It has no
 // direct dependency on slack-go or internal/nudge; callers inject those via
 // function fields so the handler is pure-ish and easy to test.
@@ -116,14 +130,15 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		return
 	}
 
-	// 2a. Membership gate: silent drop if the bot isn't a formal member of
-	// this conversation. Slack's Agent/Assistant mode can deliver events
-	// for DMs the bot hasn't been invited to (e.g., between two humans),
-	// which would leak the owner's private conversations to agents. Drop
-	// any event the bot can't inspect via conversations.info.
-	if h.CanAccessConversation != nil && !h.CanAccessConversation(msg.ChatID) {
+	// 2a. Membership gate for DMs: Slack's Agent/Assistant mode delivers
+	// message.im events for DMs the bot isn't in (between two humans),
+	// which would leak private conversations. Drop if the bot can't see
+	// the conversation via conversations.info. Channels are protected by
+	// the explicit opt-in list (step 3), so we skip this roundtrip there.
+	if msg.Kind == ConversationDM && h.CanAccessConversation != nil &&
+		!h.CanAccessConversation(msg.ChatID) {
 		fmt.Fprintf(os.Stderr,
-			"slack: DROPPED event for chat %s — bot is not a member of this conversation (privacy gate)\n",
+			"slack: DROPPED DM event for %s — bot is not a member (privacy gate)\n",
 			msg.ChatID)
 		return
 	}
@@ -249,15 +264,9 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		}
 	}
 
-	// Use the same thread key for both reply and thinking. If the inbound
-	// was inside an existing thread, keep the thread; otherwise use the
-	// message's own TS as the thread anchor. Always include --thread so
-	// OutboxMessage.ThreadTS is set, which lets the publisher clear the
-	// "working..." status indicator on successful post.
-	threadKey := msg.ThreadTS
-	if threadKey == "" {
-		threadKey = msg.MessageTS
-	}
+	// Always include --thread so OutboxMessage.ThreadTS is set, which lets
+	// the publisher clear the "working..." status indicator on success.
+	threadKey := msg.ThreadKey()
 	replyArgs := fmt.Sprintf("%s \"your response here\"", msg.ChatID)
 	thinkingArgs := fmt.Sprintf("%s \"short verb phrase\"", msg.ChatID)
 	if threadKey != "" {
@@ -310,17 +319,8 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		return
 	}
 
-	// 10. Set a "working..." thinking indicator in the Slack thread so the
-	// user gets immediate feedback that the message was received. The
-	// indicator is cleared when the agent's reply posts (publisher side).
-	// Best-effort: skip if no handler, log failures but don't block.
-	if h.SetThreadStatus != nil {
-		threadKey := msg.ThreadTS
-		if threadKey == "" {
-			threadKey = msg.MessageTS
-		}
-		if threadKey != "" {
-			h.SetThreadStatus(msg.ChatID, threadKey, "working...")
-		}
+	if h.SetThreadStatus != nil && threadKey != "" {
+		// Async: Slack API latency must not backpressure Socket Mode intake.
+		go h.SetThreadStatus(msg.ChatID, threadKey, statusWorking)
 	}
 }

@@ -107,8 +107,6 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 	outboxDir := filepath.Join(opts.TownRoot, constants.DirRuntime, "slack_outbox")
 	publisher := NewPublisher(outboxDir, client, rt)
 	publisher.ClearThreadStatus = func(chatID, threadTS string) {
-		// Best-effort: clear the "working..." indicator the handler set on
-		// inbound receipt. Empty status clears the indicator.
 		if err := client.SetAssistantStatus(context.Background(), chatID, threadTS, ""); err != nil {
 			fmt.Fprintf(os.Stderr, "slack: clear thread status failed: %v\n", err)
 		}
@@ -157,34 +155,11 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			return DownloadInboundAttachment(ctx, client, opts.TownRoot, m)
 		},
 		SetThreadStatus: func(chatID, threadTS, status string) {
-			// Best-effort: log but don't block delivery on failure.
-			// Most common failure: missing 'assistant:write' scope or
-			// Assistant mode not enabled on the Slack app.
 			if err := client.SetAssistantStatus(context.Background(), chatID, threadTS, status); err != nil {
 				fmt.Fprintf(os.Stderr, "slack: set thread status failed: %v\n", err)
 			}
 		},
-		CanAccessConversation: func(chatID string) bool {
-			// Privacy gate: only route messages from conversations the bot
-			// is a formal member of. Slack's Agent/Assistant mode delivers
-			// events for DMs the bot isn't in; those would leak private
-			// conversations to agents if we routed them.
-			//
-			// Fail closed: on channel_not_found we drop (correct).
-			// On transient errors we also drop but log loudly — failing
-			// open would leak events on Slack API hiccups, which is worse
-			// than a brief false-negative on legitimate events.
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			ok, err := client.CanAccessConversation(ctx, chatID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr,
-					"slack: membership check failed for %s (failing closed): %v\n",
-					chatID, err)
-				return false
-			}
-			return ok
-		},
+		CanAccessConversation: newMembershipCache(client).check,
 	}
 
 	return &Daemon{
@@ -327,10 +302,7 @@ func (d *Daemon) onEventsAPI(ctx context.Context, payload slackevents.EventsAPIE
 	inner := payload.InnerEvent
 	switch e := inner.Data.(type) {
 	case *slackevents.AppMentionEvent:
-		// AppMentionEvent fires specifically when the bot is @mentioned, so
-		// BotMentioned is trivially true here. This lets the handler route
-		// "@<bot> <text>" in a channel to the default target when no
-		// specific agent was also mentioned.
+		// AppMention events are, by definition, bot-mentioned.
 		d.handler.Handle(ctx, IncomingMessage{
 			SenderUserID: e.User,
 			Kind:         classifyChannel(e.Channel),
@@ -551,4 +523,59 @@ func LoadStatusSnapshot(path string) (*StatusSnapshot, error) {
 		return nil, fmt.Errorf("parse status file: %w", err)
 	}
 	return &s, nil
+}
+
+// membershipCache memoizes conversations.info membership checks used by the
+// privacy gate. Positive results (bot IS a member) are stable and cached
+// for 5 min. Negative results get a shorter TTL so access changes propagate
+// quickly. On API errors we fail closed — returning no-access — but do not
+// cache the failure, so the next event retries.
+type membershipCache struct {
+	client     *Client
+	mu         sync.Mutex
+	entries    map[string]membershipEntry
+	positiveTTL time.Duration
+	negativeTTL time.Duration
+}
+
+type membershipEntry struct {
+	ok     bool
+	expiry time.Time
+}
+
+func newMembershipCache(c *Client) *membershipCache {
+	return &membershipCache{
+		client:      c,
+		entries:     map[string]membershipEntry{},
+		positiveTTL: 5 * time.Minute,
+		negativeTTL: 30 * time.Second,
+	}
+}
+
+func (m *membershipCache) check(chatID string) bool {
+	m.mu.Lock()
+	if e, ok := m.entries[chatID]; ok && time.Now().Before(e.expiry) {
+		m.mu.Unlock()
+		return e.ok
+	}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	allowed, err := m.client.CanAccessConversation(ctx, chatID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"slack: membership check failed for %s (failing closed, not caching): %v\n",
+			chatID, err)
+		return false
+	}
+
+	ttl := m.positiveTTL
+	if !allowed {
+		ttl = m.negativeTTL
+	}
+	m.mu.Lock()
+	m.entries[chatID] = membershipEntry{ok: allowed, expiry: time.Now().Add(ttl)}
+	m.mu.Unlock()
+	return allowed
 }

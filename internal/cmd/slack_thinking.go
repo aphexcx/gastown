@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/slack"
@@ -67,11 +66,7 @@ func runSlackThinking(cmd *cobra.Command, args []string) error {
 
 	client := slack.NewClient(cfg)
 	if err := client.SetAssistantStatus(context.Background(), chatID, slackThinkingThread, status); err != nil {
-		// Non-fatal: surface the error so the agent knows, but don't
-		// propagate it as a catastrophic failure — status updates are
-		// best-effort and must not block the agent's actual work.
-		fmt.Fprintf(os.Stderr, "slack thinking: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("set thread status: %w", err)
 	}
 
 	if status == "" {

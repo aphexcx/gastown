@@ -251,7 +251,7 @@ func (p *Publisher) refreshFailedCount() {
 // directly into the failed/ directory. Unlike DeadLetterOutboxMessage, this
 // does NOT attempt to re-read or re-marshal the file — it just renames it.
 func quarantineRawClaim(outboxDir, claim string) {
-	failedDir := filepath.Join(outboxDir, "failed")
+	failedDir := filepath.Join(outboxDir, failedDirName)
 	if err := os.MkdirAll(failedDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "slack: mkdir failed/ for quarantine: %v\n", err)
 		return
