@@ -201,26 +201,11 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// this empty value with intentional settings like --max-old-space-size.
 	env["NODE_OPTIONS"] = ""
 
-	// Resolve effort level from per-role config (role_effort in town/rig settings,
-	// or cost-tier presets). Falls back to "high" when no config exists.
-	// The CLAUDE_CODE_EFFORT_LEVEL env var is deprecated — effort is now configured
-	// per-role through config, matching the pattern used for model selection.
-	rigPath := ""
-	if cfg.Rig != "" && cfg.TownRoot != "" {
-		rigPath = filepath.Join(cfg.TownRoot, cfg.Rig)
-	}
-	effort := ResolveRoleEffort(cfg.Role, cfg.TownRoot, rigPath)
-	if effort == "" {
-		effort = "high"
-	}
-	env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
-	if shellEffort := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL"); shellEffort != "" {
-		fmt.Fprintf(os.Stderr,
-			"notice: CLAUDE_CODE_EFFORT_LEVEL=%s env var is deprecated and ignored; "+
-				"%s effort resolved to %q via config. "+
-				"Set per-role effort with role_effort in settings or gt config cost-tier.\n",
-			shellEffort, cfg.Role, effort)
-	}
+	// CLAUDE_CODE_EFFORT_LEVEL is deprecated and ignored by Claude Code, which
+	// reads effortLevel from settings.json. Clear it so it doesn't leak from
+	// tmux/parent env into child agents and regenerate a deprecation notice
+	// on every spawn.
+	env["CLAUDE_CODE_EFFORT_LEVEL"] = ""
 
 	// Clear CLAUDECODE to prevent nested session detection in Claude Code v2.x.
 	// When gt sling is invoked from within a Claude Code session, CLAUDECODE=1
