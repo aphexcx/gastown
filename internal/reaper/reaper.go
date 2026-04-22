@@ -598,6 +598,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.updated_at < ?
 		AND i.priority > 1
 		AND i.issue_type != 'epic'
+		AND (i.external_ref IS NULL OR i.external_ref = '')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
 			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')

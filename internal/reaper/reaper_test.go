@@ -246,3 +246,32 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
 	}
 }
+
+// TestAutoCloseExcludesExternallyTrackedIssues verifies that the AutoClose
+// WHERE clause skips issues with a non-empty external_ref. Externally
+// tracked issues (Linear, GitLab, Jira, etc.) belong to their upstream
+// tracker for lifecycle — Reaper can't know whether a Linear issue's
+// staleness is real without live-fetching Linear state on every patrol.
+// Regression guard for the reaper-auto-closed-active-Linear-issues bug
+// where 13 beads got stamped close_reason='stale:auto-closed by reaper'
+// while the Linear side was still In Progress / In Review.
+func TestAutoCloseExcludesExternallyTrackedIssues(t *testing.T) {
+	source, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	body := string(source)
+	start := strings.Index(body, "func AutoClose(")
+	if start == -1 {
+		t.Fatalf("could not find AutoClose() in reaper.go")
+	}
+	// Next function (e.g. Purge) bounds the AutoClose body.
+	end := strings.Index(body[start+len("func AutoClose("):], "\nfunc ")
+	if end == -1 {
+		end = len(body) - start
+	}
+	autoCloseBody := body[start : start+len("func AutoClose(")+end]
+	if !strings.Contains(autoCloseBody, "i.external_ref IS NULL") {
+		t.Fatalf("expected AutoClose() WHERE clause to exclude external_ref'd issues, body was:\n%s", autoCloseBody)
+	}
+}
