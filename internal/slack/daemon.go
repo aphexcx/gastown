@@ -554,7 +554,7 @@ func newMembershipCache(c *Client) *membershipCache {
 
 // check returns whether the bot can access chatID and a human-readable reason
 // for the result. The reason is meant for log lines so operators can tell
-// "Slack confirmed not_a_member" from "API error, failing closed" without
+// "Slack returned channel_not_found" from "API error, failing closed" without
 // digging into stderr context.
 func (m *membershipCache) check(chatID string) (bool, string) {
 	m.mu.Lock()
@@ -563,7 +563,7 @@ func (m *membershipCache) check(chatID string) (bool, string) {
 		if e.ok {
 			return true, "cached_ok"
 		}
-		return false, "cached_not_a_member"
+		return false, "cached_channel_not_found"
 	}
 	m.mu.Unlock()
 

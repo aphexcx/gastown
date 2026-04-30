@@ -95,6 +95,9 @@ func runSlackDaemonForeground(cmd *cobra.Command, _ []string) error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		sig := <-sigCh
+		// Forensics is bounded to ~2s of ps calls; cancel runs after so the
+		// helper finishes writing before main returns and the process exits.
+		// 2s is well within graceful shutdown latency targets.
 		logShutdownForensics(cmd.OutOrStderr(), sig)
 		cancel()
 	}()
@@ -209,29 +212,40 @@ func runSlackStop(cmd *cobra.Command, _ []string) error {
 //   - our pid + parent pid (launchd/1 means we were orphaned long ago)
 //   - a ps snapshot of current `gt slack stop|kill` invocations, to catch
 //     the sender if they're still alive
+//
+// The ps calls are bounded to 2s total so a stuck `ps` can't gate shutdown.
 func logShutdownForensics(w io.Writer, sig os.Signal) {
 	ppid := os.Getppid()
+	myPID := os.Getpid()
 	fmt.Fprintf(w, "slack: shutdown signal received sig=%v pid=%d ppid=%d t=%s\n",
-		sig, os.Getpid(), ppid, time.Now().Format(time.RFC3339Nano))
+		sig, myPID, ppid, time.Now().Format(time.RFC3339Nano))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
 	// Best-effort ppid identity. On macOS ppid==1 is launchd, meaning the
 	// original `gt slack start` parent exited long ago — expected after
 	// daemonization, not a smoking gun on its own.
-	if out, err := exec.Command("ps", "-o", "pid,user,command", "-p",
+	if out, err := exec.CommandContext(ctx, "ps", "-o", "pid,user,command", "-p",
 		fmt.Sprint(ppid)).Output(); err == nil {
 		fmt.Fprintf(w, "slack: shutdown ppid info:\n%s", out)
 	}
 
 	// Snapshot any currently-running `gt slack stop`, `kill <pid>`, or `pkill`
 	// processes. The sender of a SIGTERM usually exits within milliseconds, so
-	// this is racy — but when it works it's the smoking gun.
-	out, err := exec.Command("ps", "-axo", "pid,ppid,start,command").Output()
+	// this is racy — but when it works it's the smoking gun. We exclude our
+	// own pid so the daemon doesn't show up as a suspect of its own death.
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid,ppid,start,command").Output()
 	if err != nil {
 		return
 	}
-	myPID := fmt.Sprint(os.Getpid())
-	flags := []string{"gt slack stop", "pkill", "killall", "slack daemon"}
+	myPIDStr := fmt.Sprint(myPID)
+	flags := []string{"gt slack stop", "pkill", "killall"}
 	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == myPIDStr {
+			continue
+		}
 		flagged := false
 		for _, f := range flags {
 			if strings.Contains(line, f) {
@@ -239,7 +253,7 @@ func logShutdownForensics(w io.Writer, sig os.Signal) {
 				break
 			}
 		}
-		if !flagged && strings.Contains(line, "kill") && strings.Contains(line, myPID) {
+		if !flagged && strings.Contains(line, "kill") && strings.Contains(line, myPIDStr) {
 			flagged = true
 		}
 		if flagged {
