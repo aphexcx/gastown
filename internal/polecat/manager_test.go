@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // installMockBd places a fake bd binary in PATH that handles the commands
@@ -102,6 +104,87 @@ esac
 		}
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func setupCanonicalBranchManagerTest(t *testing.T) (*Manager, string) {
+	t.Helper()
+	installMockBd(t)
+
+	root := t.TempDir()
+	mayorRig := filepath.Join(root, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	readmePath := filepath.Join(mayorRig, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.Add("README.md"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := mayorGit.Commit("Initial commit"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	r := &rig.Rig{Name: "rig", Path: root}
+	return NewManager(r, git.NewGit(root), nil), mayorRig
+}
+
+func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName string) string {
+	t.Helper()
+
+	repoGit := git.NewGit(repoPath)
+	if err := repoGit.CheckoutNewBranch(branchName, startPoint); err != nil {
+		t.Fatalf("checkout stale branch %s from %s: %v", branchName, startPoint, err)
+	}
+
+	fileName := strings.NewReplacer("/", "-", "@", "-").Replace(branchName) + ".txt"
+	if err := os.WriteFile(filepath.Join(repoPath, fileName), []byte(branchName+"\n"), 0644); err != nil {
+		t.Fatalf("write stale branch marker: %v", err)
+	}
+	if err := repoGit.Add(fileName); err != nil {
+		t.Fatalf("git add stale branch marker: %v", err)
+	}
+	if err := repoGit.Commit("Create stale polecat branch"); err != nil {
+		t.Fatalf("git commit stale branch marker: %v", err)
+	}
+
+	sha, err := repoGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("resolve stale branch commit: %v", err)
+	}
+	return sha
 }
 
 func TestStateIsWorking(t *testing.T) {
@@ -210,6 +293,92 @@ func TestAssigneeID(t *testing.T) {
 	expected := "test-rig/polecats/Toast"
 	if id != expected {
 		t.Errorf("assigneeID = %q, want %q", id, expected)
+	}
+}
+
+// TestAgentBeadID_Deterministic verifies that agentBeadID returns the same string
+// on repeated calls regardless of process working directory. Regression test for
+// gt-lph: the old implementation called workspace.Find on each invocation, which
+// could resolve differently depending on cwd, causing non-deterministic IDs across
+// Manager instances for the same rig path.
+func TestAgentBeadID_Deterministic(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	r := &rig.Rig{
+		Name: "myrig",
+		Path: rigPath,
+	}
+
+	// Construct two Managers from the same rig path — they must produce
+	// identical agentBeadIDs regardless of construction context.
+	m1 := NewManager(r, git.NewGit(rigPath), nil)
+	m2 := NewManager(r, git.NewGit(rigPath), nil)
+
+	id1a := m1.agentBeadID("Toast")
+	id1b := m1.agentBeadID("Toast")
+	id2 := m2.agentBeadID("Toast")
+
+	// Same Manager, repeated calls — must be identical.
+	if id1a != id1b {
+		t.Errorf("agentBeadID not stable across calls: %q vs %q", id1a, id1b)
+	}
+
+	// Different Manager, same rig — must be identical.
+	if id1a != id2 {
+		t.Errorf("agentBeadID differs across Managers for same rig: %q vs %q", id1a, id2)
+	}
+
+	// Verify the ID is non-empty and contains expected components.
+	if id1a == "" {
+		t.Fatal("agentBeadID returned empty string")
+	}
+
+	// Change process working directory and construct a third Manager —
+	// the ID must still match (the old bug: workspace.Find resolved
+	// differently from different cwds).
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("Chdir to townRoot: %v", err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	m3 := NewManager(r, git.NewGit(rigPath), nil)
+	id3 := m3.agentBeadID("Toast")
+	if id1a != id3 {
+		t.Errorf("agentBeadID differs after cwd change: %q (original) vs %q (after chdir)", id1a, id3)
+	}
+}
+
+func TestNewManager_NamepoolFromRigConfig(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write rig config.json with polecat_names (no settings/config.json)
+	rigConfig := `{"polecat_names": ["alpha", "beta", "gamma"]}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "myrig", Path: rigPath}
+	m := NewManager(r, git.NewGit(rigPath), nil)
+	pool := m.GetNamePool()
+
+	name, err := pool.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if name != "alpha" {
+		t.Errorf("expected first name from rig config (alpha), got %q", name)
 	}
 }
 
@@ -357,6 +526,7 @@ func TestClearIssueWithoutAssignment(t *testing.T) {
 func TestAddWithOptions_HasAgentsMD(t *testing.T) {
 	// This test verifies that AGENTS.md exists in polecat worktrees after creation.
 	// AGENTS.md is critical for polecats to "land the plane" properly.
+	installMockBd(t)
 
 	root := t.TempDir()
 
@@ -401,6 +571,20 @@ func TestAddWithOptions_HasAgentsMD(t *testing.T) {
 	cmd.Dir = mayorRig
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	// Create rig-level .beads directory with redirect to mayor/rig/.beads
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	rigRedirect := filepath.Join(rigBeads, "redirect")
+	if err := os.WriteFile(rigRedirect, []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
 	}
 
 	// Create rig pointing to root
@@ -661,6 +845,8 @@ func TestIsDoltConfigError(t *testing.T) {
 		{"database not found", fmt.Errorf("database not found"), true},
 		{"connection refused", fmt.Errorf("dial tcp: connection refused"), true},
 		{"configure custom types", fmt.Errorf("configure custom types in /path: exit 1"), true},
+		{"identity mismatch", fmt.Errorf("identity mismatch: local project_id != database project_id"), true},
+		{"Unknown database", fmt.Errorf("Unknown database 'gastown'"), true},
 		{"generic error", fmt.Errorf("something else failed"), false},
 		{"wrapped not initialized", fmt.Errorf("bd create failed: %w", fmt.Errorf("database not initialized")), true},
 	}
@@ -695,6 +881,53 @@ func TestIsDoltOptimisticLockError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isDoltOptimisticLockError(tt.err); got != tt.want {
 				t.Errorf("isDoltOptimisticLockError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsCurrentHookedIssueForAssignee(t *testing.T) {
+	assignee := "testrig/polecats/toast"
+
+	tests := []struct {
+		name  string
+		issue *beads.Issue
+		want  bool
+	}{
+		{
+			name: "nil issue",
+			want: false,
+		},
+		{
+			name: "hooked and matching assignee",
+			issue: &beads.Issue{
+				Status:   beads.StatusHooked,
+				Assignee: assignee,
+			},
+			want: true,
+		},
+		{
+			name: "hooked but different assignee",
+			issue: &beads.Issue{
+				Status:   beads.StatusHooked,
+				Assignee: "testrig/polecats/nux",
+			},
+			want: false,
+		},
+		{
+			name: "matching assignee but open status",
+			issue: &beads.Issue{
+				Status:   "open",
+				Assignee: assignee,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCurrentHookedIssueForAssignee(tt.issue, assignee); got != tt.want {
+				t.Fatalf("isCurrentHookedIssueForAssignee() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -919,6 +1152,78 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 	}
 }
 
+func TestAddWithOptions_UsesCanonicalOriginDefaultBranch(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	mayorGit := git.NewGit(mayorRig)
+	baseSHA, err := mayorGit.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+	staleSHA := createStalePolecatCommit(t, mayorRig, "main", "polecat/stale-source")
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	worktreeGit := git.NewGit(polecat.ClonePath)
+	staleAncestor, err := worktreeGit.IsAncestor(staleSHA, polecat.Branch)
+	if err != nil {
+		t.Fatalf("check stale ancestry: %v", err)
+	}
+	if staleAncestor {
+		t.Fatalf("new polecat branch %q unexpectedly includes stale local commit %s", polecat.Branch, staleSHA)
+	}
+
+	baseAncestor, err := worktreeGit.IsAncestor(baseSHA, polecat.Branch)
+	if err != nil {
+		t.Fatalf("check canonical ancestry: %v", err)
+	}
+	if !baseAncestor {
+		t.Fatalf("new polecat branch %q should descend from origin/main commit %s", polecat.Branch, baseSHA)
+	}
+}
+
+func TestReuseIdlePolecat_UsesCanonicalOriginDefaultBranch(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	mayorGit := git.NewGit(mayorRig)
+	baseSHA, err := mayorGit.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	staleSHA := createStalePolecatCommit(t, polecat.ClonePath, "HEAD", "polecat/toast-stale")
+
+	reused, err := mgr.ReuseIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
+	if err != nil {
+		t.Fatalf("ReuseIdlePolecat: %v", err)
+	}
+
+	worktreeGit := git.NewGit(reused.ClonePath)
+	staleAncestor, err := worktreeGit.IsAncestor(staleSHA, reused.Branch)
+	if err != nil {
+		t.Fatalf("check stale ancestry: %v", err)
+	}
+	if staleAncestor {
+		t.Fatalf("reused polecat branch %q unexpectedly includes stale local commit %s", reused.Branch, staleSHA)
+	}
+
+	baseAncestor, err := worktreeGit.IsAncestor(baseSHA, reused.Branch)
+	if err != nil {
+		t.Fatalf("check canonical ancestry: %v", err)
+	}
+	if !baseAncestor {
+		t.Fatalf("reused polecat branch %q should descend from origin/main commit %s", reused.Branch, baseSHA)
+	}
+}
+
 func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 	// This test verifies the invariant that polecat creation does NOT add any
 	// TRACKED files to the repo's directory structure. The user's code should stay pure.
@@ -1057,8 +1362,8 @@ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 		if strings.Contains(line, ".beads") {
 			continue
 		}
-		// .gitignore is expected - Gas Town patterns added
-		if strings.Contains(line, ".gitignore") {
+		// CLAUDE.md is expected - provisioned by CreatePolecatCLAUDEmd for gt done instructions
+		if strings.Contains(line, "CLAUDE.md") {
 			continue
 		}
 		unexpected = append(unexpected, line)
@@ -1632,5 +1937,207 @@ func TestAllocateAndAdd_NoDuplicateNames(t *testing.T) {
 		if count > 1 {
 			t.Errorf("name %q allocated %d times — race condition (GH#2215)", name, count)
 		}
+	}
+}
+
+// TestReuseIdlePolecat_KillsLiveSession verifies that ReuseIdlePolecat kills
+// an existing live (non-stale) tmux session instead of returning ErrSessionRunning.
+// This is the regression test for the sling-reuse-stale-session bug: idle polecats
+// with a live Claude session at a dead ❯ prompt must have their session killed so
+// StartSession can create a fresh session with a proper gt prime --hook cycle.
+func TestReuseIdlePolecat_KillsLiveSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux not supported on Windows")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testreuse"
+	rigPath := filepath.Join(townRoot, rigName)
+	polecatName := "toast"
+
+	// Create minimal polecat directory structure
+	polecatDir := filepath.Join(rigPath, "polecats", polecatName)
+	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+		t.Fatalf("mkdir polecat dir: %v", err)
+	}
+
+	// Register a unique prefix for session naming
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", rigName)
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	r := &rig.Rig{Name: rigName, Path: rigPath}
+	mgr := NewManager(r, git.NewGit(rigPath), tm)
+
+	// Create a live tmux session (simulates Claude sitting at ❯ after gt done)
+	sessMgr := NewSessionManager(tm, r)
+	sessionName := sessMgr.SessionName(polecatName)
+	if err := tm.NewSessionWithCommand(sessionName, townRoot, "sleep 300"); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(sessionName) })
+
+	// Write a fresh heartbeat (simulating a session that just finished gt done
+	// but hasn't gone stale yet — this is the exact scenario that previously
+	// caused ReuseIdlePolecat to return ErrSessionRunning)
+	TouchSessionHeartbeat(townRoot, sessionName)
+
+	// Verify session is alive and heartbeat exists
+	running, err := tm.HasSession(sessionName)
+	if err != nil || !running {
+		t.Fatalf("precondition: session %s should be running", sessionName)
+	}
+	if hb := ReadSessionHeartbeat(townRoot, sessionName); hb == nil {
+		t.Fatal("precondition: heartbeat should exist")
+	}
+
+	// Call ReuseIdlePolecat — it will kill the session, then fail on worktree
+	// operations (no real git repo). The important thing is it does NOT return
+	// ErrSessionRunning.
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+
+	// Verify it did NOT return ErrSessionRunning (the old buggy behavior)
+	if errors.Is(reuseErr, ErrSessionRunning) {
+		t.Fatalf("ReuseIdlePolecat returned ErrSessionRunning for live session — "+
+			"this is the sling-reuse-stale-session bug: idle polecats with live "+
+			"sessions must have their session killed, not rejected")
+	}
+
+	// We expect an error from later steps (worktree not found), but not from session handling
+	if reuseErr == nil {
+		t.Fatal("expected error from worktree operations (test has no real git repo)")
+	}
+	if !strings.Contains(reuseErr.Error(), "worktree") {
+		t.Logf("ReuseIdlePolecat error (expected worktree-related): %v", reuseErr)
+	}
+
+	// Verify the session was killed
+	running, _ = tm.HasSession(sessionName)
+	if running {
+		t.Error("session should have been killed by ReuseIdlePolecat")
+	}
+
+	// Verify heartbeat was cleaned up
+	if hb := ReadSessionHeartbeat(townRoot, sessionName); hb != nil {
+		t.Error("heartbeat should have been removed after session kill")
+	}
+}
+
+// TestReuseIdlePolecat_KillsStaleSession verifies that ReuseIdlePolecat also
+// handles the stale-session case correctly (regression: the original code path
+// that worked before the fix should still work after).
+func TestReuseIdlePolecat_KillsStaleSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux not supported on Windows")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "teststale"
+	rigPath := filepath.Join(townRoot, rigName)
+	polecatName := "marmalade"
+
+	polecatDir := filepath.Join(rigPath, "polecats", polecatName)
+	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+		t.Fatalf("mkdir polecat dir: %v", err)
+	}
+
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", rigName)
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	r := &rig.Rig{Name: rigName, Path: rigPath}
+	mgr := NewManager(r, git.NewGit(rigPath), tm)
+
+	sessMgr := NewSessionManager(tm, r)
+	sessionName := sessMgr.SessionName(polecatName)
+	if err := tm.NewSessionWithCommand(sessionName, townRoot, "sleep 300"); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(sessionName) })
+
+	// Write a STALE heartbeat (old timestamp)
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute).UTC()
+	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `","state":"exiting"}`)
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+
+	// Should not return ErrSessionRunning
+	if errors.Is(reuseErr, ErrSessionRunning) {
+		t.Fatal("ReuseIdlePolecat should not return ErrSessionRunning for stale session")
+	}
+
+	// Session should be killed
+	running, _ := tm.HasSession(sessionName)
+	if running {
+		t.Error("stale session should have been killed")
+	}
+
+	// Heartbeat should be cleaned up
+	if hb := ReadSessionHeartbeat(townRoot, sessionName); hb != nil {
+		t.Error("heartbeat should have been removed after stale session kill")
+	}
+}
+
+// TestReuseIdlePolecat_NoSessionNoop verifies that ReuseIdlePolecat proceeds
+// normally when there's no existing session (the most common reuse case: session
+// was already killed by the Witness or expired).
+func TestReuseIdlePolecat_NoSessionNoop(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux not supported on Windows")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testnoop"
+	rigPath := filepath.Join(townRoot, rigName)
+	polecatName := "jam"
+
+	polecatDir := filepath.Join(rigPath, "polecats", polecatName)
+	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+		t.Fatalf("mkdir polecat dir: %v", err)
+	}
+
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", rigName)
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	r := &rig.Rig{Name: rigName, Path: rigPath}
+	mgr := NewManager(r, git.NewGit(rigPath), tm)
+
+	// No tmux session, no heartbeat — the common idle case
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+
+	// Should not return ErrSessionRunning
+	if errors.Is(reuseErr, ErrSessionRunning) {
+		t.Fatal("ReuseIdlePolecat should not return ErrSessionRunning when no session exists")
+	}
+
+	// Error should be from later steps (worktree ops), not session handling
+	if reuseErr == nil {
+		t.Fatal("expected error from worktree operations")
 	}
 }

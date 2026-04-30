@@ -2,14 +2,26 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/constants"
 )
+
+// IdentityEnvVars are agent identity env vars that must not leak across
+// process or session boundaries. Used by daemon sanitization (clearing
+// inherited vars), tmux global cleanup, and prime session env repair.
+// See GH#3006.
+var IdentityEnvVars = []string{
+	"GT_ROLE", "GT_RIG", "GT_CREW", "GT_POLECAT", "GT_DOG_NAME",
+	"GT_SESSION", "GT_AGENT", "BD_ACTOR", "GIT_AUTHOR_NAME", "BEADS_AGENT_NAME",
+}
 
 // AgentEnvConfig specifies the configuration for generating agent environment variables.
 // This is the single source of truth for all agent environment configuration.
@@ -122,7 +134,8 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		// GT_ROLE must be set so startup command resolution can honor role_agents.dog.
 		env["GT_ROLE"] = "dog"
 		if cfg.AgentName != "" {
-			env["BD_ACTOR"] = fmt.Sprintf("dog/%s", cfg.AgentName)
+			env["GT_DOG_NAME"] = cfg.AgentName
+			env["BD_ACTOR"] = fmt.Sprintf("deacon/dogs/%s", cfg.AgentName)
 			env["GIT_AUTHOR_NAME"] = cfg.AgentName
 		} else {
 			env["BD_ACTOR"] = "dog"
@@ -187,6 +200,27 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// In BuildStartupCommand, rc.Env is merged after AgentEnv and can override
 	// this empty value with intentional settings like --max-old-space-size.
 	env["NODE_OPTIONS"] = ""
+
+	// Resolve effort level from per-role config (role_effort in town/rig settings,
+	// or cost-tier presets). Falls back to "high" when no config exists.
+	// The CLAUDE_CODE_EFFORT_LEVEL env var is deprecated — effort is now configured
+	// per-role through config, matching the pattern used for model selection.
+	rigPath := ""
+	if cfg.Rig != "" && cfg.TownRoot != "" {
+		rigPath = filepath.Join(cfg.TownRoot, cfg.Rig)
+	}
+	effort := ResolveRoleEffort(cfg.Role, cfg.TownRoot, rigPath)
+	if effort == "" {
+		effort = "high"
+	}
+	env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+	if shellEffort := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL"); shellEffort != "" {
+		fmt.Fprintf(os.Stderr,
+			"notice: CLAUDE_CODE_EFFORT_LEVEL=%s env var is deprecated and ignored; "+
+				"%s effort resolved to %q via config. "+
+				"Set per-role effort with role_effort in settings or gt config cost-tier.\n",
+			shellEffort, cfg.Role, effort)
+	}
 
 	// Clear CLAUDECODE to prevent nested session detection in Claude Code v2.x.
 	// When gt sling is invoked from within a Claude Code session, CLAUDECODE=1
@@ -262,13 +296,70 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		}
 	}
 
+	// Inject Dolt server port so agents' direct bd invocations connect to
+	// gt's central server instead of auto-starting rogue per-rig servers.
+	// Without this, bd falls back to its own discovery (.beads/dolt-server.port
+	// or auto-start), causing split-brain after reinstall/restart.
+	//
+	// Resolution: config file first, then process env fallback. Process env
+	// propagation ensures agent sessions inherit the port even when TownRoot
+	// is not set (e.g., AgentEnvSimple callers).
+	if cfg.TownRoot != "" {
+		if port := resolveDoltPort(cfg.TownRoot); port > 0 {
+			portStr := strconv.Itoa(port)
+			env["GT_DOLT_PORT"] = portStr
+			env["BEADS_DOLT_PORT"] = portStr
+		}
+	}
+	// Propagate GT_DOLT_PORT / BEADS_DOLT_PORT from process env when not
+	// already resolved from config. This covers sessions where TownRoot is
+	// empty or has no config.yaml (GH#2412).
+	if _, ok := env["GT_DOLT_PORT"]; !ok {
+		if v := os.Getenv("GT_DOLT_PORT"); v != "" {
+			env["GT_DOLT_PORT"] = v
+			// Also set BEADS_DOLT_PORT if not explicitly overridden in env.
+			if os.Getenv("BEADS_DOLT_PORT") == "" {
+				env["BEADS_DOLT_PORT"] = v
+			}
+		}
+	}
+	if _, ok := env["BEADS_DOLT_PORT"]; !ok {
+		if v := os.Getenv("BEADS_DOLT_PORT"); v != "" {
+			env["BEADS_DOLT_PORT"] = v
+		}
+	}
+
+	// Suppress bd's Dolt auto-start for all Gas Town agents (GH#2930).
+	// Gas Town manages its own Dolt server (gt dolt start/stop). When the
+	// server is momentarily unreachable (restart, journal hiccup), bd's
+	// auto-start tries to launch a shadow server in the agent's .beads/dolt/
+	// directory — which conflicts with the real server on the same port and
+	// triggers an escalation flood loop. Dogs are especially affected because
+	// their kennel's .beads/ has no explicit dolt_server_port in metadata.json.
+	if cfg.TownRoot != "" {
+		env["BEADS_DOLT_AUTO_START"] = "0"
+	}
+
+	// Propagate Dolt server host so bd doesn't fall back to 127.0.0.1 when
+	// the server runs on a remote machine (e.g., mini2 over Tailscale).
+	if _, ok := env["BEADS_DOLT_SERVER_HOST"]; !ok {
+		if v := os.Getenv("BEADS_DOLT_SERVER_HOST"); v != "" {
+			env["BEADS_DOLT_SERVER_HOST"] = v
+		} else if v := os.Getenv("GT_DOLT_HOST"); v != "" {
+			env["BEADS_DOLT_SERVER_HOST"] = v
+		}
+	}
+
 	// Pass through cloud API credentials and provider configuration from the parent shell.
 	// Only variables explicitly listed here are forwarded; all others are blocked for isolation.
 	for _, key := range []string{
 		// Anthropic API (direct)
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
-		"ANTHROPIC_BASE_URL",
+		// ANTHROPIC_BASE_URL intentionally excluded — agents that need a custom
+		// base URL (MiniMax, Groq, etc.) get it from their agent config's Env
+		// block, not from the parent process. Passthrough caused cross-provider
+		// contamination: a MiniMax deacon's base URL leaked into Claude polecats.
 		"ANTHROPIC_CUSTOM_HEADERS",
 
 		// Model selection
@@ -344,6 +435,82 @@ func sanitizeOTELAttrValue(s string, maxLen int) string {
 	return s
 }
 
+// resolveDoltPort determines the Dolt server port for the given town root.
+//
+// Resolution order (mirrors doltserver.DefaultConfig without importing it):
+//  1. .dolt-data/config.yaml listener.port (authoritative, machine-generated)
+//  2. GT_DOLT_PORT environment variable
+//  3. mayor/daemon.json env.GT_DOLT_PORT
+//  4. 0 (caller should skip injection — DefaultPort 3307 is bd's own default)
+//
+// This avoids importing doltserver (which pulls in yaml, sql, mysql driver)
+// by scanning the config.yaml line-by-line. The file is machine-generated by
+// gt dolt start with a known format, so a simple line scan is safe.
+func resolveDoltPort(townRoot string) int {
+	// 1. Read from .dolt-data/config.yaml (authoritative)
+	configPath := filepath.Join(townRoot, ".dolt-data", "config.yaml")
+	if data, err := os.ReadFile(configPath); err == nil {
+		if port := parsePortFromConfigYAML(data); port > 0 {
+			return port
+		}
+	}
+
+	// 2. Environment variable
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil && port > 0 {
+			return port
+		}
+	}
+
+	// 3. daemon.json fallback
+	daemonJSONPath := filepath.Join(townRoot, "mayor", "daemon.json")
+	if data, err := os.ReadFile(daemonJSONPath); err == nil {
+		var daemonEnv struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(data, &daemonEnv); err == nil {
+			if v, ok := daemonEnv.Env["GT_DOLT_PORT"]; ok {
+				if port, err := strconv.Atoi(v); err == nil && port > 0 {
+					return port
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+// parsePortFromConfigYAML extracts the listener port from a Dolt config.yaml
+// without a yaml dependency. The file is machine-generated by gt dolt start
+// with the format:
+//
+//	listener:
+//	  port: 3307
+func parsePortFromConfigYAML(data []byte) int {
+	lines := strings.Split(string(data), "\n")
+	inListener := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "listener:" {
+			inListener = true
+			continue
+		}
+		if inListener {
+			if strings.HasPrefix(trimmed, "port:") {
+				portStr := strings.TrimSpace(strings.TrimPrefix(trimmed, "port:"))
+				if port, err := strconv.Atoi(portStr); err == nil {
+					return port
+				}
+			}
+			// Any non-indented line ends the listener block
+			if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+				inListener = false
+			}
+		}
+	}
+	return 0
+}
+
 // AgentEnvSimple is a convenience function for simple role-based env var lookup.
 // Use this when you only need role, rig, and agentName without advanced options.
 func AgentEnvSimple(role, rig, agentName string) map[string]string {
@@ -380,6 +547,12 @@ func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// psQuote quotes a value for use in PowerShell $env: assignments.
+// Uses single quotes with embedded single quotes doubled ('').
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 // ExportPrefix builds an export statement prefix for shell commands.
 // Returns a string like "export GT_ROLE=mayor BD_ACTOR=mayor && "
 // The keys are sorted for deterministic output.
@@ -396,11 +569,18 @@ func ExportPrefix(env map[string]string) string {
 	}
 	sort.Strings(keys)
 
+	if runtime.GOOS == "windows" {
+		var parts []string
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("$env:%s=%s", k, psQuote(env[k])))
+		}
+		return strings.Join(parts, "; ") + "; "
+	}
+
 	var parts []string
 	for _, k := range keys {
 		parts = append(parts, fmt.Sprintf("%s=%s", k, ShellQuote(env[k])))
 	}
-
 	return "export " + strings.Join(parts, " ") + " && "
 }
 
@@ -471,4 +651,19 @@ func EnvToSlice(env map[string]string) []string {
 		result = append(result, k+"="+v)
 	}
 	return result
+}
+
+// ClaudeConfigDir resolves the Claude Code configuration directory.
+// Resolution order:
+//  1. CLAUDE_CONFIG_DIR env var (if set and non-empty)
+//  2. $HOME/.claude (fallback)
+func ClaudeConfigDir() (string, error) {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".claude"), nil
 }

@@ -166,9 +166,51 @@ Every field from the `AgentPresetInfo` struct in `internal/config/agents.go`:
 }
 ```
 
-### Activating the preset
+### Built-in preset: GitHub Copilot CLI
 
-Once the JSON file exists, configure a rig (or the whole town) to use it:
+`copilot` ships as a built-in preset — no JSON file needed. It uses the `--yolo` flag for
+autonomous mode and flag-style session resume. Copilot CLI supports full executable lifecycle
+hooks via `.github/hooks/gastown.json`:
+
+```json
+{
+  "name": "copilot",
+  "command": "copilot",
+  "args": ["--yolo"],
+  "process_names": ["copilot"],
+  "resume_flag": "--resume",
+  "resume_style": "flag",
+  "ready_delay_ms": 5000,
+  "hooks_provider": "copilot",
+  "hooks_dir": ".github/hooks",
+  "hooks_settings_file": "gastown.json",
+  "instructions_file": "AGENTS.md"
+}
+```
+
+Gas Town provisions `.github/hooks/gastown.json` in the agent's working directory with the
+standard lifecycle hooks (`sessionStart`, `userPromptSubmitted`, `preToolUse`, `sessionEnd`).
+This is the same hook events as Claude Code, just in Copilot's JSON format.
+
+> **Note on readiness detection**: Copilot CLI doesn't emit a detectable prompt prefix, so
+> Gas Town uses a 5-second delay instead of prompt-based detection. Sessions take slightly
+> longer to become ready than Claude.
+
+> **Enterprise requirement**: Copilot CLI must be enabled at two levels before use:
+> 1. Enterprise → Settings → AI controls → Copilot → **"Copilot in the CLI" = Enabled**
+> 2. Org → Settings → Copilot → Policies → **"Copilot in the CLI" = Enabled**
+>
+> Users also need a Copilot seat assigned. See [GitHub Copilot in the CLI](https://docs.github.com/en/copilot/using-github-copilot/using-github-copilot-in-the-command-line).
+
+To activate:
+```bash
+gt config default-agent copilot        # Set as town default
+gt start --agent copilot               # Or pass per-command
+```
+
+### Activating a custom preset
+
+Once a JSON file exists, configure a rig (or the whole town) to use it:
 
 ```json
 // In ~/gt/<rig>/settings/config.json
@@ -347,7 +389,7 @@ delivery mechanism adapts to the agent's plugin API.
 If your agent doesn't support executable hooks but reads an instructions/context
 file, Gas Town can install a markdown file with startup instructions.
 
-Reference: `internal/copilot/plugin/gastown-instructions.md`
+Reference: `internal/hooks/templates/copilot/copilot-instructions.md`
 
 ```markdown
 # Gas Town Agent Context
@@ -365,6 +407,10 @@ This loads your full role context, mail, and pending work.
 
 Set `hooks_informational: true` in the preset. Gas Town will then send
 `gt prime` via tmux nudge as a fallback (since hooks won't run automatically).
+
+> **Note**: GitHub Copilot CLI previously used Pattern C, but now supports full
+> executable lifecycle hooks (Pattern B equivalent, using its own JSON format).
+> See the built-in Copilot preset section above for current configuration.
 
 ### How Gas Town chooses the fallback strategy
 
@@ -430,6 +476,42 @@ exec codex "$@"
 The wrapper runs `gt prime` before `exec`-ing the real agent binary. Users
 install it as `gt-codex` in their PATH.
 
+### Experimental Codex hooks via custom profile
+
+Gas Town also supports an experimental opt-in Codex hooks path for users who define a custom Codex agent profile with explicit hook settings.
+
+Use this only when both of these are true:
+- Your custom agent profile sets `prompt_mode: "arg"` plus `hooks.provider: "codex"`, `hooks.dir: ".codex"`, and `hooks.settings_file: "hooks.json"`
+- Codex has its upstream hooks feature enabled via `[features].codex_hooks = true`
+
+This installs `.codex/hooks.json` through the existing provider installer path and keeps the implementation intentionally small:
+- `SessionStart` runs `gt prime --hook`
+- Autonomous `SessionStart` also runs `gt mail check --inject`
+- `Stop` runs `gt costs record`
+
+Example custom profile:
+
+```json
+{
+  "agents": {
+    "codex-worker-hooks": {
+      "command": "codex",
+      "args": ["--dangerously-bypass-approvals-and-sandbox"],
+      "prompt_mode": "arg",
+      "hooks": {
+        "provider": "codex",
+        "dir": ".codex",
+        "settings_file": "hooks.json"
+      }
+    }
+  }
+}
+```
+
+This path does not attempt broader hook parity such as tool guards, prompt-submit hooks, or pre-compact behavior.
+
+The default built-in `codex` preset does not change. It remains on the no-hooks fallback path, and the `gt-codex` wrapper guidance above still applies to that default path unless you explicitly opt into a custom hook-capable Codex profile.
+
 ### Slash commands
 
 Gas Town provisions slash commands (like `/commit`, `/handoff`) into agent
@@ -447,7 +529,7 @@ Current agent capabilities at a glance:
 | Claude | Yes (settings.json) | `--resume` (flag) | Native | Yes | arg | node, claude |
 | Gemini | Yes | `--resume` (flag) | `-p` | No | arg | gemini |
 | Codex | No | `resume` (subcmd) | `exec` subcmd | No | none | codex |
-| Cursor | No | `--resume` (flag) | `-p` | No | arg | cursor-agent |
+| Cursor | Yes (`.cursor/hooks.json`) | `--resume` (flag) | `-p` / `--print` + `--output-format` | No | arg | cursor-agent, agent |
 | Auggie | No | `--resume` (flag) | No | No | arg | auggie |
 | AMP | No | `threads continue` (subcmd) | No | No | arg | amp |
 | OpenCode | Yes (plugin JS) | No | `run` subcmd | No | none | opencode, node, bun |

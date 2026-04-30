@@ -279,6 +279,71 @@ func TestScanStranded_ClosesEmptyConvoys(t *testing.T) {
 	}
 }
 
+func TestScanStranded_GracePeriodSkipsRecentConvoy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// Convoy created 30 seconds ago — well within the 5-minute grace period.
+	recentTime := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
+	strandedJSON := fmt.Sprintf(`[{"id":"hq-new1","title":"New","tracked_count":0,"ready_count":0,"ready_issues":[],"created_at":"%s"}]`, recentTime)
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: strandedJSON,
+	})
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	// Convoy check must NOT have been called — grace period should protect it.
+	if _, err := os.Stat(paths.checkLogPath); err == nil {
+		data, _ := os.ReadFile(paths.checkLogPath)
+		t.Errorf("convoy check was called for recent convoy (grace period should protect): %s", data)
+	}
+
+	// Should see grace period log message.
+	found := false
+	for _, s := range logged {
+		if strings.Contains(s, "grace period") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected grace period log message, got: %v", logged)
+	}
+}
+
+func TestScanStranded_GracePeriodAllowsOldConvoy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// Convoy created 10 minutes ago — past the 5-minute grace period.
+	oldTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	strandedJSON := fmt.Sprintf(`[{"id":"hq-old1","title":"Old","tracked_count":0,"ready_count":0,"ready_issues":[],"created_at":"%s"}]`, oldTime)
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: strandedJSON,
+	})
+
+	m := NewConvoyManager(paths.townRoot, func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	data, err := os.ReadFile(paths.checkLogPath)
+	if err != nil {
+		t.Fatalf("read check log: %v", err)
+	}
+	if !strings.Contains(string(data), "hq-old1") {
+		t.Errorf("expected gt convoy check for hq-old1 (past grace period), got: %q", data)
+	}
+}
+
 func TestScanStranded_NoStrandedConvoys(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on Windows")
@@ -1704,6 +1769,138 @@ func TestPollAllStores_HighWaterMark_NoReprocessing(t *testing.T) {
 	}
 }
 
+func TestPollAllStores_ReopenClearsCloseDedupAcrossPolls(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	issueID := fmt.Sprintf("gt-reclose-%d", time.Now().UnixNano())
+	issue := &beadsdk.Issue{
+		ID: issueID, Title: "Reclose Test", Status: beadsdk.StatusOpen,
+		Priority: 2, IssueType: beadsdk.TypeTask, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := store.CloseIssue(ctx, issue.ID, "done", "test", ""); err != nil {
+		t.Fatalf("CloseIssue: %v", err)
+	}
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
+		map[string]beadsdk.Storage{"hq": store}, nil, nil)
+	m.seeded.Store(true)
+	m.pollStoresSnapshot(m.stores)
+
+	firstCloseCount := 0
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+			firstCloseCount++
+		}
+	}
+	if firstCloseCount != 1 {
+		t.Fatalf("expected 1 close detection for %s on first close, got %d: %v", issueID, firstCloseCount, logged)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"status": beadsdk.StatusOpen}, "test"); err != nil {
+		t.Fatalf("ReopenIssue via UpdateIssue: %v", err)
+	}
+
+	logged = nil
+	m.pollStoresSnapshot(m.stores)
+
+	if _, ok := m.processedCloses.Load(issueID); ok {
+		t.Fatalf("expected processedCloses entry for %s to be cleared after reopen", issueID)
+	}
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+			t.Fatalf("expected reopen poll not to log a close for %s, got: %v", issueID, logged)
+		}
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if err := store.CloseIssue(ctx, issue.ID, "done again", "test", ""); err != nil {
+		t.Fatalf("CloseIssue again: %v", err)
+	}
+
+	logged = nil
+	m.pollStoresSnapshot(m.stores)
+
+	secondCloseCount := 0
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+			secondCloseCount++
+		}
+	}
+	if secondCloseCount != 1 {
+		t.Fatalf("expected 1 close detection for %s after reopen/reclose, got %d: %v", issueID, secondCloseCount, logged)
+	}
+}
+
+func TestPollAllStores_ReopenResetsPerCycleDedup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	issueID := fmt.Sprintf("gt-reclose-same-poll-%d", time.Now().UnixNano())
+	issue := &beadsdk.Issue{
+		ID: issueID, Title: "Reclose Same Poll Test", Status: beadsdk.StatusOpen,
+		Priority: 2, IssueType: beadsdk.TypeTask, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := store.CloseIssue(ctx, issue.ID, "done", "test", ""); err != nil {
+		t.Fatalf("CloseIssue: %v", err)
+	}
+
+	// Beads events use CURRENT_TIMESTAMP in Dolt, which is second precision.
+	// Space the lifecycle transitions across distinct seconds so the store's
+	// created_at ordering is deterministic within this single poll.
+	time.Sleep(1100 * time.Millisecond)
+	if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"status": beadsdk.StatusOpen}, "test"); err != nil {
+		t.Fatalf("ReopenIssue via UpdateIssue: %v", err)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	if err := store.CloseIssue(ctx, issue.ID, "done again", "test", ""); err != nil {
+		t.Fatalf("CloseIssue again: %v", err)
+	}
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
+		map[string]beadsdk.Storage{"hq": store}, nil, nil)
+	m.seeded.Store(true)
+	m.pollStoresSnapshot(m.stores)
+
+	closeCount := 0
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+			closeCount++
+		}
+	}
+	if closeCount != 2 {
+		t.Fatalf("expected 2 close detections for %s when close->reopen->close occurs in one poll, got %d: %v", issueID, closeCount, logged)
+	}
+}
+
 // TestPollAllStores_CrossStoreDedup verifies that a close event seen from
 // multiple stores is only processed once (GH #1798).
 func TestPollAllStores_CrossStoreDedup(t *testing.T) {
@@ -2171,4 +2368,81 @@ func TestDoltRecoveryCallback_NilSafe(t *testing.T) {
 	dsm.mu.Lock()
 	dsm.clearUnhealthySignal()
 	dsm.mu.Unlock()
+}
+
+// infNaNStorage is a minimal Storage stub whose GetAllEventsSince always
+// returns the given error. All other methods panic (they should not be called).
+type infNaNStorage struct {
+	beadsdk.Storage // embedded to satisfy unimplemented methods
+	err             error
+}
+
+func (s *infNaNStorage) GetAllEventsSince(_ context.Context, _ time.Time) ([]*beadsdk.Event, error) {
+	return nil, s.err
+}
+
+// TestPollStore_InfNaNError_AdvancesHWMAndReturnsNil verifies that when
+// GetAllEventsSince returns a "+Inf is not a valid value for double" error
+// (corrupt Dolt row), pollStore advances the high-water mark to now and
+// returns nil (no error, no recovery mode).
+func TestPollStore_InfNaNError_AdvancesHWMAndReturnsNil(t *testing.T) {
+	for _, errMsg := range []string{
+		"Error 1366 (HY000): error: +Inf is not a valid value for double",
+		"Error 1366 (HY000): error: -Inf is not a valid value for double",
+		"Error 1366 (HY000): error: NaN is not a valid value for double",
+		// Dolt wraps values in single quotes in actual error messages
+		"Error 1366 (HY000): error: '+Inf' is not a valid value for 'double'",
+		"Error 1366 (HY000): error: '-Inf' is not a valid value for 'double'",
+		"Error 1366 (HY000): error: 'NaN' is not a valid value for 'double'",
+		// Wrapped in beads SDK error context (actual observed format)
+		"failed to get events since 0: Error 1366 (HY000): error: '+Inf' is not a valid value for 'double'",
+	} {
+		t.Run(errMsg[:20], func(t *testing.T) {
+			stub := &infNaNStorage{err: fmt.Errorf("%s", errMsg)}
+			stores := map[string]beadsdk.Storage{"hq": stub}
+
+			var logged []string
+			logger := func(format string, args ...interface{}) {
+				logged = append(logged, fmt.Sprintf(format, args...))
+			}
+
+			before := time.Now()
+			m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+			hadError := m.pollStoresSnapshot(m.stores)
+			after := time.Now()
+
+			// pollStoresSnapshot should report no error (corrupt row is handled)
+			if hadError {
+				t.Errorf("expected no error for inf/nan store, got hadError=true; logs: %v", logged)
+			}
+
+			// recoveryMode must NOT be set (we recovered inline)
+			if m.recoveryMode.Load() {
+				t.Errorf("recoveryMode should not be set for inf/nan error; logs: %v", logged)
+			}
+
+			// High-water mark for "hq" should have been advanced to approximately now
+			v, ok := m.lastEventIDs.Load("hq")
+			if !ok {
+				t.Fatal("expected HWM to be stored for hq")
+			}
+			hwm := v.(time.Time)
+			if hwm.Before(before) || hwm.After(after.Add(time.Second)) {
+				t.Errorf("HWM %v not in expected range [%v, %v]", hwm, before, after)
+			}
+
+			// Should have logged a message about the skip
+			foundMsg := false
+			for _, s := range logged {
+				if strings.Contains(s, "+Inf/NaN row detected") {
+					foundMsg = true
+					break
+				}
+			}
+			if !foundMsg {
+				t.Errorf("expected HWM-advance log message, got: %v", logged)
+			}
+		})
+	}
 }

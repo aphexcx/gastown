@@ -70,3 +70,116 @@ git push              # Push to remote
 - **Dependencies**: `bd ready` shows only unblocked work
 
 <!-- end-beads-agent-instructions -->
+
+<!-- gastown-agent-instructions-v1 -->
+
+---
+
+## Gas Town Multi-Agent Communication
+
+This workspace is part of a **Gas Town** multi-agent environment. You communicate
+with other agents using `gt` commands — never by printing text or using raw tmux.
+
+### Nudging Agents (Immediate Delivery)
+
+`gt nudge` sends a message directly to another agent's active session:
+
+```bash
+gt nudge mayor "Status update: PR review complete"
+gt nudge laneassist/crew/dom "Check your mail — PR ready for review"
+gt nudge witness "Polecat health check needed"
+gt nudge refinery "Merge queue has items"
+```
+
+**Target formats:**
+- Role shortcuts: `mayor`, `deacon`, `witness`, `refinery`
+- Full path: `<rig>/crew/<name>`, `<rig>/polecats/<name>`
+
+**Important:** `gt nudge` is the ONLY way to send text to another agent's session.
+Never print "Hey @name" — the other agent cannot see your terminal output.
+
+### Sending Mail (Persistent Messages)
+
+`gt mail` sends messages that persist across session restarts:
+
+```bash
+# Reading
+gt mail inbox                    # List messages
+gt mail read <id>                # Read a specific message
+
+# Sending (use --stdin for multi-line content)
+gt mail send mayor/ -s "Subject" -m "Short message"
+gt mail send laneassist/crew/dom -s "PR Review" --stdin <<'BODY'
+Multi-line message content here.
+Details about the PR and what to look for.
+BODY
+gt mail send --human -s "Subject" -m "Message to overseer"
+```
+
+### When to Use Which
+
+| Want to... | Command | Why |
+|------------|---------|-----|
+| Wake a sleeping agent | `gt nudge <target> "msg"` | Immediate delivery |
+| Send detailed task/info | `gt mail send <target> -s "..." --stdin` | Persists across restarts |
+| Both: send + wake | `gt mail send` then `gt nudge` | Mail carries payload, nudge wakes |
+
+### Context Recovery
+
+After compaction or new session, run `gt prime` to reload your full role context,
+identity, and any pending work.
+
+```bash
+gt prime              # Full context reload
+gt hook               # Check for assigned work
+gt mail inbox         # Check for messages
+```
+
+<!-- end-gastown-agent-instructions -->
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd dolt push
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->

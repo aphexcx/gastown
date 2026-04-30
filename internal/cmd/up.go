@@ -2,13 +2,17 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -20,6 +24,7 @@ import (
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
@@ -27,6 +32,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -103,7 +109,13 @@ const maxConcurrentAgentStarts = 10
 
 // daemonStartupGrace is how long to wait after spawning the daemon process
 // before verifying it started. The daemon needs time to write its PID file.
-const daemonStartupGrace = 300 * time.Millisecond
+// On Windows, DETACHED_PROCESS startup is slower so we allow extra time.
+var daemonStartupGrace = func() time.Duration {
+	if runtime.GOOS == "windows" {
+		return 2 * time.Second
+	}
+	return 300 * time.Millisecond
+}()
 
 var upCmd = &cobra.Command{
 	Use:     "up",
@@ -175,6 +187,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Discover rigs early so we can prefetch while daemon/deacon/mayor start
 	rigs := discoverRigs(townRoot)
 
+	// Safety: bring current agent out of DND on startup so orchestration nudges
+	// are not silently muted after a previous incident/debug session.
+	if changed, err := disableCurrentAgentDND(townRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not reset DND state: %v\n", err)
+	} else if changed && !upQuiet {
+		fmt.Printf("%s DND was enabled; reset to normal for current agent\n", style.SuccessPrefix)
+	}
+
 	// Start daemon, deacon, mayor, and rig prefetch in parallel
 	var daemonErr error
 	var daemonPID int
@@ -243,8 +263,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 		defer startupWg.Done()
 		mayorMgr := mayor.NewManager(townRoot)
 		if err := mayorMgr.Start(""); err != nil {
-			if err == mayor.ErrAlreadyRunning {
+			if errors.Is(err, mayor.ErrAlreadyRunning) {
 				mayorResult = agentStartResult{name: "Mayor", ok: true, detail: mayorMgr.SessionName()}
+			} else if errors.Is(err, mayor.ErrACPActive) {
+				mayorResult = agentStartResult{name: "Mayor", ok: true, detail: "ACP active"}
 			} else {
 				mayorResult = agentStartResult{name: "Mayor", ok: false, detail: err.Error()}
 			}
@@ -300,6 +322,27 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// was skipped, polling the port would just burn the full timeout. (review finding #1)
 	if !doltSkipped && doltOK {
 		waitForDoltReady(townRoot)
+		// Propagate Dolt connection info to process env so all subsequently spawned
+		// agents (witnesses, refineries, crew) inherit it. Without this,
+		// bd auto-starts rogue Dolt instances in agent tmux sessions. (GH#2412)
+		// Host propagation prevents bd from falling back to 127.0.0.1 when the
+		// Dolt server runs on a remote machine (e.g., mini2 over Tailscale).
+		doltCfg := doltserver.DefaultConfig(townRoot)
+		portStr := fmt.Sprintf("%d", doltCfg.Port)
+		os.Setenv("GT_DOLT_PORT", portStr)
+		os.Setenv("BEADS_DOLT_PORT", portStr)
+		if doltCfg.Host != "" {
+			os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
+		}
+	}
+
+	// Orphaned bead recovery: detect beads stuck in hooked/in_progress status
+	// assigned to polecats that no longer exist (session dead + directory gone).
+	// After a crash, these beads sit orphaned until someone manually resets them.
+	// Running this before witnesses start avoids duplicate recovery. (gas-udp)
+	if !doltSkipped && doltOK {
+		orphanServices := recoverOrphanedBeads(townRoot, rigs, prefetchedRigs)
+		services = append(services, orphanServices...)
 	}
 
 	// 5 & 6. Witnesses and Refineries (using prefetched rigs)
@@ -415,8 +458,72 @@ func printStatus(name string, ok bool, detail string) {
 	}
 }
 
+// disableCurrentAgentDND resets DND for the current role context (if muted).
+// Returns true when a change was applied.
+func disableCurrentAgentDND(townRoot string) (bool, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false, fmt.Errorf("getting current directory: %w", err)
+	}
+
+	roleInfo, err := GetRoleWithContext(cwd, townRoot)
+	if err != nil {
+		// No role context (or not in role workspace): nothing to change.
+		return false, nil
+	}
+
+	ctx := RoleContext{
+		Role:     roleInfo.Role,
+		Rig:      roleInfo.Rig,
+		Polecat:  roleInfo.Polecat,
+		TownRoot: townRoot,
+		WorkDir:  cwd,
+	}
+	agentBeadID := getAgentBeadID(ctx)
+	if agentBeadID == "" {
+		return false, nil
+	}
+
+	bd := beads.New(townRoot)
+	level, err := bd.GetAgentNotificationLevel(agentBeadID)
+	if err != nil {
+		// Missing bead/field should not block startup.
+		return false, nil
+	}
+	if level != beads.NotifyMuted {
+		return false, nil
+	}
+
+	if err := bd.UpdateAgentNotificationLevel(agentBeadID, beads.NotifyNormal); err != nil {
+		return false, fmt.Errorf("updating notification level for %s: %w", agentBeadID, err)
+	}
+	return true, nil
+}
+
 // ensureDaemon starts the daemon if not running.
 func ensureDaemon(townRoot string) error {
+	// GH#2656: Don't restart the daemon while gt down is running.
+	// GH#2907: If the sentinel's PID is dead, remove stale sentinel.
+	sentinelPath := filepath.Join(townRoot, ShutdownSentinel)
+	if data, err := os.ReadFile(sentinelPath); err == nil {
+		stale := false
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			if process, err := os.FindProcess(pid); err != nil {
+				stale = true
+			} else if err := process.Signal(syscall.Signal(0)); err != nil {
+				stale = true
+			}
+		} else {
+			// Sentinel exists but has no valid PID — treat as stale.
+			stale = true
+		}
+		if stale {
+			os.Remove(sentinelPath)
+		} else {
+			return fmt.Errorf("shutdown in progress (sentinel exists: %s)", sentinelPath)
+		}
+	}
+
 	running, _, err := daemon.IsRunning(townRoot)
 	if err != nil {
 		return err
@@ -437,6 +544,7 @@ func ensureDaemon(townRoot string) error {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	util.SetDetachedProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return err
@@ -451,7 +559,10 @@ func ensureDaemon(townRoot string) error {
 		return err
 	}
 	if !running {
-		return fmt.Errorf("daemon failed to start")
+		if msg := readDaemonStartupFailure(townRoot, cmd.Process.Pid); msg != "" {
+			return fmt.Errorf("daemon failed to start: %s", msg)
+		}
+		return fmt.Errorf("daemon failed to start (check logs with 'gt daemon logs')")
 	}
 
 	return nil
@@ -903,5 +1014,55 @@ func waitForDoltReady(townRoot string) {
 	if err := doltserver.WaitForReady(townRoot, doltReadyTimeout); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v (agents may see connection errors)\n", err)
 	}
+}
+
+// recoverOrphanedBeads scans each rig for beads stuck in hooked/in_progress
+// status assigned to polecats that no longer exist (tmux session dead AND
+// worktree directory removed). For each orphan, the bead is reset to open
+// and the deacon is notified for re-dispatch.
+//
+// This runs during gt up after Dolt is ready, before witnesses start their
+// own patrol. It catches the crash-recovery case where polecats die and
+// their beads are never re-slung. (gas-udp)
+func recoverOrphanedBeads(townRoot string, rigs []string, prefetchedRigs map[string]*rig.Rig) []ServiceStatus {
+	var services []ServiceStatus
+
+	bd := witness.DefaultBdCli()
+	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+
+	for _, rigName := range rigs {
+		if _, ok := prefetchedRigs[rigName]; !ok {
+			fmt.Fprintf(os.Stderr, "[orphan-recovery] skipping rig %s (failed to load)\n", rigName)
+			continue // Rig failed to load — skip
+		}
+
+		rigPath := filepath.Join(townRoot, rigName)
+		result := witness.DetectOrphanedBeads(bd, rigPath, rigName, router)
+
+		if len(result.Orphans) == 0 {
+			continue // No orphans in this rig
+		}
+
+		recovered := 0
+		for _, orphan := range result.Orphans {
+			if orphan.BeadRecovered {
+				recovered++
+			}
+		}
+
+		detail := fmt.Sprintf("found %d orphaned, recovered %d", len(result.Orphans), recovered)
+		services = append(services, ServiceStatus{
+			Name:   fmt.Sprintf("Orphan recovery (%s)", rigName),
+			Type:   "recovery",
+			Rig:    rigName,
+			OK:     true,
+			Detail: detail,
+		})
+	}
+
+	// Flush any pending mail notifications before proceeding.
+	router.WaitPendingNotifications()
+
+	return services
 }
 

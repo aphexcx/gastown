@@ -262,7 +262,7 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 	}
 	if !found {
 		suggestions := suggest.FindSimilar(polecatName, r.Polecats, 3)
-		hint := fmt.Sprintf("Create with: gt polecat add %s/%s", rigName, polecatName)
+		hint := fmt.Sprintf("Create with: gt polecat identity add %s %s", rigName, polecatName)
 		return fmt.Errorf("%s", suggest.FormatSuggestion("Polecat", polecatName, suggestions, hint))
 	}
 
@@ -336,8 +336,18 @@ func runSessionAttach(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Attach (this replaces the process)
-	return polecatMgr.Attach(polecatName)
+	running, err := polecatMgr.IsRunning(polecatName)
+	if err != nil {
+		return fmt.Errorf("checking session: %w", err)
+	}
+	if !running {
+		return polecat.ErrSessionNotFound
+	}
+
+	// Hand the terminal off to tmux via syscall.Exec so tmux inherits our
+	// controlling TTY directly. Running tmux as a subprocess with buffered
+	// stdio triggers "open terminal failed: not a terminal".
+	return attachToTmuxSession(polecatMgr.SessionName(polecatName))
 }
 
 // SessionListItem represents a session in list output.

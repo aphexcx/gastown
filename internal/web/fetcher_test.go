@@ -1,6 +1,8 @@
 package web
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +11,8 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/activity"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 func TestCalculateWorkStatus(t *testing.T) {
@@ -569,4 +573,326 @@ esac
 			t.Fatalf("expected timeout error, got: %v", err)
 		}
 	})
+}
+
+func withMayorFetcherHooks(t *testing.T, sessionEnv func(sessionName, key string) (string, error), runCmdFunc func(time.Duration, string, ...string) (*bytes.Buffer, error)) {
+	t.Helper()
+
+	originalGetEnv := fetcherGetSessionEnv
+	originalRunCmd := fetcherRunCmd
+	t.Cleanup(func() {
+		fetcherGetSessionEnv = originalGetEnv
+		fetcherRunCmd = originalRunCmd
+	})
+	t.Cleanup(config.ResetRegistryForTesting)
+
+	if sessionEnv != nil {
+		fetcherGetSessionEnv = sessionEnv
+	}
+	if runCmdFunc != nil {
+		fetcherRunCmd = runCmdFunc
+	}
+}
+
+func TestResolveMayorRuntime(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionEnv  func(sessionName, key string) (string, error)
+		setup       func(t *testing.T, townRoot string)
+		wantRuntime string
+	}{
+		{
+			name: "uses session agent env",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "codex", nil
+			},
+			wantRuntime: "codex",
+		},
+		{
+			name: "falls back to town settings",
+			sessionEnv: func(string, string) (string, error) {
+				return "", os.ErrNotExist
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				settings := config.NewTownSettings()
+				settings.DefaultAgent = "codex"
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+			},
+			wantRuntime: "codex",
+		},
+		{
+			name: "uses custom role agent alias",
+			sessionEnv: func(string, string) (string, error) {
+				return "", os.ErrNotExist
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				settings := config.NewTownSettings()
+				settings.RoleAgents[constants.RoleMayor] = "claude-sonnet"
+				settings.Agents["claude-sonnet"] = &config.RuntimeConfig{
+					Command: "claude",
+					Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+				}
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+			},
+			wantRuntime: "claude/sonnet",
+		},
+		{
+			name: "uses registry agent from session env",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "mayor-registry", nil
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				registry := &config.AgentRegistry{
+					Version: config.CurrentAgentRegistryVersion,
+					Agents: map[string]*config.AgentPresetInfo{
+						"mayor-registry": {
+							Name:    "mayor-registry",
+							Command: "opencode",
+							Args:    []string{"run", "--model", "gpt-5"},
+						},
+					},
+				}
+				if err := config.SaveAgentRegistry(config.DefaultAgentRegistryPath(townRoot), registry); err != nil {
+					t.Fatalf("SaveAgentRegistry: %v", err)
+				}
+			},
+			wantRuntime: "opencode/gpt-5",
+		},
+		{
+			name: "uses ephemeral tier agent from session env",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "claude-sonnet", nil
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), config.NewTownSettings()); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+				t.Setenv("GT_COST_TIER", "economy")
+			},
+			wantRuntime: "claude/sonnet",
+		},
+		{
+			name: "uses provider only role agent alias",
+			sessionEnv: func(string, string) (string, error) {
+				return "", os.ErrNotExist
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				settings := config.NewTownSettings()
+				settings.RoleAgents[constants.RoleMayor] = "mayor-custom"
+				settings.Agents["mayor-custom"] = &config.RuntimeConfig{
+					Provider: "codex",
+				}
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+			},
+			wantRuntime: "codex",
+		},
+		{
+			name: "returns unknown alias verbatim when unresolved",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "mystery-agent", nil
+			},
+			wantRuntime: "mystery-agent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withMayorFetcherHooks(t, tt.sessionEnv, nil)
+
+			townRoot := t.TempDir()
+			if tt.setup != nil {
+				tt.setup(t, townRoot)
+			}
+
+			f := &LiveConvoyFetcher{townRoot: townRoot}
+			if got := f.resolveMayorRuntime("hq-mayor"); got != tt.wantRuntime {
+				t.Fatalf("resolveMayorRuntime() = %q, want %q", got, tt.wantRuntime)
+			}
+		})
+	}
+}
+
+func TestRuntimeLabelFromConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  string
+		args     []string
+		fallback string
+		want     string
+	}{
+		{
+			name:     "claude model flag",
+			command:  "claude",
+			args:     []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+			fallback: "claude-sonnet",
+			want:     "claude/sonnet",
+		},
+		{
+			name:     "short model flag",
+			command:  "opencode",
+			args:     []string{"run", "-m", "gpt-5"},
+			fallback: "custom-opencode",
+			want:     "opencode/gpt-5",
+		},
+		{
+			name:     "cgroup wrap unwraps binary",
+			command:  "cgroup-wrap",
+			args:     []string{"/usr/local/bin/codex", "--dangerously-bypass-approvals-and-sandbox"},
+			fallback: "codex",
+			want:     "codex",
+		},
+		{
+			name:     "empty command falls back to alias",
+			command:  "",
+			args:     nil,
+			fallback: "mystery-agent",
+			want:     "mystery-agent",
+		},
+		{
+			name:     "empty command and fallback defaults to claude",
+			command:  "",
+			args:     nil,
+			fallback: "",
+			want:     "claude",
+		},
+		{
+			name:     "model equals form long flag",
+			command:  "claude",
+			args:     []string{"--dangerously-skip-permissions", "--model=sonnet"},
+			fallback: "claude-sonnet",
+			want:     "claude/sonnet",
+		},
+		{
+			name:     "model equals form short flag",
+			command:  "opencode",
+			args:     []string{"-m=gpt-5"},
+			fallback: "custom",
+			want:     "opencode/gpt-5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runtimeLabelFromConfig(tt.command, tt.args, tt.fallback); got != tt.want {
+				t.Fatalf("runtimeLabelFromConfig(%q, %v, %q) = %q, want %q", tt.command, tt.args, tt.fallback, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetchMayor_UsesResolvedRuntime(t *testing.T) {
+	withMayorFetcherHooks(
+		t,
+		func(sessionName, key string) (string, error) {
+			if sessionName != "hq-mayor" || key != "GT_AGENT" {
+				t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+			}
+			return "codex", nil
+		},
+		func(_ time.Duration, name string, args ...string) (*bytes.Buffer, error) {
+			if name != "tmux" {
+				t.Fatalf("unexpected command: %s %v", name, args)
+			}
+			return bytes.NewBufferString("hq-mayor:1731328320\nhq-deacon:1731328300\n"), nil
+		},
+	)
+
+	f := &LiveConvoyFetcher{
+		townRoot:             t.TempDir(),
+		mayorActiveThreshold: 24 * time.Hour,
+		tmuxCmdTimeout:       time.Second,
+	}
+
+	status, err := f.FetchMayor()
+	if err != nil {
+		t.Fatalf("FetchMayor: %v", err)
+	}
+	if !status.IsAttached {
+		t.Fatal("expected mayor to be attached")
+	}
+	if status.SessionName != "hq-mayor" {
+		t.Fatalf("SessionName = %q, want %q", status.SessionName, "hq-mayor")
+	}
+	if status.Runtime != "codex" {
+		t.Fatalf("Runtime = %q, want %q", status.Runtime, "codex")
+	}
+	if status.LastActivity == "" {
+		t.Fatal("expected LastActivity to be populated")
+	}
+}
+
+// TestFetchHealth_DeaconHeartbeatFieldName verifies that FetchHealth reads the
+// "timestamp" field written by heartbeat.go, not the old "last_heartbeat" field
+// that caused dashboard to always show "no timestamp". (GH#2989)
+func TestFetchHealth_DeaconHeartbeatFieldName(t *testing.T) {
+	townRoot := t.TempDir()
+	deaconDir := filepath.Join(townRoot, "deacon")
+	if err := os.MkdirAll(deaconDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write heartbeat.json using the field name heartbeat.go actually writes.
+	now := time.Now().UTC().Truncate(time.Second)
+	heartbeatJSON := fmt.Sprintf(`{"timestamp":%q,"cycle":42,"healthy_agents":3,"unhealthy_agents":1}`,
+		now.Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(deaconDir, "heartbeat.json"), []byte(heartbeatJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &LiveConvoyFetcher{
+		townRoot:                townRoot,
+		heartbeatFreshThreshold: 5 * time.Minute,
+	}
+
+	health, err := f.FetchHealth()
+	if err != nil {
+		t.Fatalf("FetchHealth: %v", err)
+	}
+
+	// DeaconHeartbeat must NOT be "no timestamp" — the field was read correctly.
+	if health.DeaconHeartbeat == "no timestamp" {
+		t.Fatal("DeaconHeartbeat = \"no timestamp\": JSON field name mismatch (GH#2989)")
+	}
+	if health.DeaconHeartbeat == "no heartbeat" {
+		t.Fatal("DeaconHeartbeat = \"no heartbeat\": heartbeat file was not read")
+	}
+
+	// Cycle and agent counts should be populated.
+	if health.DeaconCycle != 42 {
+		t.Errorf("DeaconCycle = %d, want 42", health.DeaconCycle)
+	}
+	if health.HealthyAgents != 3 {
+		t.Errorf("HealthyAgents = %d, want 3", health.HealthyAgents)
+	}
+	if health.UnhealthyAgents != 1 {
+		t.Errorf("UnhealthyAgents = %d, want 1", health.UnhealthyAgents)
+	}
+
+	// Heartbeat should be considered fresh (written just now).
+	if !health.HeartbeatFresh {
+		t.Error("HeartbeatFresh = false for a just-written heartbeat")
+	}
 }

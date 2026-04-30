@@ -23,7 +23,27 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/util"
 )
+
+func stripEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	filtered := env[:0]
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+// shortSHA returns at most 8 characters of a SHA for display.
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
+}
 
 // DefaultStaleClaimTimeout is the default duration after which a claimed MR
 // is considered abandoned and eligible for re-claim. This is conservative
@@ -47,6 +67,21 @@ func isClaimStale(updatedAt string, timeout time.Duration) (stale bool, parseErr
 }
 
 // GateConfig defines a single quality gate command.
+// GatePhase controls when a gate runs in the merge pipeline.
+type GatePhase string
+
+const (
+	// GatePhasePreMerge runs the gate before the squash merge (default).
+	// The gate validates the source branch on the target baseline.
+	GatePhasePreMerge GatePhase = "pre-merge"
+
+	// GatePhasePostSquash runs the gate after the squash merge but before push.
+	// The gate validates the actual combined code, catching issues that only
+	// manifest in the merged result (broken imports, boot failures, missing
+	// templates). On failure, the merge is reset.
+	GatePhasePostSquash GatePhase = "post-squash"
+)
+
 type GateConfig struct {
 	// Cmd is the shell command to execute.
 	Cmd string `json:"cmd"`
@@ -54,6 +89,12 @@ type GateConfig struct {
 	// Timeout is the maximum time the gate command may run.
 	// Zero means no timeout (inherits context deadline).
 	Timeout time.Duration `json:"timeout"`
+
+	// Phase controls when this gate runs: "pre-merge" (default) or "post-squash".
+	// Pre-merge gates run before the squash merge on the source branch.
+	// Post-squash gates run after the squash merge on the combined result,
+	// before pushing. On post-squash failure, the merge is reset.
+	Phase GatePhase `json:"phase"`
 }
 
 // GateResult holds the outcome of a single gate execution.
@@ -124,6 +165,26 @@ type MergeQueueConfig struct {
 	// before escalation to Mayor.
 	MaxRetryCount int `json:"max_retry_count"`
 
+	// AutoPush controls whether the refinery pushes to origin after merging.
+	// When false, the refinery merges locally but does not push — the user
+	// or a separate process handles pushing. Useful to avoid triggering
+	// CI/CD builds (e.g. Vercel) on every merge.
+	AutoPush bool `json:"auto_push"`
+
+	// MergeStrategy controls how the refinery lands work: "direct" (default)
+	// does local squash merge + git push; "pr" uses the VCS provider's merge API
+	// which respects branch protection/restriction rules.
+	MergeStrategy string `json:"merge_strategy,omitempty"`
+
+	// VCSProvider selects the VCS platform for PR operations when
+	// MergeStrategy="pr". Valid values: "github" (default), "bitbucket".
+	VCSProvider string `json:"vcs_provider,omitempty"`
+
+	// RequireReview controls whether the refinery requires at least one approving
+	// review before merging a PR. Only meaningful when MergeStrategy="pr".
+	// Nil defaults to false (no review required).
+	RequireReview *bool `json:"require_review,omitempty"`
+
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
@@ -145,6 +206,7 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		StaleClaimWarningAfter:  2 * time.Hour,
 		StaleClaimCriticalAfter: 6 * time.Hour,
 		MaxRetryCount:           5,
+		AutoPush:                true,
 	}
 }
 
@@ -208,6 +270,7 @@ type Engineer struct {
 	beads                 *beads.Beads
 	git                   *git.Git
 	config                *MergeQueueConfig
+	prProvider            PRProvider   // VCS-specific PR operations (nil when MergeStrategy != "pr")
 	workDir               string
 	output                io.Writer    // Output destination for user-facing messages
 	router                *mail.Router // Mail router for sending protocol messages
@@ -298,6 +361,10 @@ func (e *Engineer) LoadConfig() error {
 		StaleClaimTimeout    *string                    `json:"stale_claim_timeout"`
 		Gates                map[string]*gateConfigRaw  `json:"gates"`
 		GatesParallel        *bool                      `json:"gates_parallel"`
+		AutoPush             *bool                      `json:"auto_push"`
+		MergeStrategy        *string                    `json:"merge_strategy"`
+		VCSProvider          *string                    `json:"vcs_provider"`
+		RequireReview        *bool                      `json:"require_review"`
 	}
 
 	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
@@ -359,13 +426,58 @@ func (e *Engineer) LoadConfig() error {
 				}
 				gc.Timeout = dur
 			}
+			switch raw.Phase {
+			case "", "pre-merge":
+				gc.Phase = GatePhasePreMerge
+			case "post-squash":
+				gc.Phase = GatePhasePostSquash
+			default:
+				return fmt.Errorf("gate %q has invalid phase %q: must be \"pre-merge\" or \"post-squash\"", name, raw.Phase)
+			}
 			e.config.Gates[name] = gc
 		}
 	}
 	if mqRaw.GatesParallel != nil {
 		e.config.GatesParallel = *mqRaw.GatesParallel
 	}
+	if mqRaw.AutoPush != nil {
+		e.config.AutoPush = *mqRaw.AutoPush
+	}
+	if mqRaw.MergeStrategy != nil {
+		e.config.MergeStrategy = *mqRaw.MergeStrategy
+	}
+	if mqRaw.VCSProvider != nil {
+		e.config.VCSProvider = *mqRaw.VCSProvider
+	}
+	if mqRaw.RequireReview != nil {
+		e.config.RequireReview = mqRaw.RequireReview
+	}
 
+	// Initialize the PR provider when merge_strategy=pr.
+	if e.config.MergeStrategy == "pr" {
+		if err := e.initPRProvider(); err != nil {
+			return fmt.Errorf("initializing PR provider: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// initPRProvider creates the appropriate PRProvider based on vcs_provider config.
+// Defaults to GitHub when vcs_provider is empty or "github".
+func (e *Engineer) initPRProvider() error {
+	switch e.config.VCSProvider {
+	case "", "github":
+		e.prProvider = newGitHubPRProvider(e.git)
+	case "bitbucket":
+		p, err := newBitbucketPRProvider(e.git)
+		if err != nil {
+			return err
+		}
+		e.prProvider = p
+	default:
+		return fmt.Errorf("unknown vcs_provider %q (supported: github, bitbucket)", e.config.VCSProvider)
+	}
 	return nil
 }
 
@@ -374,6 +486,7 @@ func (e *Engineer) LoadConfig() error {
 type gateConfigRaw struct {
 	Cmd     string `json:"cmd"`
 	Timeout string `json:"timeout"`
+	Phase   string `json:"phase"`
 }
 
 // Config returns the current merge queue configuration.
@@ -383,16 +496,31 @@ func (e *Engineer) Config() *MergeQueueConfig {
 
 // ProcessResult contains the result of processing a merge request.
 type ProcessResult struct {
-	Success     bool
-	MergeCommit string
-	Error       string
-	Conflict    bool
-	TestsFailed bool
-	SlotTimeout bool // Merge slot contention timeout (distinct from build/test failure)
+	Success        bool
+	MergeCommit    string
+	Error          string
+	Conflict       bool
+	TestsFailed    bool
+	SlotTimeout    bool // Merge slot contention timeout (distinct from build/test failure)
+	BranchNotFound bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
+	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
+	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
 }
 
 // doMerge performs the actual git merge operation.
 func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue string, skipGates ...bool) ProcessResult {
+	// GH#2778: Check no_merge flag on source issue before merging. The polecat
+	// normally skips MR creation when no_merge is set, but if an MR is created
+	// manually (e.g., gh pr create) the refinery would otherwise auto-merge it.
+	if sourceIssue != "" {
+		if si, err := e.beads.Show(sourceIssue); err == nil && si != nil {
+			if af := beads.ParseAttachmentFields(si); af != nil && af.NoMerge {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue %s has no_merge=true — skipping merge\n", sourceIssue)
+				return ProcessResult{NoMerge: true, Error: "no_merge flag set on source issue"}
+			}
+		}
+	}
+
 	// Step 1: Verify source branch exists locally (shared .repo.git with polecats)
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking local branch %s...\n", branch)
 	exists, err := e.git.BranchExists(branch)
@@ -404,8 +532,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 	if !exists {
 		return ProcessResult{
-			Success: false,
-			Error:   fmt.Sprintf("branch %s not found locally", branch),
+			Success:        false,
+			BranchNotFound: true,
+			Error:          fmt.Sprintf("branch %s not found locally", branch),
 		}
 	}
 
@@ -451,7 +580,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 	if len(subChanges) > 0 {
 		// Ensure submodules are initialized in the refinery worktree
-		if initErr := git.InitSubmodules(e.git.WorkDir()); initErr != nil {
+		// Use mayor/rig as reference to avoid re-fetching from remote
+		mayorRig := filepath.Join(e.rig.Path, "mayor", "rig")
+		if initErr := git.InitSubmodules(e.git.WorkDir(), mayorRig); initErr != nil {
 			return ProcessResult{
 				Success: false,
 				Error:   fmt.Sprintf("failed to init submodules in refinery worktree: %v", initErr),
@@ -461,7 +592,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			if sc.NewSHA == "" {
 				continue // Submodule removed, nothing to push
 			}
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing submodule %s (commit %s)...\n", sc.Path, sc.NewSHA[:8])
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing submodule %s (commit %s)...\n", sc.Path, shortSHA(sc.NewSHA))
 			if pushErr := e.git.PushSubmoduleCommit(sc.Path, sc.NewSHA, "origin"); pushErr != nil {
 				return ProcessResult{
 					Success: false,
@@ -498,6 +629,14 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Tests passed")
 	}
 
+	// PR merge path: when merge_strategy=pr, use the VCS provider's merge API
+	// instead of local squash merge + direct push. This respects branch
+	// protection/restriction rules and preserves the PR audit trail.
+	// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
+	if e.config.MergeStrategy == "pr" {
+		return e.doMergePR(ctx, branch, target)
+	}
+
 	// Step 5: Perform the actual merge using squash merge
 	// Get the original commit message from the polecat branch to preserve the
 	// conventional commit format (feat:/fix:) instead of creating redundant merge commits
@@ -531,6 +670,19 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 	}
 
+	// Step 5.5: Run post-squash gates on the merged result.
+	// These validate the actual combined code before it goes anywhere.
+	// On failure, reset the merge to undo the local squash commit.
+	if !shouldSkipGates {
+		postResult := e.runGatesForPhase(ctx, GatePhasePostSquash)
+		if !postResult.Success {
+			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after post-squash gate failure: %v\n", target, resetErr)
+			}
+			return postResult
+		}
+	}
+
 	// Step 6: Get the merge commit SHA
 	mergeCommit, err := e.git.Rev("HEAD")
 	if err != nil {
@@ -540,59 +692,152 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 	}
 
-	// Step 7: Acquire merge slot before push to serialize writes to the default branch.
-	// Only serialize pushes to the rig's default branch (typically main).
-	// Integration-branch and feature-branch pushes don't need serialization.
-	var pushHolder string
-	if target == e.rig.DefaultBranch() {
-		var slotErr error
-		pushHolder, slotErr = e.acquireMainPushSlot(ctx)
-		if slotErr != nil {
-			// Reset the checked-out target branch to origin to undo the local squash commit.
-			// ResetHard is required because target is the current branch (checked out in Step 2).
-			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after slot failure: %v\n", target, resetErr)
-			}
-			// Only classify as SlotTimeout for actual contention (retries exhausted).
-			// Infrastructure errors (beads down, permission errors) should surface
-			// through the normal failure/notification path for operator visibility.
-			return ProcessResult{
-				Success:     false,
-				SlotTimeout: errors.Is(slotErr, errMergeSlotTimeout),
-				Error:       fmt.Sprintf("failed to acquire merge slot before push: %v", slotErr),
-			}
-		}
-		defer func() {
-			// pushHolder is empty when the self-conflict bypass fires — conflict-resolution
-			// owns the slot, so we must not release it here.
-			if pushHolder != "" {
-				if releaseErr := e.mergeSlotRelease(pushHolder); releaseErr != nil {
-					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to release merge slot for push (%s): %v\n", pushHolder, releaseErr)
+	// Step 7-8: Push to origin (when auto_push is enabled).
+	if e.config.AutoPush {
+		// Acquire merge slot before push to serialize writes to the default branch.
+		// Only serialize pushes to the rig's default branch (typically main).
+		// Integration-branch and feature-branch pushes don't need serialization.
+		var pushHolder string
+		if target == e.rig.DefaultBranch() {
+			var slotErr error
+			pushHolder, slotErr = e.acquireMainPushSlot(ctx)
+			if slotErr != nil {
+				// Reset the checked-out target branch to origin to undo the local squash commit.
+				// ResetHard is required because target is the current branch (checked out in Step 2).
+				if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after slot failure: %v\n", target, resetErr)
+				}
+				// Only classify as SlotTimeout for actual contention (retries exhausted).
+				// Infrastructure errors (beads down, permission errors) should surface
+				// through the normal failure/notification path for operator visibility.
+				return ProcessResult{
+					Success:     false,
+					SlotTimeout: errors.Is(slotErr, errMergeSlotTimeout),
+					Error:       fmt.Sprintf("failed to acquire merge slot before push: %v", slotErr),
 				}
 			}
-		}()
+			defer func() {
+				// pushHolder is empty when the self-conflict bypass fires — conflict-resolution
+				// owns the slot, so we must not release it here.
+				if pushHolder != "" {
+					if releaseErr := e.mergeSlotRelease(pushHolder); releaseErr != nil {
+						_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to release merge slot for push (%s): %v\n", pushHolder, releaseErr)
+					}
+				}
+			}()
+		}
+
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing to origin/%s...\n", target)
+		if err := e.git.Push("origin", target, false); err != nil {
+			// Reset the checked-out target branch to undo the local squash commit.
+			// Without this, the next retry could see stale local state from the failed push.
+			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after push failure: %v\n", target, resetErr)
+			}
+			return ProcessResult{
+				Success: false,
+				Error:   fmt.Sprintf("failed to push to origin: %v", err),
+			}
+		}
+	} else {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Auto-push disabled, skipping push to origin/%s\n", target)
 	}
 
-	// Step 8: Push to origin
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing to origin/%s...\n", target)
-	if err := e.git.Push("origin", target, false); err != nil {
-		// Reset the checked-out target branch to undo the local squash commit.
-		// Without this, the next retry could see stale local state from the failed push.
-		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after push failure: %v\n", target, resetErr)
-		}
-		return ProcessResult{
-			Success: false,
-			Error:   fmt.Sprintf("failed to push to origin: %v", err),
-		}
-	}
-
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged: %s\n", mergeCommit[:8])
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged: %s\n", shortSHA(mergeCommit))
 	return ProcessResult{
 		Success:     true,
 		MergeCommit: mergeCommit,
 	}
 }
+
+// doMergePR handles merging via the VCS provider's PR merge API (merge_strategy=pr).
+// This respects branch protection/restriction rules including required reviews.
+// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
+// Called from doMerge after quality gates have passed.
+//
+//nolint:unparam // ctx is reserved for future use when git methods accept context
+func (e *Engineer) doMergePR(ctx context.Context, branch, target string) ProcessResult {
+	_ = ctx
+	provider := e.config.VCSProvider
+	if provider == "" {
+		provider = "github"
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Using PR merge strategy (vcs_provider=%s)\n", provider)
+
+	if e.prProvider == nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("no PR provider configured for vcs_provider=%s", provider),
+		}
+	}
+
+	// Step PR.1: Find the PR for this branch
+	prNumber, err := e.prProvider.FindPRNumber(branch)
+	if err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("failed to find PR for branch %s: %v", branch, err),
+		}
+	}
+	if prNumber == 0 {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("no open PR found for branch %s — merge_strategy=pr requires a PR", branch),
+		}
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
+
+	// Step PR.2: Check approval status if require_review is enabled
+	requireReview := e.config.RequireReview != nil && *e.config.RequireReview
+	if requireReview {
+		approved, err := e.prProvider.IsPRApproved(prNumber)
+		if err != nil {
+			return ProcessResult{
+				Success: false,
+				Error:   fmt.Sprintf("failed to check PR #%d approval status: %v", prNumber, err),
+			}
+		}
+		if !approved {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting human approval — deferring merge\n", prNumber)
+			return ProcessResult{
+				Success:       false,
+				NeedsApproval: true,
+				Error:         fmt.Sprintf("PR #%d requires approving review before merge", prNumber),
+			}
+		}
+		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", prNumber)
+	}
+
+	// Step PR.3: Merge via VCS provider API using squash merge
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (squash)...\n", prNumber, provider)
+	mergeCommit, err := e.prProvider.MergePR(prNumber, "squash")
+	if err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("PR merge failed for PR #%d: %v", prNumber, err),
+		}
+	}
+
+	// Step PR.4: Sync local target branch after remote merge
+	if err := e.git.Checkout(target); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to checkout %s after PR merge: %v\n", target, err)
+	} else if err := e.git.Pull("origin", target); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to pull %s after PR merge: %v\n", target, err)
+	}
+
+	if mergeCommit == "" {
+		if sha, err := e.git.Rev("HEAD"); err == nil {
+			mergeCommit = sha
+		}
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Successfully merged PR #%d: %s\n", prNumber, shortSHA(mergeCommit))
+	return ProcessResult{
+		Success:     true,
+		MergeCommit: mergeCommit,
+	}
+}
+
 
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
 	slotID, err := e.mergeSlotEnsureExists()
@@ -682,6 +927,7 @@ func (e *Engineer) runTests(ctx context.Context) ProcessResult {
 		// is intentional for flexibility (pipes, env vars, etc).
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Executing test command: %s\n", e.config.TestCommand)
 		cmd := exec.CommandContext(ctx, "sh", "-c", e.config.TestCommand) //nolint:gosec // G204: TestCommand is from trusted rig config
+		util.SetDetachedProcessGroup(cmd)
 		cmd.Dir = e.workDir
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -731,6 +977,7 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	}
 
 	cmd := exec.CommandContext(gateCtx, "sh", "-c", gate.Cmd) //nolint:gosec // G204: Gate commands are from trusted rig config
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = e.workDir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -767,11 +1014,26 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	}
 }
 
-// runGates executes all configured quality gates and returns a ProcessResult.
+// runGates executes all pre-merge gates (backward-compatible entry point).
+func (e *Engineer) runGates(ctx context.Context) ProcessResult {
+	return e.runGatesForPhase(ctx, GatePhasePreMerge)
+}
+
+// runGatesForPhase executes gates matching the given phase.
 // Gates run in parallel if GatesParallel is true; otherwise sequentially.
 // Any single gate failure means overall failure.
-func (e *Engineer) runGates(ctx context.Context) ProcessResult {
-	gates := e.config.Gates
+func (e *Engineer) runGatesForPhase(ctx context.Context, phase GatePhase) ProcessResult {
+	// Filter gates for this phase. Empty phase is treated as pre-merge (default).
+	gates := make(map[string]*GateConfig)
+	for name, gc := range e.config.Gates {
+		gatePhase := gc.Phase
+		if gatePhase == "" {
+			gatePhase = GatePhasePreMerge
+		}
+		if gatePhase == phase {
+			gates[name] = gc
+		}
+	}
 	if len(gates) == 0 {
 		return ProcessResult{Success: true}
 	}
@@ -783,11 +1045,12 @@ func (e *Engineer) runGates(ctx context.Context) ProcessResult {
 	}
 	sort.Strings(names)
 
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Running %d quality gate(s) (parallel=%v)\n", len(names), e.config.GatesParallel)
+	parallel := e.config.GatesParallel && phase == GatePhasePreMerge // post-squash always sequential
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Running %d %s gate(s) (parallel=%v)\n", len(names), phase, parallel)
 
 	var results []GateResult
 
-	if e.config.GatesParallel {
+	if parallel {
 		results = make([]GateResult, len(names))
 		var wg sync.WaitGroup
 		for i, name := range names {
@@ -939,11 +1202,19 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
-	// 1. Close source issue with reference to MR
+	// 1. Close source issue with reference to MR.
+	// Use ForceCloseWithReason to bypass dependency checks — the source issue
+	// may have an attached molecule (wisp) whose open steps would block a
+	// normal close. This matches how gt done handles closures.
 	if mr.SourceIssue != "" {
 		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-		if err := e.beads.CloseWithReason(closeReason, mr.SourceIssue); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
+		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
+			// Check if already closed (by polecat's gt done) — that's fine
+			if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
+			}
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed source issue: %s\n", mr.SourceIssue)
 		}
@@ -956,17 +1227,32 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
-	// 2. Delete source branch if configured (local and remote)
-	if e.config.DeleteMergedBranches && mr.Branch != "" {
+	// 2. Delete source branch (local and remote).
+	// Polecat branches (polecat/*) are always cleaned up — they are ephemeral
+	// work branches that should never persist after merge. Other branches
+	// respect the DeleteMergedBranches config.
+	isPolecat := strings.HasPrefix(mr.Branch, "polecat/")
+	if mr.Branch != "" && (e.config.DeleteMergedBranches || isPolecat) {
 		if err := e.git.DeleteBranch(mr.Branch, true); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete local branch %s: %v\n", mr.Branch, err)
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted local branch: %s\n", mr.Branch)
 		}
-		if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
+		// Remote delete — only polecat branches. Non-polecat branches may belong
+		// to contributor forks with open upstream PRs; deleting them from origin
+		// causes GitHub to auto-close those PRs via head_ref_delete. (GH#2669)
+		// gas-fk4: Also skip deletion for polecat branches that have open PRs.
+		// When merge_strategy=pr, polecat branches have GitHub PRs that should
+		// be closed via gh pr merge (showing "merged"), not via branch deletion
+		// (which shows "closed" and destroys the PR audit trail).
+		if isPolecat {
+			if e.git.HasOpenPR(mr.Branch) {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", mr.Branch)
+			} else if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
+			}
 		}
 	}
 
@@ -975,7 +1261,18 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// Run convoy check to auto-close and notify subscribers.
 	e.postMergeConvoyCheck(mr)
 
-	// 4. Log success
+	// 4. Nudge mayor about successful merge so dispatcher can unblock
+	// dependent work. Without this, mayor only discovers completion by polling.
+	// Uses nudge (not mail) to avoid permanent Dolt commits for routine signals (GH#2434).
+	nudgeMsg := fmt.Sprintf("MERGED: %s issue=%s branch=%s", mr.ID, mr.SourceIssue, mr.Branch)
+	nudgeCmd := exec.Command("gt", "nudge", "mayor/", nudgeMsg)
+	util.SetDetachedProcessGroup(nudgeCmd)
+	nudgeCmd.Dir = e.workDir
+	if err := nudgeCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about merge: %v\n", err)
+	}
+
+	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
 }
 
@@ -990,6 +1287,37 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	if result.SlotTimeout {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] ✗ Slot timeout: %s - %s\n", mr.ID, result.Error)
 		_, _ = fmt.Fprintln(e.output, "[Engineer] MR remains in queue for automatic retry (slot contention)")
+		return
+	}
+
+	// No-merge is intentional — the source issue has no_merge=true. Not a failure.
+	// No polecat or mayor notification needed; the MR is simply dequeued.
+	if result.NoMerge {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: no_merge flag set on source issue, dequeued\n", mr.ID)
+		return
+	}
+
+	// NeedsApproval: PR exists but lacks required approving review (merge_strategy=pr).
+	// Not a failure — the MR stays in queue and will be retried on the next poll.
+	// No polecat notification needed; the PR just needs a human review on GitHub.
+	if result.NeedsApproval {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR awaiting human approval, will retry next poll\n", mr.ID)
+		return
+	}
+
+	// Branch-not-found: the remote branch doesn't exist. This can mean either
+	// the branch was cleanly cherry-picked to target, OR the polecat's work was
+	// lost (e.g., worktree in /tmp wiped by reboot before gt done pushed).
+	// Escalate to mayor so lost work can be re-dispatched (gas-556).
+	if result.BranchNotFound {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: branch %s not found on remote — escalating to mayor (possible work loss)\n", mr.ID, mr.Branch)
+		mayorMsg := fmt.Sprintf("BRANCH_MISSING: MR %s branch=%s issue=%s worker=%s — branch not on origin, work may be lost; re-dispatch if needed",
+			mr.ID, mr.Branch, mr.SourceIssue, mr.Worker)
+		mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
+		mayorCmd.Dir = e.workDir
+		if err := mayorCmd.Run(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about missing branch: %v\n", err)
+		}
 		return
 	}
 
@@ -1008,11 +1336,22 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	nudgeMsg := fmt.Sprintf("MERGE_FAILED: branch=%s issue=%s type=%s error=%s — fix and resubmit with 'gt done'",
 		mr.Branch, mr.SourceIssue, failureType, result.Error)
 	nudgeCmd := exec.Command("gt", "nudge", nudgeTarget, nudgeMsg)
+	util.SetDetachedProcessGroup(nudgeCmd)
 	nudgeCmd.Dir = e.workDir
 	if err := nudgeCmd.Run(); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about merge failure: %v\n", polecatName, err)
 	} else {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about merge failure (%s)\n", polecatName, failureType)
+	}
+
+	// Nudge mayor about merge failure so dispatcher can unblock or reassign
+	// dependent work immediately. Mirrors the success nudge in HandleMRInfoSuccess.
+	mayorMsg := fmt.Sprintf("MERGE_FAILED: %s issue=%s branch=%s type=%s", mr.ID, mr.SourceIssue, mr.Branch, failureType)
+	mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
+	util.SetDetachedProcessGroup(mayorCmd)
+	mayorCmd.Dir = e.workDir
+	if err := mayorCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about merge failure: %v\n", err)
 	}
 
 	// If this was a conflict, create a conflict-resolution task for dispatch
@@ -1135,7 +1474,7 @@ The Refinery will automatically retry the merge after you force-push.`,
 		mr.Branch,
 		mr.ID,
 		mr.Branch,
-		mr.Target, mainSHA[:8],
+		mr.Target, shortSHA(mainSHA),
 		mr.SourceIssue,
 		retryCount,
 		mr.Branch,
@@ -1146,14 +1485,21 @@ The Refinery will automatically retry the merge after you force-push.`,
 	taskTitle := fmt.Sprintf("Resolve merge conflicts: %s", originalTitle)
 	task, err := e.beads.Create(beads.CreateOptions{
 		Title:       taskTitle,
-		Type:        "task",
+		Labels:      []string{"gt:task"},
 		Priority:    mr.Priority,
 		Description: description,
 		Actor:       e.rig.Name + "/refinery",
+		Rig:         e.rig.Name, // Ensure task lands in the rig's database (gt-7y7)
 	})
 	if err != nil {
 		releaseSlotOnError()
 		return "", fmt.Errorf("creating conflict resolution task: %w", err)
+	}
+
+	// gt-gpy: Validate task bead landed in the rig's database (warning only).
+	townRoot := filepath.Dir(e.rig.Path)
+	if prefixErr := beads.ValidateRigPrefix(townRoot, e.rig.Name, task.ID); prefixErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] WARNING: conflict task prefix mismatch: %v\n", prefixErr)
 	}
 
 	// The conflict task's ID is returned so the MR can be blocked on it.
@@ -1254,7 +1600,7 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 	// Query beads for all open merge-request issues.
 	// Cannot use ReadyWithType here because bd ready excludes ephemeral beads,
 	// and MRs are ephemeral by design. Use List + manual blocker check instead.
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1, // No priority filter
@@ -1289,6 +1635,11 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 			continue // Skip issues without MR fields
 		}
 
+		// Filter by rig — wisps are shared across all rigs (GH#2718).
+		if fields.Rig != "" && !strings.EqualFold(fields.Rig, e.rig.Name) {
+			continue
+		}
+
 		// Skip if already assigned, unless claim is stale (allows re-claim after crash).
 		// NOTE: Only one refinery runs per rig (enforced by ErrAlreadyRunning in
 		// manager.go), so concurrent re-claim race conditions are not a concern.
@@ -1317,7 +1668,7 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 // This queries beads for blocked merge-request issues.
 func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 	// Query all merge-request issues (both ready and blocked)
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1, // No priority filter
@@ -1345,6 +1696,11 @@ func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 			continue
 		}
 
+		// Filter by rig — wisps are shared across all rigs (GH#2718).
+		if fields.Rig != "" && !strings.EqualFold(fields.Rig, e.rig.Name) {
+			continue
+		}
+
 		mr := issueToMRInfo(issue, fields)
 		mr.BlockedBy = blockedBy
 		mrs = append(mrs, mr)
@@ -1359,7 +1715,7 @@ func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 // so agents can detect orphaned MRs. Designed for agent-side queue health analysis
 // (ZFC: Go transports data, agent decides what's interesting).
 func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1,
@@ -1379,6 +1735,11 @@ func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
 			continue
 		}
 
+		// Filter by rig — wisps are shared across all rigs (GH#2718).
+		if fields.Rig != "" && !strings.EqualFold(fields.Rig, e.rig.Name) {
+			continue
+		}
+
 		mr := issueToMRInfo(issue, fields)
 
 		// Check branch existence (local + remote tracking refs)
@@ -1395,7 +1756,7 @@ func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
 // ListQueueAnomalies finds stale claims and orphaned branches in open MRs.
 // This gives Witness/Refinery patrols deterministic signals for deadlock risk.
 func (e *Engineer) ListQueueAnomalies(now time.Time) ([]*MRAnomaly, error) {
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1,
@@ -1404,7 +1765,17 @@ func (e *Engineer) ListQueueAnomalies(now time.Time) ([]*MRAnomaly, error) {
 		return nil, fmt.Errorf("querying beads for merge-requests: %w", err)
 	}
 
-	return detectQueueAnomalies(issues, now, e.config.StaleClaimWarningAfter, func(branch string) (bool, bool, error) {
+	// Filter by rig — wisps are shared across all rigs (GH#2718).
+	filtered := make([]*beads.Issue, 0, len(issues))
+	for _, issue := range issues {
+		fields := beads.ParseMRFields(issue)
+		if fields != nil && fields.Rig != "" && !strings.EqualFold(fields.Rig, e.rig.Name) {
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+
+	return detectQueueAnomalies(filtered, now, e.config.StaleClaimWarningAfter, func(branch string) (bool, bool, error) {
 		localExists, err := e.git.BranchExists(branch)
 		if err != nil {
 			return false, false, err
@@ -1543,6 +1914,7 @@ func (e *Engineer) notifyDeaconConvoyFeeding(mr *MRInfo) {
 	// this nudge just accelerates discovery.
 	nudgeMsg := fmt.Sprintf("CONVOY_NEEDS_FEEDING: convoy=%s issue=%s", mr.ConvoyID, mr.SourceIssue)
 	nudgeCmd := exec.Command("gt", "nudge", "deacon", nudgeMsg)
+	util.SetDetachedProcessGroup(nudgeCmd)
 	nudgeCmd.Dir = e.workDir
 	if err := nudgeCmd.Run(); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge deacon about convoy feeding for %s: %v\n", mr.ConvoyID, err)
@@ -1564,9 +1936,14 @@ type convoyInfo struct {
 // checkAndCloseCompletedConvoys finds and closes convoys where all tracked issues
 // are complete. Returns the list of convoys that were closed.
 func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []convoyInfo {
+	bdEnv := stripEnvKey(os.Environ(), "BEADS_DIR")
+
 	// List all open convoys
-	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json")
+	listArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"list", "--type=convoy", "--status=open", "--json"})
+	listCmd := exec.Command("bd", listArgs...)
+	util.SetDetachedProcessGroup(listCmd)
 	listCmd.Dir = townBeads
+	listCmd.Env = bdEnv
 	var stdout bytes.Buffer
 	listCmd.Stdout = &stdout
 
@@ -1590,8 +1967,11 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 
 	for _, convoy := range convoys {
 		// Get tracked issues for this convoy via bd dep list
-		depCmd := exec.Command("bd", "dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json")
+		depArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
+		depCmd := exec.Command("bd", depArgs...)
+		util.SetDetachedProcessGroup(depCmd)
 		depCmd.Dir = townRoot
+		depCmd.Env = bdEnv
 		var depOut bytes.Buffer
 		depCmd.Stdout = &depOut
 
@@ -1620,8 +2000,11 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			}
 
 			// Get fresh status from home rig via bd show with routing
-			showCmd := exec.Command("bd", "show", depID, "--json")
+			showArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"show", depID, "--json"})
+			showCmd := exec.Command("bd", showArgs...)
+			util.SetDetachedProcessGroup(showCmd)
 			showCmd.Dir = townRoot
+			showCmd.Env = bdEnv
 			var showOut bytes.Buffer
 			showCmd.Stdout = &showOut
 
@@ -1655,8 +2038,11 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			reason = "Empty convoy — auto-closed as definitionally complete"
 		}
 
-		closeCmd := exec.Command("bd", "close", convoy.ID, "-r", reason)
+		closeArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"close", convoy.ID, "-r", reason})
+		closeCmd := exec.Command("bd", closeArgs...)
+		util.SetDetachedProcessGroup(closeCmd)
 		closeCmd.Dir = townBeads
+		closeCmd.Env = bdEnv
 
 		if err := closeCmd.Run(); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close convoy %s: %v\n", convoy.ID, err)
@@ -1685,6 +2071,7 @@ func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description
 		mailCmd := exec.Command("gt", "mail", "send", addr,
 			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
 			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery", convoyID, e.rig.Name))
+		util.SetDetachedProcessGroup(mailCmd)
 		mailCmd.Dir = townRoot
 		if err := mailCmd.Run(); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not notify %s: %v\n", addr, err)
@@ -1721,6 +2108,7 @@ func (e *Engineer) landConvoySwarm(townRoot string, convoy convoyInfo) {
 
 	// Use gt swarm land to perform the landing
 	landCmd := exec.Command("gt", "swarm", "land", moleculeID)
+	util.SetDetachedProcessGroup(landCmd)
 	landCmd.Dir = townRoot
 	var landOut, landErr bytes.Buffer
 	landCmd.Stdout = &landOut

@@ -121,7 +121,7 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 			style.Dim.Render(msg.ID),
 			msg.From)
 		fmt.Printf("      %s\n",
-			style.Dim.Render(msg.Timestamp.Format("2006-01-02 15:04")))
+			style.Dim.Render(msg.Timestamp.Local().Format("2006-01-02 15:04")))
 	}
 
 	// Ack after output so human-readable display is not delayed by bd subprocesses.
@@ -205,7 +205,7 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s %s%s%s\n\n", style.Bold.Render("Subject:"), msg.Subject, typeStr, priorityStr)
 	fmt.Printf("From: %s\n", msg.From)
 	fmt.Printf("To: %s\n", msg.To)
-	fmt.Printf("Date: %s\n", msg.Timestamp.Format("2006-01-02 15:04:05"))
+	fmt.Printf("Date: %s\n", msg.Timestamp.Local().Format("2006-01-02 15:04:05"))
 	fmt.Printf("ID: %s\n", style.Dim.Render(msg.ID))
 
 	if msg.ThreadID != "" {
@@ -459,6 +459,35 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 	mailbox, err := getMailbox(address)
 	if err != nil {
 		return err
+	}
+
+	// --all: mark all unread messages as read
+	if mailMarkReadAll {
+		if len(args) > 0 {
+			return fmt.Errorf("--all cannot be combined with explicit message IDs")
+		}
+		messages, err := mailbox.ListUnread()
+		if err != nil {
+			return fmt.Errorf("listing unread messages: %w", err)
+		}
+		if len(messages) == 0 {
+			fmt.Printf("%s No unread messages\n", style.Bold.Render("✓"))
+			return nil
+		}
+		marked := 0
+		for _, msg := range messages {
+			if err := mailbox.MarkReadOnly(msg.ID); err != nil {
+				style.PrintWarning("could not mark %s as read: %v", msg.ID, err)
+			} else {
+				marked++
+			}
+		}
+		fmt.Printf("%s Marked %d messages as read\n", style.Bold.Render("✓"), marked)
+		return nil
+	}
+
+	if len(args) == 0 {
+		return fmt.Errorf("message ID required (or use --all to mark all as read)")
 	}
 
 	// Mark all specified messages as read

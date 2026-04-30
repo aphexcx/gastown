@@ -12,7 +12,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -372,10 +374,11 @@ func runHook(_ *cobra.Command, args []string) error {
 	const hookBackoffMax = 10 * time.Second
 	var lastHookErr error
 	for attempt := 1; attempt <= hookMaxRetries; attempt++ {
-		hookBdCmd := exec.Command("bd", "update", beadID, "--status=hooked", "--assignee="+agentID)
-		hookBdCmd.Dir = townRoot
-		hookBdCmd.Stderr = os.Stderr
-		if err := hookBdCmd.Run(); err != nil {
+		if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
+			Dir(resolveBeadDir(beadID)).
+			StripBeadsDir().
+			WithAutoCommit().
+			Run(); err != nil {
 			lastHookErr = err
 			if attempt < hookMaxRetries {
 				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
@@ -386,6 +389,20 @@ func runHook(_ *cobra.Command, args []string) error {
 			return fmt.Errorf("hooking bead after %d attempts: %w", hookMaxRetries, lastHookErr)
 		}
 		break
+	}
+
+	// Emit a propulsion signal if the target is the mayor.
+	// This allows the ACP propeller to react to hook changes event-driven.
+	if agentID == "mayor/" {
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			session := "hq-mayor"
+			message := fmt.Sprintf("Hook updated: attached bead %s", beadID)
+			_ = nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+				Sender:   "hook",
+				Message:  message,
+				Priority: nudge.PriorityNormal,
+			})
+		}
 	}
 
 	if targetAgent != "" {
@@ -444,7 +461,7 @@ func checkPinnedBeadComplete(b *beads.Beads, issue *beads.Issue) (isComplete boo
 func runHookShow(cmd *cobra.Command, args []string) error {
 	var target string
 	if len(args) > 0 {
-		target = args[0]
+		target = normalizeHookShowTarget(args[0])
 	} else {
 		// Auto-detect current agent from context
 		agentID, _, _, err := resolveSelfTarget()
@@ -454,10 +471,30 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		target = agentID
 	}
 
-	// Find beads directory
+	// Find beads directory.
+	// For remote rig-level targets (e.g. "myndy_monorepo/refinery"), resolve the
+	// rig's actual beads dir using the same rig-aware routing as runHook (attach).
+	// Without this, gt hook show always queries whatever DB is local (typically HQ),
+	// missing wisps stored in the target rig's database.
 	workDir, err := findLocalBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
+	}
+	if len(args) > 0 && !isTownLevelRole(target) {
+		townRoot, townErr := workspace.FindFromCwd()
+		if townErr == nil && townRoot != "" {
+			agentBeadID := agentIDToBeadID(target, townRoot)
+			if agentBeadID != "" {
+				rigName := strings.Split(target, "/")[0]
+				var fallbackPath string
+				if rigName == "mayor" || rigName == "deacon" {
+					fallbackPath = townRoot
+				} else {
+					fallbackPath = filepath.Join(townRoot, rigName, "mayor", "rig")
+				}
+				workDir = beads.ResolveHookDir(townRoot, agentBeadID, fallbackPath)
+			}
+		}
 	}
 
 	b := beads.New(workDir)
@@ -527,6 +564,87 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	bead := hookedBeads[0]
 	fmt.Printf("%s: %s '%s' [%s]\n", target, bead.ID, bead.Title, bead.Status)
 	return nil
+}
+
+// normalizeHookShowTarget resolves target aliases/shorthand to canonical agent IDs.
+// Examples:
+//   - "rig/polecat" -> "rig/polecats/polecat"
+//   - "mayor" -> "mayor"
+//
+// If resolution fails, it returns the original target unchanged.
+func normalizeHookShowTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return target
+	}
+
+	// Use the same role/path resolver as dispatching commands, then convert
+	// the resulting tmux session back to a canonical assignee address.
+	// This keeps "hook show" target parsing aligned with sling/hook behavior.
+	if sessionName, err := resolveRoleToSession(target); err == nil && sessionName != "" {
+		if addr, ok := sessionNameToCanonicalAddress(sessionName, target); ok {
+			return addr
+		}
+	}
+
+	// Fallback for explicit/canonical addresses when resolver couldn't help.
+	if identity, err := session.ParseAddress(target); err == nil {
+		return identity.Address()
+	}
+
+	// Direct shorthand expansion: rig/name → rig/polecats/name or rig/crew/name.
+	// This handles the case where the session name roundtrip fails due to
+	// uninitialized prefix registry. See GH#2371.
+	parts := strings.Split(target, "/")
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		name := parts[1]
+		// Check for known roles — don't expand those
+		switch strings.ToLower(name) {
+		case "witness", "refinery", "mayor", "deacon":
+			// Already a valid canonical address
+		default:
+			// Check if it's a crew member by looking for the directory
+			townRoot := detectTownRootFromCwd()
+			if townRoot != "" {
+				crewPath := filepath.Join(townRoot, parts[0], "crew", name)
+				if info, statErr := os.Stat(crewPath); statErr == nil && info.IsDir() {
+					return parts[0] + "/crew/" + name
+				}
+			}
+			// Default to polecat
+			return parts[0] + "/polecats/" + strings.ToLower(name)
+		}
+	}
+
+	return target
+}
+
+// sessionNameToCanonicalAddress maps a tmux session name to a canonical agent
+// assignee address (e.g., "gastown/polecats/toast").
+//
+// targetHint is the original user input and is used to seed a temporary
+// prefix→rig mapping for deterministic parsing in tests or minimal
+// environments where the global session registry is not initialized.
+func sessionNameToCanonicalAddress(sessionName, targetHint string) (string, bool) {
+	if identity, err := session.ParseSessionName(sessionName); err == nil {
+		return identity.Address(), true
+	}
+
+	registry := session.NewPrefixRegistry()
+	for rig, prefix := range session.DefaultRegistry().AllRigs() {
+		registry.Register(prefix, rig)
+	}
+	parts := strings.Split(strings.TrimSpace(targetHint), "/")
+	if len(parts) >= 2 && parts[0] != "" {
+		rig := parts[0]
+		registry.Register(session.PrefixFor(rig), rig)
+	}
+
+	identity, err := session.ParseSessionNameWithRegistry(sessionName, registry)
+	if err != nil {
+		return "", false
+	}
+	return identity.Address(), true
 }
 
 // findTownRoot finds the Gas Town root directory.

@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // Common errors
@@ -218,17 +220,24 @@ func (l *Lock) write(sessionID string) error {
 	return nil
 }
 
-// FindAllLocks scans a directory tree for agent.lock files.
+// FindAllLocks scans for agent.lock files, skipping large internal
+// directories (.dolt-data, .git) that are extremely slow to walk on
+// Docker bind mounts (macOS VirtioFS).
 // Returns a map of worker directory -> LockInfo.
 func FindAllLocks(root string) (map[string]*LockInfo, error) {
 	locks := make(map[string]*LockInfo)
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip errors
+			return nil
 		}
 
+		// Skip large internal directories that never contain agent locks.
 		if info.IsDir() {
+			name := info.Name()
+			if name == ".dolt-data" || name == ".dolt-backup" || name == ".git" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -290,7 +299,16 @@ func CleanStaleLocks(root string) (int, error) {
 func getActiveTmuxSessions() []string {
 	// Get both session name and ID to handle different lock formats
 	// Format: "session_name:session_id" e.g., "gt-beads-crew-dave:$55"
-	cmd := execCommand("tmux", "list-sessions", "-F", "#{session_name}:#{session_id}")
+	// Use the town's tmux socket so we query the correct server.
+	// Without -L, bare "tmux" queries the "default" socket, which misses
+	// all sessions on the per-town socket (e.g., "gt-a1b2c3") and causes
+	// CleanStaleLocks to incorrectly remove locks for active sessions.
+	args := []string{}
+	if sock := tmux.GetDefaultSocket(); sock != "" {
+		args = append(args, "-L", sock)
+	}
+	args = append(args, "list-sessions", "-F", "#{session_name}:#{session_id}")
+	cmd := execCommand("tmux", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil // tmux not running or not installed
@@ -349,6 +367,7 @@ type execCmdWrapper struct {
 
 func (c *execCmdWrapper) Output() ([]byte, error) {
 	cmd := exec.Command(c.name, c.args...) //nolint:gosec // G204: command args are controlled internally
+	setProcessGroup(cmd)
 	return cmd.Output()
 }
 

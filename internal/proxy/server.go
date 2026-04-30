@@ -201,7 +201,7 @@ func (s *Server) DenyCert(serial *big.Int) {
 	s.denyList.Deny(serial)
 }
 
-// Start begins listening and serving. Blocks until ctx is cancelled.
+// Start begins listening and serving. Blocks until ctx is canceled.
 func (s *Server) Start(ctx context.Context) error {
 	pool := x509.NewCertPool()
 	pool.AddCert(s.ca.Cert)
@@ -211,6 +211,9 @@ func (s *Server) Start(ctx context.Context) error {
 		ClientAuth: tls.RequireAndVerifyClientCert,
 		ClientCAs:  pool,
 		MinVersion: tls.VersionTLS13,
+		// Disable session tickets so resumed sessions cannot bypass the custom
+		// revocation check implemented in VerifyPeerCertificate.
+		SessionTicketsDisabled: true,
 		// VerifyPeerCertificate is called after the standard chain verification
 		// passes. We use it to check the leaf cert's serial against the deny list,
 		// so that a revoked certificate is rejected at the TLS handshake before any

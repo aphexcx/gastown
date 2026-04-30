@@ -35,6 +35,18 @@ var (
 
 	// SWARM_START - mayor initiating batch work
 	PatternSwarmStart = regexp.MustCompile(`^SWARM_START`)
+
+	// DISPATCH_ATTEMPT <polecat-name> - witness attempting to dispatch polecat to bead
+	PatternDispatchAttempt = regexp.MustCompile(`^DISPATCH_ATTEMPT\s+(\S+)`)
+
+	// DISPATCH_OK <polecat-name> - dispatch succeeded
+	PatternDispatchOK = regexp.MustCompile(`^DISPATCH_OK\s+(\S+)`)
+
+	// DISPATCH_FAIL <polecat-name> - dispatch failed
+	PatternDispatchFail = regexp.MustCompile(`^DISPATCH_FAIL\s+(\S+)`)
+
+	// IDLE_PASSIVATED <polecat-name> - polecat passivated after idle timeout
+	PatternIdlePassivated = regexp.MustCompile(`^IDLE_PASSIVATED\s+(\S+)`)
 )
 
 // ProtocolType identifies the type of protocol message.
@@ -49,6 +61,10 @@ const (
 	ProtoMergeReady        ProtocolType = "merge_ready"
 	ProtoHandoff           ProtocolType = "handoff"
 	ProtoSwarmStart        ProtocolType = "swarm_start"
+	ProtoDispatchAttempt   ProtocolType = "dispatch_attempt"
+	ProtoDispatchOK        ProtocolType = "dispatch_ok"
+	ProtoDispatchFail      ProtocolType = "dispatch_fail"
+	ProtoIdlePassivated    ProtocolType = "idle_passivated"
 	ProtoUnknown           ProtocolType = "unknown"
 )
 
@@ -90,6 +106,37 @@ type PolecatDonePayload struct {
 	Branch      string
 	Gate        string // Gate ID when Exit is PHASE_COMPLETE
 	MRFailed    bool   // True when MR bead creation was attempted but failed
+	PushFailed  bool   // True when branch push to origin failed (gas-556)
+}
+
+// HelpCategory classifies the nature of a help request for routing.
+type HelpCategory string
+
+const (
+	HelpCategoryDecision  HelpCategory = "decision"  // Multiple valid paths, need choice
+	HelpCategoryHelp      HelpCategory = "help"       // Need guidance or expertise
+	HelpCategoryBlocked   HelpCategory = "blocked"    // Waiting on unresolvable dependency
+	HelpCategoryFailed    HelpCategory = "failed"     // Unexpected error, can't proceed
+	HelpCategoryEmergency HelpCategory = "emergency"  // Security or data integrity issue
+	HelpCategoryLifecycle HelpCategory = "lifecycle"   // Worker stuck or needs recycle
+	HelpCategoryUnknown   HelpCategory = "help"        // Default to general help
+)
+
+// HelpSeverity indicates the assessed urgency of a help request.
+type HelpSeverity string
+
+const (
+	HelpSeverityCritical HelpSeverity = "critical" // P0: immediate attention
+	HelpSeverityHigh     HelpSeverity = "high"     // P1: urgent blocker
+	HelpSeverityMedium   HelpSeverity = "medium"   // P2: standard help request
+)
+
+// HelpAssessment contains the assessed category, severity, and routing suggestion.
+type HelpAssessment struct {
+	Category   HelpCategory
+	Severity   HelpSeverity
+	SuggestTo  string // Suggested escalation target (e.g., "deacon", "mayor", "overseer")
+	Rationale  string // Brief explanation of why this classification was chosen
 }
 
 // HelpPayload contains parsed data from a HELP message.
@@ -100,6 +147,7 @@ type HelpPayload struct {
 	Problem     string
 	Tried       string
 	RequestedAt time.Time
+	Assessment  *HelpAssessment // Populated by AssessHelp()
 }
 
 // MergedPayload contains parsed data from a MERGED message.
@@ -138,6 +186,35 @@ type SwarmStartPayload struct {
 	StartedAt time.Time
 }
 
+// DispatchAttemptPayload contains parsed data from a DISPATCH_ATTEMPT message.
+type DispatchAttemptPayload struct {
+	PolecatName string
+	BeadID      string
+	AttemptedAt time.Time
+}
+
+// DispatchOKPayload contains parsed data from a DISPATCH_OK message.
+type DispatchOKPayload struct {
+	PolecatName string
+	BeadID      string
+	DispatchedAt time.Time
+}
+
+// DispatchFailPayload contains parsed data from a DISPATCH_FAIL message.
+type DispatchFailPayload struct {
+	PolecatName string
+	BeadID      string
+	Reason      string
+	FailedAt    time.Time
+}
+
+// IdlePassivatedPayload contains parsed data from an IDLE_PASSIVATED message.
+type IdlePassivatedPayload struct {
+	PolecatName  string
+	IdleDuration string
+	PassivatedAt time.Time
+}
+
 // ClassifyMessage determines the protocol type from a message subject.
 func ClassifyMessage(subject string) ProtocolType {
 	switch {
@@ -157,6 +234,14 @@ func ClassifyMessage(subject string) ProtocolType {
 		return ProtoHandoff
 	case PatternSwarmStart.MatchString(subject):
 		return ProtoSwarmStart
+	case PatternDispatchAttempt.MatchString(subject):
+		return ProtoDispatchAttempt
+	case PatternDispatchOK.MatchString(subject):
+		return ProtoDispatchOK
+	case PatternDispatchFail.MatchString(subject):
+		return ProtoDispatchFail
+	case PatternIdlePassivated.MatchString(subject):
+		return ProtoIdlePassivated
 	default:
 		return ProtoUnknown
 	}
@@ -379,6 +464,114 @@ func ParseSwarmStart(body string) (*SwarmStartPayload, error) {
 	return payload, nil
 }
 
+// ParseDispatchAttempt extracts payload from a DISPATCH_ATTEMPT message.
+// Subject format: DISPATCH_ATTEMPT <polecat-name>
+// Body format:
+//
+//	Bead: <bead-id>
+func ParseDispatchAttempt(subject, body string) (*DispatchAttemptPayload, error) {
+	matches := PatternDispatchAttempt.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DISPATCH_ATTEMPT subject: %s", subject)
+	}
+
+	payload := &DispatchAttemptPayload{
+		PolecatName: matches[1],
+		AttemptedAt: time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Bead:") {
+			payload.BeadID = strings.TrimSpace(strings.TrimPrefix(line, "Bead:"))
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseDispatchOK extracts payload from a DISPATCH_OK message.
+// Subject format: DISPATCH_OK <polecat-name>
+// Body format:
+//
+//	Bead: <bead-id>
+func ParseDispatchOK(subject, body string) (*DispatchOKPayload, error) {
+	matches := PatternDispatchOK.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DISPATCH_OK subject: %s", subject)
+	}
+
+	payload := &DispatchOKPayload{
+		PolecatName:  matches[1],
+		DispatchedAt: time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Bead:") {
+			payload.BeadID = strings.TrimSpace(strings.TrimPrefix(line, "Bead:"))
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseDispatchFail extracts payload from a DISPATCH_FAIL message.
+// Subject format: DISPATCH_FAIL <polecat-name>
+// Body format:
+//
+//	Bead: <bead-id>
+//	Reason: <failure-reason>
+func ParseDispatchFail(subject, body string) (*DispatchFailPayload, error) {
+	matches := PatternDispatchFail.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DISPATCH_FAIL subject: %s", subject)
+	}
+
+	payload := &DispatchFailPayload{
+		PolecatName: matches[1],
+		FailedAt:    time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Bead:"):
+			payload.BeadID = strings.TrimSpace(strings.TrimPrefix(line, "Bead:"))
+		case strings.HasPrefix(line, "Reason:"):
+			payload.Reason = strings.TrimSpace(strings.TrimPrefix(line, "Reason:"))
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseIdlePassivated extracts payload from an IDLE_PASSIVATED message.
+// Subject format: IDLE_PASSIVATED <polecat-name>
+// Body format:
+//
+//	IdleDuration: <duration>
+func ParseIdlePassivated(subject, body string) (*IdlePassivatedPayload, error) {
+	matches := PatternIdlePassivated.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid IDLE_PASSIVATED subject: %s", subject)
+	}
+
+	payload := &IdlePassivatedPayload{
+		PolecatName:  matches[1],
+		PassivatedAt: time.Now(),
+	}
+
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "IdleDuration:") {
+			payload.IdleDuration = strings.TrimSpace(strings.TrimPrefix(line, "IdleDuration:"))
+		}
+	}
+
+	return payload, nil
+}
+
 // CleanupWispLabels generates labels for a cleanup wisp.
 func CleanupWispLabels(polecatName, state string) []string {
 	return []string{
@@ -400,8 +593,7 @@ func SwarmWispLabels(swarmID string, total, completed int, startTime time.Time) 
 }
 
 // FormatHelpSummary formats a parsed HelpPayload into a human-readable summary
-// for the witness agent to triage. The agent decides whether to help directly,
-// escalate, and to whom — no Go-level judgment is made here.
+// for the witness agent to triage. Includes assessment if available.
 func FormatHelpSummary(payload *HelpPayload) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "HELP REQUEST from %s", payload.Agent)
@@ -409,6 +601,13 @@ func FormatHelpSummary(payload *HelpPayload) string {
 		fmt.Fprintf(&b, " (issue: %s)", payload.IssueID)
 	}
 	b.WriteString("\n")
+	if payload.Assessment != nil {
+		fmt.Fprintf(&b, "Assessment: [%s] severity=%s → suggest escalate to %s\n",
+			payload.Assessment.Category, payload.Assessment.Severity, payload.Assessment.SuggestTo)
+		if payload.Assessment.Rationale != "" {
+			fmt.Fprintf(&b, "Rationale: %s\n", payload.Assessment.Rationale)
+		}
+	}
 	if payload.Topic != "" {
 		fmt.Fprintf(&b, "Topic: %s\n", payload.Topic)
 	}
@@ -422,4 +621,82 @@ func FormatHelpSummary(payload *HelpPayload) string {
 		fmt.Fprintf(&b, "Requested: %s\n", payload.RequestedAt.Format(time.RFC3339))
 	}
 	return b.String()
+}
+
+// helpKeywords maps keyword patterns to their category and severity.
+// Checked in priority order — first match wins.
+var helpKeywords = []struct {
+	patterns []string
+	category HelpCategory
+	severity HelpSeverity
+}{
+	// Emergency: security, data corruption, system down
+	{
+		patterns: []string{"security", "vulnerability", "breach", "unauthorized", "credential", "exposed secret", "data corruption", "data loss", "system down"},
+		category: HelpCategoryEmergency,
+		severity: HelpSeverityCritical,
+	},
+	// Failed: errors, crashes, unexpected failures
+	{
+		patterns: []string{"crash", "panic", "fatal", "segfault", "oom", "out of memory", "disk full", "connection refused", "database error", "dolt", "server unreachable"},
+		category: HelpCategoryFailed,
+		severity: HelpSeverityHigh,
+	},
+	// Blocked: dependencies, waiting, merge conflicts
+	{
+		patterns: []string{"blocked", "waiting on", "depends on", "merge conflict", "conflict", "deadlock", "stuck", "cannot proceed", "can't proceed"},
+		category: HelpCategoryBlocked,
+		severity: HelpSeverityHigh,
+	},
+	// Decision: architecture, design choices, ambiguity
+	{
+		patterns: []string{"which approach", "decision", "ambiguous", "unclear", "multiple options", "design choice", "architecture", "how should", "which way"},
+		category: HelpCategoryDecision,
+		severity: HelpSeverityMedium,
+	},
+	// Lifecycle: worker state, session issues
+	{
+		patterns: []string{"session", "respawn", "restart", "zombie", "hung", "timeout", "idle", "no progress"},
+		category: HelpCategoryLifecycle,
+		severity: HelpSeverityMedium,
+	},
+}
+
+// categoryRoutes maps categories to their default escalation target.
+var categoryRoutes = map[HelpCategory]string{
+	HelpCategoryEmergency: "overseer",
+	HelpCategoryFailed:    "deacon",
+	HelpCategoryBlocked:   "mayor",
+	HelpCategoryDecision:  "deacon",
+	HelpCategoryLifecycle: "witness",
+	HelpCategoryHelp:      "deacon",
+}
+
+// AssessHelp classifies a help request's category and severity based on
+// the topic and problem fields, using keyword matching against the
+// escalation categories defined in the escalation protocol.
+func AssessHelp(payload *HelpPayload) *HelpAssessment {
+	combined := strings.ToLower(payload.Topic + " " + payload.Problem)
+
+	for _, entry := range helpKeywords {
+		for _, pattern := range entry.patterns {
+			if strings.Contains(combined, pattern) {
+				target := categoryRoutes[entry.category]
+				return &HelpAssessment{
+					Category:  entry.category,
+					Severity:  entry.severity,
+					SuggestTo: target,
+					Rationale: fmt.Sprintf("matched keyword %q", pattern),
+				}
+			}
+		}
+	}
+
+	// Default: general help, medium severity, route to deacon
+	return &HelpAssessment{
+		Category:  HelpCategoryHelp,
+		Severity:  HelpSeverityMedium,
+		SuggestTo: "deacon",
+		Rationale: "no specific keywords matched, defaulting to general help",
+	}
 }

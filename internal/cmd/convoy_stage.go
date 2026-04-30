@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -30,10 +29,14 @@ var convoyStageLaunch bool
 // or falls back to "Staged: N beads across M rigs".
 var convoyStageTitle string
 
+// convoyStageNoValidate disables automatic validation bead creation for epic input.
+var convoyStageNoValidate bool
+
 func init() {
 	convoyStageCmd.Flags().BoolVar(&convoyStageJSON, "json", false, "Output machine-readable JSON")
 	convoyStageCmd.Flags().BoolVar(&convoyStageLaunch, "launch", false, "Launch the convoy immediately after staging (transition to open)")
 	convoyStageCmd.Flags().StringVar(&convoyStageTitle, "title", "", "Human-readable title for the convoy (default: derived from epic title or auto-generated)")
+	convoyStageCmd.Flags().BoolVar(&convoyStageNoValidate, "no-validate", false, "Skip automatic validation bead creation (epic input only)")
 }
 
 // ---------------------------------------------------------------------------
@@ -42,14 +45,15 @@ func init() {
 
 // StageResult is the top-level JSON output for gt convoy stage --json.
 type StageResult struct {
-	Status   string           `json:"status"`    // "staged_ready", "staged_warnings", or "error"
-	ConvoyID string           `json:"convoy_id"` // empty if errors prevented creation
-	Restaged bool             `json:"restaged"`  // true if an existing convoy was updated in place
-	Errors   []FindingJSON    `json:"errors"`
-	Warnings []FindingJSON    `json:"warnings"`
-	Waves    []WaveJSON       `json:"waves"`
-	Gated    []GatedTaskJSON  `json:"gated,omitempty"` // tasks blocked by open non-slingable nodes
-	Tree     []TreeNodeJSON   `json:"tree"`
+	Status           string          `json:"status"`                       // "staged_ready", "staged_warnings", or "error"
+	ConvoyID         string          `json:"convoy_id"`                    // empty if errors prevented creation
+	Restaged         bool            `json:"restaged"`                     // true if an existing convoy was updated in place
+	ValidationBeadID string          `json:"validation_bead_id,omitempty"` // capstone validation bead (epic input only)
+	Errors           []FindingJSON   `json:"errors"`
+	Warnings         []FindingJSON   `json:"warnings"`
+	Waves            []WaveJSON      `json:"waves"`
+	Gated            []GatedTaskJSON `json:"gated,omitempty"` // tasks blocked by open non-slingable nodes
+	Tree             []TreeNodeJSON  `json:"tree"`
 }
 
 // GatedTaskJSON is the JSON representation of a task gated by non-slingable blockers.
@@ -309,6 +313,20 @@ func runConvoyStage(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Step 11a: Append validation bead as final wave (epic input only).
+	if input.Kind == StageInputEpic && !convoyStageNoValidate {
+		epicID := input.IDs[0]
+		var validationID string
+		waves, validationID, err = appendValidationWave(dag, waves, epicID)
+		if err != nil {
+			return fmt.Errorf("creating validation bead: %w", err)
+		}
+		if validationID != "" && !convoyStageJSON {
+			blockerCount := len(dag.Nodes[validationID].BlockedBy)
+			fmt.Printf("Validation bead created: %s (blocked by %d tasks, formula: mol-validate-prd)\n", validationID, blockerCount)
+		}
+	}
+
 	// Step 11b: Add gated task warnings and recalculate status.
 	for _, g := range gated {
 		warns = append(warns, StagingFinding{
@@ -405,6 +423,16 @@ func runConvoyStageJSON(dag *ConvoyDAG, input *StageInput, errs, warns []Staging
 		return err
 	}
 
+	// Append validation bead as final wave (epic input only).
+	var validationBeadID string
+	if input.Kind == StageInputEpic && !convoyStageNoValidate {
+		epicID := input.IDs[0]
+		waves, validationBeadID, err = appendValidationWave(dag, waves, epicID)
+		if err != nil {
+			return fmt.Errorf("creating validation bead: %w", err)
+		}
+	}
+
 	// Add gated task warnings and recalculate status.
 	for _, g := range gated {
 		warns = append(warns, StagingFinding{
@@ -421,6 +449,7 @@ func runConvoyStageJSON(dag *ConvoyDAG, input *StageInput, errs, warns []Staging
 	}
 
 	result.Status = status
+	result.ValidationBeadID = validationBeadID
 	result.Waves = buildWavesJSON(waves, dag)
 	result.Gated = buildGatedJSON(gated, dag)
 
@@ -474,27 +503,18 @@ func dagSlingableIDs(dag *ConvoyDAG) []string {
 }
 
 // convoyTrackedBeadIDs returns the set of bead IDs tracked by a convoy.
-// It calls `bd dep list <convoyID> --direction=down --type=tracks --json`
-// against the town beads directory and unwraps external:prefix:id references.
+// Uses bdDepListRawIDs to query the raw dependencies table, which works
+// for cross-database deps where tracked issues live in a different Dolt
+// database (e.g., ds-* issues tracked by an hq-cv-* convoy). See GH #2624.
 func convoyTrackedBeadIDs(townBeads, convoyID string) (map[string]bool, error) {
-	townRoot := filepath.Dir(townBeads)
-	depCmd := exec.Command("bd", "dep", "list", convoyID, "--direction=down", "--type=tracks", "--json")
-	depCmd.Dir = townRoot
-	out, err := depCmd.Output()
+	trackedIDs, err := bdDepListRawIDs(townBeads, convoyID, "down", "tracks")
 	if err != nil {
-		return nil, fmt.Errorf("bd dep list %s --direction=down --type=tracks: %w", convoyID, err)
+		return nil, fmt.Errorf("tracked deps for %s: %w", convoyID, err)
 	}
 
-	var tracked []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(out, &tracked); err != nil {
-		return nil, fmt.Errorf("parsing tracked deps for %s: %w", convoyID, err)
-	}
-
-	ids := make(map[string]bool, len(tracked))
-	for _, t := range tracked {
-		ids[beads.ExtractIssueID(t.ID)] = true
+	ids := make(map[string]bool, len(trackedIDs))
+	for _, id := range trackedIDs {
+		ids[id] = true
 	}
 	return ids, nil
 }
@@ -648,13 +668,17 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 		return "", err
 	}
 
+	// Resolve the actual .beads directory (follows redirects) before calling
+	// EnsureCustomTypes/Statuses, which expect a .beads path, not a workspace root.
+	resolvedBeads := beads.ResolveBeadsDir(townBeads)
+
 	// Ensure custom types (including 'convoy') are registered in town beads.
-	if err := beads.EnsureCustomTypes(townBeads); err != nil {
+	if err := beads.EnsureCustomTypes(resolvedBeads); err != nil {
 		return "", fmt.Errorf("ensuring custom types: %w", err)
 	}
 
 	// Ensure custom statuses (staged_ready, staged_warnings) are registered.
-	if err := beads.EnsureCustomStatuses(townBeads); err != nil {
+	if err := beads.EnsureCustomStatuses(resolvedBeads); err != nil {
 		return "", fmt.Errorf("ensuring custom statuses: %w", err)
 	}
 
@@ -702,18 +726,18 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 	}
 
 	// Set the staged status.
-	statusCmd := exec.Command("bd", "update", convoyID, "--status="+status)
-	statusCmd.Dir = townBeads
-	if out, err := statusCmd.CombinedOutput(); err != nil {
+	// Strip BEADS_DIR so bd discovers the correct database from Dir()
+	// rather than using an inherited (possibly wrong) override.
+	if out, err := BdCmd("update", convoyID, "--status="+status).
+		Dir(townBeads).StripBeadsDir().WithAutoCommit().
+		CombinedOutput(); err != nil {
 		return "", fmt.Errorf("bd update convoy status: %w\noutput: %s", err, out)
 	}
 
 	// Track each slingable bead via bd dep add.
 	for _, beadID := range slingableIDs {
-		if out, err := BdCmd("dep", "add", convoyID, beadID, "--type=tracks").
-			Dir(townBeads).WithAutoCommit().
-			CombinedOutput(); err != nil {
-			return "", fmt.Errorf("bd dep add %s %s: %w\noutput: %s", convoyID, beadID, err, out)
+		if err := addTrackingRelationFn(townBeads, convoyID, beadID); err != nil {
+			fmt.Printf("  Warning: could not track %s in convoy: %v\n", beadID, err)
 		}
 	}
 
@@ -748,10 +772,8 @@ func updateStagedConvoy(existingConvoyID string, dag *ConvoyDAG, waves []Wave, s
 	// Add new beads not currently tracked.
 	for _, id := range desiredIDs {
 		if !currentIDs[id] {
-			if out, err := BdCmd("dep", "add", existingConvoyID, id, "--type=tracks").
-				Dir(townBeads).WithAutoCommit().
-				CombinedOutput(); err != nil {
-				return fmt.Errorf("bd dep add %s %s: %w\noutput: %s", existingConvoyID, id, err, out)
+			if err := addTrackingRelationFn(townBeads, existingConvoyID, id); err != nil {
+				fmt.Printf("  Warning: could not track %s in convoy: %v\n", id, err)
 			}
 		}
 	}
@@ -759,10 +781,8 @@ func updateStagedConvoy(existingConvoyID string, dag *ConvoyDAG, waves []Wave, s
 	// Remove stale beads no longer in the DAG.
 	for id := range currentIDs {
 		if !desiredSet[id] {
-			if out, err := BdCmd("dep", "remove", existingConvoyID, id, "--type=tracks").
-				Dir(townBeads).WithAutoCommit().
-				CombinedOutput(); err != nil {
-				return fmt.Errorf("bd dep remove %s %s: %w\noutput: %s", existingConvoyID, id, err, out)
+			if err := removeTrackingRelationFn(townBeads, existingConvoyID, id); err != nil {
+				fmt.Printf("  Warning: could not untrack %s from convoy: %v\n", id, err)
 			}
 		}
 	}
@@ -1020,6 +1040,104 @@ func computeWaves(dag *ConvoyDAG) ([]Wave, []GatedTask, error) {
 	}
 
 	return waves, nil, nil
+}
+
+// appendValidationWave creates a validation bead blocked by all slingable beads
+// in the DAG and appends it as the final wave. The validation bead uses the
+// mol-validate-prd formula to ensure every swarm epic gets mandatory capstone
+// validation. Returns the updated waves and the validation bead ID.
+// Only called for epic input when --no-validate is not set.
+func appendValidationWave(dag *ConvoyDAG, waves []Wave, epicID string) ([]Wave, string, error) {
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return waves, "", err
+	}
+
+	// Collect all slingable bead IDs (these will block the validation bead).
+	var slingableIDs []string
+	for _, node := range dag.Nodes {
+		if isSlingableType(node.Type) {
+			slingableIDs = append(slingableIDs, node.ID)
+		}
+	}
+	sort.Strings(slingableIDs)
+
+	if len(slingableIDs) == 0 {
+		return waves, "", nil // nothing to validate
+	}
+
+	// Generate a validation bead ID.
+	validationID := fmt.Sprintf("hq-%s", generateShortID())
+
+	// Build the description with epic context and formula reference.
+	description := fmt.Sprintf(
+		"Capstone validation for epic %s. "+
+			"Run mol-validate-prd formula to validate PRD success criteria.\n\n"+
+			"formula: mol-validate-prd\nepic_id: %s",
+		epicID, epicID,
+	)
+
+	// Create the validation bead in town beads.
+	createArgs := []string{
+		"create",
+		"--type=task",
+		"--id=" + validationID,
+		"--title=Validate: PRD success criteria",
+		"--description=" + description,
+	}
+	if beads.NeedsForceForID(validationID) {
+		createArgs = append(createArgs, "--force")
+	}
+	if out, err := BdCmd(createArgs...).Dir(townBeads).WithAutoCommit().CombinedOutput(); err != nil {
+		return waves, "", fmt.Errorf("bd create validation bead: %w\noutput: %s", err, out)
+	}
+
+	// Set the validation bead as a child of the epic.
+	if out, err := BdCmd("dep", "add", epicID, validationID, "--type=parent-child").
+		Dir(townBeads).WithAutoCommit().StripBeadsDir().
+		CombinedOutput(); err != nil {
+		return waves, "", fmt.Errorf("bd dep add parent-child %s %s: %w\noutput: %s", epicID, validationID, err, out)
+	}
+
+	// Add blocking edges: every slingable bead blocks the validation bead.
+	// Cross-rig deps may fail (bd validates both IDs in same DB). Non-fatal.
+	for _, beadID := range slingableIDs {
+		if out, err := BdCmd("dep", "add", beadID, validationID, "--type=blocks").
+			Dir(townBeads).WithAutoCommit().StripBeadsDir().
+			CombinedOutput(); err != nil {
+			fmt.Printf("  Warning: could not add blocking dep %s → %s: %v\n", beadID, validationID, err)
+			_ = out
+		}
+	}
+
+	// Add the validation bead to the DAG.
+	dag.Nodes[validationID] = &ConvoyDAGNode{
+		ID:        validationID,
+		Title:     "Validate: PRD success criteria",
+		Type:      "task",
+		Status:    "open",
+		BlockedBy: slingableIDs,
+		Parent:    epicID,
+	}
+
+	// Update the Blocks field of each slingable node.
+	for _, beadID := range slingableIDs {
+		if node, ok := dag.Nodes[beadID]; ok {
+			node.Blocks = append(node.Blocks, validationID)
+		}
+	}
+
+	// Append as the final wave.
+	nextWaveNum := 1
+	if len(waves) > 0 {
+		nextWaveNum = waves[len(waves)-1].Number + 1
+	}
+	waves = append(waves, Wave{
+		Number: nextWaveNum,
+		Tasks:  []string{validationID},
+	})
+
+	return waves, validationID, nil
 }
 
 // BeadInfo represents raw bead data from bd show output.
@@ -1307,9 +1425,9 @@ type bdShowResult struct {
 // Each entry is a bead that the queried issue depends on.
 // The IssueID is set by the caller (it's the bead we queried).
 type bdDepResult struct {
-	IssueID        string `json:"-"`               // set by caller
-	DependsOnID    string `json:"id"`              // the dependency target
-	Type           string `json:"dependency_type"` // blocks, parent-child, etc.
+	IssueID     string `json:"-"`               // set by caller
+	DependsOnID string `json:"id"`              // the dependency target
+	Type        string `json:"dependency_type"` // blocks, parent-child, etc.
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,7 +1437,13 @@ type bdDepResult struct {
 // bdShow runs `bd show <id> --json` and returns the parsed bead info.
 // Returns error if bd exits non-zero or returns no results.
 func bdShow(beadID string) (*bdShowResult, error) {
-	out, err := exec.Command("bd", "show", beadID, "--json").Output()
+	cmd := exec.Command("bd", "show", beadID, "--json")
+	// Route to the correct rig database via prefix resolution.
+	if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
+		cmd.Dir = dir
+		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("bd show %s: %w", beadID, err)
 	}
@@ -1339,7 +1463,13 @@ func bdShow(beadID string) (*bdShowResult, error) {
 // bd dep list returns the beads that <id> depends on. Each result's
 // DependsOnID is the dependency target; IssueID is set to <id> by this func.
 func bdDepList(beadID string) ([]bdDepResult, error) {
-	out, err := exec.Command("bd", "dep", "list", beadID, "--json").Output()
+	cmd := exec.Command("bd", "dep", "list", beadID, "--json")
+	// Route to the correct rig database via prefix resolution.
+	if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
+		cmd.Dir = dir
+		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("bd dep list %s: %w", beadID, err)
 	}
@@ -1363,8 +1493,14 @@ func bdDepList(beadID string) ([]bdDepResult, error) {
 // routes.jsonl so this works regardless of the caller's working directory.
 func bdListChildren(parentID string) ([]bdShowResult, error) {
 	cmd := exec.Command("bd", "list", "--parent="+parentID, "--json")
-	if dir := beadsDirForID(parentID); dir != "" {
+	// Route to the correct rig database via prefix resolution.
+	// resolveBeadDir returns the parent of .beads (the working directory bd
+	// expects), unlike beadsDirForID which returns the .beads directory itself.
+	// Also strip BEADS_DIR to prevent inherited overrides from interfering
+	// with bd's workspace detection (consistent with bdShow/bdDepList).
+	if dir := resolveBeadDir(parentID); dir != "" && dir != "." {
 		cmd.Dir = dir
+		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
 	}
 	out, err := cmd.Output()
 	if err != nil {
@@ -1549,20 +1685,22 @@ func collectConvoyBeads(convoyID string) ([]BeadInfo, []DepInfo, error) {
 		return nil, nil, fmt.Errorf("convoy %s: %w", convoyID, err)
 	}
 
-	// 2. Get deps for the convoy — filter for "tracks" type.
-	deps, err := bdDepList(convoyID)
+	// 2. Read tracked IDs using the same filtered dep-list path used by status
+	// and staged-convoy reconciliation. This handles id-only dep rows and
+	// external:<rig>:<id> wrappers.
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	trackedSet, err := convoyTrackedBeadIDs(townBeads, convoyID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("deps for convoy %s: %w", convoyID, err)
 	}
-
-	// Extract tracked bead IDs. bdDepList sets IssueID to the queried bead
-	// (the convoy) and DependsOnID to the JSON "id" field (the tracked bead).
-	var trackedIDs []string
-	for _, d := range deps {
-		if d.Type == "tracks" {
-			trackedIDs = append(trackedIDs, d.DependsOnID)
-		}
+	trackedIDs := make([]string, 0, len(trackedSet))
+	for id := range trackedSet {
+		trackedIDs = append(trackedIDs, id)
 	}
+	sort.Strings(trackedIDs)
 
 	if len(trackedIDs) == 0 {
 		return nil, nil, fmt.Errorf("convoy %s tracks no beads", convoyID)

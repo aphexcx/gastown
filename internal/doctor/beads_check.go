@@ -283,142 +283,23 @@ func saveRigsConfig(path string, cfg *rigsConfigFile) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// beadShower is an interface for fetching bead information.
-// Allows mocking in tests.
-type beadShower interface {
-	Show(id string) (*beads.Issue, error)
+// dbPrefixGetter abstracts querying the database for issue_prefix.
+// Allows mocking in tests without shelling out to bd.
+type dbPrefixGetter interface {
+	GetDBPrefix(rigPath string) (string, error)
 }
 
-// labelAdder is an interface for adding labels to beads.
-// Allows mocking in tests.
-type labelAdder interface {
-	AddLabel(townRoot, id, label string) error
-}
+// realDBPrefixGetter shells out to bd to query the database.
+type realDBPrefixGetter struct{}
 
-// realLabelAdder implements labelAdder using bd command.
-type realLabelAdder struct{}
-
-func (r *realLabelAdder) AddLabel(townRoot, id, label string) error {
-	cmd := exec.Command("bd", "label", "add", id, label)
-	cmd.Dir = townRoot
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("adding %s label to %s: %s", label, id, strings.TrimSpace(string(output)))
+func (r *realDBPrefixGetter) GetDBPrefix(rigPath string) (string, error) {
+	cmd := exec.Command("bd", "config", "get", "issue_prefix")
+	cmd.Dir = rigPath
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
 	}
-	return nil
-}
-
-// RoleLabelCheck verifies that role beads have the gt:role label.
-// This label is required for GetRoleConfig to recognize role beads.
-// Role beads created before the label migration may be missing this label.
-type RoleLabelCheck struct {
-	FixableCheck
-	missingLabel []string // Role bead IDs missing gt:role label
-	townRoot     string   // Cached for Fix
-
-	// Injected dependencies for testing
-	beadShower beadShower
-	labelAdder labelAdder
-}
-
-// NewRoleLabelCheck creates a new role label check.
-func NewRoleLabelCheck() *RoleLabelCheck {
-	return &RoleLabelCheck{
-		FixableCheck: FixableCheck{
-			BaseCheck: BaseCheck{
-				CheckName:        "role-bead-labels",
-				CheckDescription: "Check that role beads have gt:role label",
-				CheckCategory:    CategoryConfig,
-			},
-		},
-		labelAdder: &realLabelAdder{},
-	}
-}
-
-// roleBeadIDs returns the list of role bead IDs to check.
-func roleBeadIDs() []string {
-	return []string{
-		beads.MayorRoleBeadIDTown(),
-		beads.DeaconRoleBeadIDTown(),
-		beads.DogRoleBeadIDTown(),
-		beads.WitnessRoleBeadIDTown(),
-		beads.RefineryRoleBeadIDTown(),
-		beads.PolecatRoleBeadIDTown(),
-		beads.CrewRoleBeadIDTown(),
-	}
-}
-
-// Run checks if role beads have the gt:role label.
-func (c *RoleLabelCheck) Run(ctx *CheckContext) *CheckResult {
-	// Check if bd command is available (skip if testing with mock)
-	if c.beadShower == nil {
-		if _, err := exec.LookPath("bd"); err != nil {
-			return &CheckResult{
-				Name:    c.Name(),
-				Status:  StatusOK,
-				Message: "beads not installed (skipped)",
-			}
-		}
-	}
-
-	// Check if .beads directory exists at town level
-	townBeadsDir := filepath.Join(ctx.TownRoot, ".beads")
-	if _, err := os.Stat(townBeadsDir); os.IsNotExist(err) {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "No beads database (skipped)",
-		}
-	}
-
-	// Use injected beadShower or create real one
-	shower := c.beadShower
-	if shower == nil {
-		shower = beads.New(ctx.TownRoot)
-	}
-
-	var missingLabel []string
-	for _, roleID := range roleBeadIDs() {
-		issue, err := shower.Show(roleID)
-		if err != nil {
-			// Bead doesn't exist - that's OK, install will create it
-			continue
-		}
-
-		// Check if it has the gt:role label
-		if !beads.HasLabel(issue, "gt:role") {
-			missingLabel = append(missingLabel, roleID)
-		}
-	}
-
-	// Cache for Fix
-	c.missingLabel = missingLabel
-	c.townRoot = ctx.TownRoot
-
-	if len(missingLabel) == 0 {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "All role beads have gt:role label",
-		}
-	}
-
-	return &CheckResult{
-		Name:    c.Name(),
-		Status:  StatusWarning,
-		Message: fmt.Sprintf("%d role bead(s) missing gt:role label", len(missingLabel)),
-		Details: missingLabel,
-		FixHint: "Run 'gt doctor --fix' to add missing labels",
-	}
-}
-
-// Fix adds the gt:role label to role beads that are missing it.
-func (c *RoleLabelCheck) Fix(ctx *CheckContext) error {
-	for _, roleID := range c.missingLabel {
-		if err := c.labelAdder.AddLabel(c.townRoot, roleID, "gt:role"); err != nil {
-			return err
-		}
-	}
-	return nil
+	return strings.TrimSpace(string(output)), nil
 }
 
 // DatabasePrefixCheck detects when a rig's database has a different issue_prefix
@@ -429,9 +310,15 @@ func (c *RoleLabelCheck) Fix(ctx *CheckContext) error {
 //
 // Unlike PrefixMismatchCheck (rigs.json ↔ routes.jsonl), this check verifies
 // the actual database configuration matches the routing table.
+//
+// Rigs that redirect to a shared database (e.g. the town root's .beads) are
+// skipped. Their database prefix is owned by the route that provides the
+// canonical database, not by the redirecting rig. Attempting to "fix" these
+// would overwrite the shared database's prefix with the rig's prefix.
 type DatabasePrefixCheck struct {
 	FixableCheck
-	mismatches []databasePrefixMismatch
+	mismatches     []databasePrefixMismatch
+	prefixGetter   dbPrefixGetter
 }
 
 type databasePrefixMismatch struct {
@@ -478,15 +365,26 @@ func (c *DatabasePrefixCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	// Check if bd command is available
-	if _, err := exec.LookPath("bd"); err != nil {
-		return &CheckResult{
-			Name:     c.Name(),
-			Status:   StatusOK,
-			Message:  "beads not installed (skipped)",
-			Category: c.Category(),
+	// Check if bd command is available (skip when using injected mock)
+	if c.prefixGetter == nil {
+		if _, err := exec.LookPath("bd"); err != nil {
+			return &CheckResult{
+				Name:     c.Name(),
+				Status:   StatusOK,
+				Message:  "beads not installed (skipped)",
+				Category: c.Category(),
+			}
 		}
 	}
+
+	getter := c.prefixGetter
+	if getter == nil {
+		getter = &realDBPrefixGetter{}
+	}
+
+	// Resolve the town root's canonical beads directory so we can detect
+	// rigs that redirect to the shared town database.
+	townBeadsDir, _ := filepath.Abs(beads.ResolveBeadsDir(ctx.TownRoot))
 
 	var problems []string
 
@@ -496,26 +394,30 @@ func (c *DatabasePrefixCheck) Run(ctx *CheckContext) *CheckResult {
 			continue
 		}
 
-		// Resolve the rig path and check beads directory exists
 		rigPath := filepath.Join(ctx.TownRoot, route.Path)
 		rigBeadsDir := beads.ResolveBeadsDir(rigPath)
 
 		// Check if beads directory exists
 		if _, err := os.Stat(rigBeadsDir); os.IsNotExist(err) {
-			continue // No beads dir for this rig
-		}
-
-		// Query database for issue_prefix by running bd from the rig directory
-		dbPrefix, err := c.getDBPrefix(rigPath)
-		if err != nil {
-			// No issue_prefix configured - that's OK
 			continue
 		}
 
-		// Normalize routes prefix (strip trailing hyphen)
+		// Skip rigs whose beads redirect resolves to the town root database.
+		// These rigs share the town DB; the prefix is owned by the town root
+		// route, not by this rig. "Fixing" them would overwrite the shared
+		// database's issue_prefix with the rig's route prefix.
+		absRigBeadsDir, _ := filepath.Abs(rigBeadsDir)
+		if absRigBeadsDir == townBeadsDir {
+			continue
+		}
+
+		dbPrefix, err := getter.GetDBPrefix(rigPath)
+		if err != nil {
+			continue
+		}
+
 		routesPrefix := strings.TrimSuffix(route.Prefix, "-")
 
-		// Compare prefixes
 		if dbPrefix != routesPrefix {
 			problems = append(problems, fmt.Sprintf("Route '%s': routes.jsonl says '%s', database has '%s'",
 				route.Path, routesPrefix, dbPrefix))
@@ -546,29 +448,23 @@ func (c *DatabasePrefixCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// getDBPrefix queries the database for issue_prefix config value.
-// Runs bd from the rig directory so it discovers the correct database.
-func (c *DatabasePrefixCheck) getDBPrefix(rigPath string) (string, error) {
-	cmd := exec.Command("bd", "config", "get", "issue_prefix")
-	cmd.Dir = rigPath
-	output, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
-}
-
 // Fix updates database configs to match routes.jsonl prefixes.
+// Only fixes rigs with their own database; rigs that redirect to a shared
+// database are skipped by Run() and will not appear in c.mismatches.
+// Logs each change visibly to prevent silent prefix corruption (GH#2455).
 func (c *DatabasePrefixCheck) Fix(ctx *CheckContext) error {
-	// Re-run check to populate mismatches if needed
 	if len(c.mismatches) == 0 {
 		result := c.Run(ctx)
 		if result.Status == StatusOK {
-			return nil // Nothing to fix
+			return nil
 		}
 	}
 
 	for _, m := range c.mismatches {
+		// Safety: log what we're about to change so corruption is visible (GH#2455)
+		fmt.Fprintf(os.Stderr, "WARNING: database-prefix fix: %s: changing issue_prefix from %q to %q (per routes.jsonl)\n",
+			m.rigPath, m.dbPrefix, m.routesPrefix)
+
 		cmd := exec.Command("bd", "config", "set", "issue_prefix", m.routesPrefix)
 		cmd.Dir = filepath.Join(ctx.TownRoot, m.rigPath)
 		if output, err := cmd.CombinedOutput(); err != nil {

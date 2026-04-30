@@ -162,60 +162,104 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	bd := beads.New(cwd)
 
 	// Determine target branch
+	// Priority: explicit --epic > formula_vars base_branch > integration branch auto-detect > rig default.
 	target := defaultBranch
 	if mqSubmitEpic != "" {
 		// Explicit --epic flag: read stored branch name, fall back to template
 		rigPath := filepath.Join(townRoot, rigName)
 		target = resolveIntegrationBranchName(bd, rigPath, mqSubmitEpic)
 	} else {
-		// Auto-detect: check if source issue has a parent epic with an integration branch
-		// Only if refinery integration branch auto-targeting is enabled
-		refineryEnabled := true
-		rigPath := filepath.Join(townRoot, rigName)
-		settingsPath := filepath.Join(rigPath, "settings", "config.json")
-		if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
-			refineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()
+		// Check for explicit --base-branch override in formula vars on the source issue.
+		// When gt sling dispatches with --base-branch, the value is persisted in
+		// the bead's formula_vars field. Without this check, MRs created via
+		// gt mq submit always target the rig's default branch (usually main),
+		// even when the polecat was working against a feature branch.
+		if sourceIssue, showErr := bd.Show(issueID); showErr == nil {
+			if af := beads.ParseAttachmentFields(sourceIssue); af != nil {
+				if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" && bb != defaultBranch {
+					target = bb
+					fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
+				}
+			}
 		}
-		if refineryEnabled {
-			autoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)
-			if err != nil {
-				// Non-fatal: log and continue with default branch as target
-				fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("(note: %v)", err)))
-			} else if autoTarget != "" {
-				target = autoTarget
+
+		// Auto-detect: check if source issue has a parent epic with an integration branch
+		// Only if no explicit base_branch was found above
+		if target == defaultBranch {
+			refineryEnabled := true
+			rigPath := filepath.Join(townRoot, rigName)
+			settingsPath := filepath.Join(rigPath, "settings", "config.json")
+			if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
+				refineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()
+			}
+			if refineryEnabled {
+				autoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)
+				if err != nil {
+					// Non-fatal: log and continue with default branch as target
+					fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("(note: %v)", err)))
+				} else if autoTarget != "" {
+					target = autoTarget
+				}
 			}
 		}
 	}
 
-	// Get source issue for priority inheritance
+	// Get source issue for priority inheritance and dependency check
 	var priority int
+	var sourceIssue *beads.Issue
 	if mqSubmitPriority >= 0 {
 		priority = mqSubmitPriority
-	} else {
-		// Try to inherit from source issue
-		sourceIssue, err := bd.Show(issueID)
-		if err != nil {
-			// Issue not found, use default priority
+	}
+	// Always try to fetch source issue (needed for both priority and dep check)
+	sourceIssue, err = bd.Show(issueID)
+	if err != nil {
+		if mqSubmitPriority < 0 {
 			priority = 2
-		} else {
+		}
+	} else {
+		if mqSubmitPriority < 0 {
 			priority = sourceIssue.Priority
 		}
+	}
+
+	// Enforce molecule step dependencies before allowing submit.
+	// If the source issue has an attached molecule, verify that prerequisite
+	// steps are complete. This prevents polecats from skipping steps like
+	// self-review, build-check, or state-update.
+	if !mqSubmitSkipDeps && !mqSubmitResubmit && sourceIssue != nil {
+		if err := checkMoleculeStepDeps(bd, sourceIssue); err != nil {
+			return err
+		}
+	}
+
+	// GH#3032: Resolve HEAD commit SHA for MR dedup.
+	commitSHA, shaErr := g.Rev("HEAD")
+	if shaErr != nil {
+		style.PrintWarning("could not resolve HEAD SHA: %v (falling back to branch-only dedup)", shaErr)
 	}
 
 	// Build MR bead title and description
 	title := fmt.Sprintf("Merge: %s", issueID)
 	description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
 		branch, target, issueID, rigName)
+	if commitSHA != "" {
+		description += fmt.Sprintf("\ncommit_sha: %s", commitSHA)
+	}
 	if worker != "" {
 		description += fmt.Sprintf("\nworker: %s", worker)
 	}
 
-	// Check if MR bead already exists for this branch (idempotency)
+	// Check if MR bead already exists for this branch+SHA (idempotency)
 	var mrIssue *beads.Issue
-	existingMR, err := bd.FindMRForBranch(branch)
+	var existingMR *beads.Issue
+	if commitSHA != "" {
+		existingMR, err = bd.FindMRForBranchAndSHA(branch, commitSHA)
+	} else {
+		existingMR, err = bd.FindMRForBranch(branch)
+	}
 	if err != nil {
 		style.PrintWarning("could not check for existing MR: %v", err)
-		// FindMRForBranch failed — fall through to create a new MR
+		// Dedup check failed — fall through to create a new MR
 	}
 
 	if existingMR != nil {
@@ -225,17 +269,63 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		// Create MR bead (ephemeral wisp - will be cleaned up after merge)
 		mrIssue, err = bd.Create(beads.CreateOptions{
 			Title:       title,
-			Type:        "merge-request",
+			Labels:      []string{"gt:merge-request"},
 			Priority:    priority,
 			Description: description,
 			Ephemeral:   true,
+			Rig:         rigName, // Ensure MR bead is created in the rig's database (gt-7y7)
 		})
 		if err != nil {
 			return fmt.Errorf("creating merge request bead: %w", err)
 		}
 
+		// gt-gpy: Validate MR bead landed in the rig's database (warning only).
+		if prefixErr := beads.ValidateRigPrefix(townRoot, rigName, mrIssue.ID); prefixErr != nil {
+			style.PrintWarning("MR bead prefix mismatch: %v\nThe refinery may not find this MR — check 'gt mq list %s'", prefixErr, rigName)
+		}
+
 		// Nudge refinery to pick up the new MR
 		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
+
+		// GH#2599: Back-link source issue to MR bead for discoverability.
+		if issueID != "" {
+			comment := fmt.Sprintf("MR created: %s", mrIssue.ID)
+			if _, err := bd.Run("comments", "add", issueID, comment); err != nil {
+				style.PrintWarning("could not back-link source issue %s to MR %s: %v", issueID, mrIssue.ID, err)
+			}
+		}
+
+		// Supersede older open MRs for the same source issue.
+		// When a new polecat reattempts an issue, the old MR (different branch)
+		// is orphaned. Close it so the queue and GitHub PRs stay clean.
+		if issueID != "" {
+			if oldMRs, err := bd.FindOpenMRsForIssue(issueID); err == nil {
+				for _, old := range oldMRs {
+					if old.ID == mrIssue.ID {
+						continue // skip the one we just created
+					}
+					reason := fmt.Sprintf("superseded by %s", mrIssue.ID)
+					if err := bd.CloseWithReason(reason, old.ID); err != nil {
+						style.PrintWarning("could not supersede old MR %s: %v", old.ID, err)
+						continue
+					}
+					fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), old.ID)
+
+					// Delete the old remote branch to auto-close the GitHub PR.
+					// Only polecat branches — non-polecat branches may belong to
+					// contributor forks; deleting them closes upstream PRs. (GH#2669)
+					oldFields := beads.ParseMRFields(old)
+					if oldFields != nil && strings.HasPrefix(oldFields.Branch, "polecat/") {
+						g := git.NewGit(cwd)
+						if err := g.DeleteRemoteBranch("origin", oldFields.Branch); err != nil {
+							style.PrintWarning("could not delete superseded branch %s: %v", oldFields.Branch, err)
+						} else {
+							fmt.Printf("  %s Deleted remote branch: %s\n", style.Dim.Render("○"), oldFields.Branch)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Success output
@@ -264,6 +354,89 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// checkMoleculeStepDeps verifies that all prerequisite molecule steps are closed
+// before allowing submission to the merge queue. Returns an error listing
+// incomplete steps if any prerequisites are not yet done.
+func checkMoleculeStepDeps(bd *beads.Beads, sourceIssue *beads.Issue) error {
+	// Check if issue has an attached molecule
+	fields := beads.ParseAttachmentFields(sourceIssue)
+	if fields == nil || fields.AttachedMolecule == "" {
+		return nil // No molecule attached — no enforcement needed
+	}
+
+	moleculeID := fields.AttachedMolecule
+
+	// List all molecule steps (children of the molecule)
+	children, err := bd.List(beads.ListOptions{
+		Parent:   moleculeID,
+		Status:   "all",
+		Priority: -1,
+	})
+	if err != nil {
+		// If we can't list steps, warn but don't block submission
+		style.PrintWarning("could not check molecule steps for %s: %v", moleculeID, err)
+		return nil
+	}
+
+	return validateMoleculePrereqs(children)
+}
+
+// validateMoleculePrereqs checks that all molecule steps that are prerequisites
+// of the submit step are closed. Returns an error listing incomplete steps.
+// Extracted for testability — accepts step data directly.
+func validateMoleculePrereqs(children []*beads.Issue) error {
+	if len(children) == 0 {
+		return nil // No steps to check
+	}
+
+	// Find the submit step — it's the step whose title contains "submit"
+	// (case-insensitive). All steps that come before it in the dependency
+	// chain must be closed.
+	submitSeq := 999999
+	for _, child := range children {
+		titleLower := strings.ToLower(child.Title)
+		if strings.Contains(titleLower, "submit") {
+			seq := extractStepSequence(child.ID)
+			if seq < submitSeq {
+				submitSeq = seq
+			}
+			break
+		}
+	}
+
+	// Collect incomplete prerequisite steps.
+	// A prerequisite is any step sequenced before the submit step (by step
+	// number suffix) that is not closed. Steps at or after the submit step
+	// are post-submit (await-verdict, self-clean) and don't need to be done.
+	var incompleteSteps []*beads.Issue
+	for _, child := range children {
+		seq := extractStepSequence(child.ID)
+		if seq >= submitSeq {
+			continue // This is the submit step or a post-submit step
+		}
+		if child.Status != "closed" {
+			incompleteSteps = append(incompleteSteps, child)
+		}
+	}
+
+	if len(incompleteSteps) == 0 {
+		return nil // All prerequisites are closed
+	}
+
+	// Sort by sequence for readable output
+	sortStepsBySequence(incompleteSteps)
+
+	// Build error message listing incomplete steps
+	var sb strings.Builder
+	sb.WriteString("molecule step dependencies not met — incomplete prerequisite steps:\n")
+	for _, step := range incompleteSteps {
+		sb.WriteString(fmt.Sprintf("  ✗ %s: %s [%s]\n", step.ID, step.Title, step.Status))
+	}
+	sb.WriteString(fmt.Sprintf("\nComplete these steps before submitting, or use --skip-deps to override."))
+
+	return fmt.Errorf("%s", sb.String())
 }
 
 // polecatCleanup sends a lifecycle shutdown request to the witness and waits for termination.

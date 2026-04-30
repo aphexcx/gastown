@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 const (
@@ -78,7 +80,9 @@ func DeliveryAckLabelSequenceIdempotent(recipientIdentity string, at time.Time, 
 // AcknowledgeDeliveryBead writes phase-2 delivery ack labels for a bead.
 // It reads existing labels for idempotent retry (reusing prior timestamps),
 // then writes the ack label sequence. Uses runBdCommand with timeouts.
+// Resolves the correct beadsDir based on the bead ID prefix (GH#2423).
 func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string) error {
+	beadsDir = beads.ResolveBeadsDirForID(beadsDir, beadID)
 	existingLabels, readErr := readBeadLabelsShared(workDir, beadsDir, beadID)
 	if readErr != nil {
 		// Log but proceed with empty labels — fresh timestamp is acceptable
@@ -94,7 +98,7 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 		if err == nil {
 			continue // bd label add silently succeeds on duplicate labels.
 		}
-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
+		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found")) {
 			return ErrMessageNotFound
 		}
 		return err

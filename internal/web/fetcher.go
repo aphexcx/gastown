@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/activity"
@@ -18,6 +19,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -44,9 +46,15 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 }
 
 var fetcherRunCmd = runCmd
+var fetcherGetSessionEnv = func(sessionName, key string) (string, error) {
+	return tmux.NewTmux().GetEnvironment(sessionName, key)
+}
 
 // runBdCmd executes a bd command with the configured cmdTimeout in the specified beads directory.
 func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Buffer, error) {
+	// bd v0.59+ requires --flat for list --json to produce JSON output
+	args = beads.InjectFlatForListJSON(args)
+
 	ctx, cancel := context.WithTimeout(context.Background(), f.cmdTimeout)
 	defer cancel()
 
@@ -73,6 +81,51 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 	return &stdout, nil
 }
 
+// fetchCircuitBreaker tracks consecutive failures for a fetch operation
+// and applies exponential backoff to prevent process storms.
+type fetchCircuitBreaker struct {
+	mu          sync.Mutex
+	failures    int
+	lastAttempt time.Time
+	backoff     time.Duration
+}
+
+// maxBackoff is the maximum backoff duration for the circuit breaker.
+const maxBackoff = 5 * time.Minute
+
+// allow returns true if enough time has passed since the last failure to permit
+// a new attempt. Always allows the first attempt (zero failures).
+func (cb *fetchCircuitBreaker) allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures == 0 {
+		return true
+	}
+	return time.Since(cb.lastAttempt) >= cb.backoff
+}
+
+// recordFailure increments the failure count and sets exponential backoff.
+// Backoff doubles from 10s up to maxBackoff.
+func (cb *fetchCircuitBreaker) recordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastAttempt = time.Now()
+	// Exponential backoff: 10s, 20s, 40s, 80s, 160s, capped at maxBackoff
+	cb.backoff = time.Duration(1<<min(cb.failures, 10)) * 5 * time.Second
+	if cb.backoff > maxBackoff {
+		cb.backoff = maxBackoff
+	}
+}
+
+// recordSuccess resets the circuit breaker on a successful fetch.
+func (cb *fetchCircuitBreaker) recordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures = 0
+	cb.backoff = 0
+}
+
 // LiveConvoyFetcher fetches convoy data from beads.
 type LiveConvoyFetcher struct {
 	townRoot  string
@@ -80,6 +133,12 @@ type LiveConvoyFetcher struct {
 
 	// bdBin is the bd binary name or path. Defaults to "bd" if empty.
 	bdBin string
+
+	// registry is a prefix registry built from the town's rigs.json.
+	// Used for parsing tmux session names instead of relying on the
+	// package-level DefaultRegistry, which may not be initialized in
+	// the dashboard process context.
+	registry *session.PrefixRegistry
 
 	// Configurable timeouts (from TownSettings.WebTimeouts)
 	cmdTimeout     time.Duration
@@ -91,6 +150,10 @@ type LiveConvoyFetcher struct {
 	stuckThreshold          time.Duration
 	heartbeatFreshThreshold time.Duration
 	mayorActiveThreshold    time.Duration
+
+	// Circuit breaker for FetchConvoys — prevents process storms when
+	// bd list --type=convoy fails persistently (e.g., schema mismatch).
+	convoyBreaker fetchCircuitBreaker
 }
 
 // NewLiveConvoyFetcher creates a fetcher for the current workspace.
@@ -114,9 +177,19 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 		}
 	}
 
+	// Build a local prefix registry from the town's rigs.json so session
+	// name parsing works regardless of whether the package-level
+	// DefaultRegistry was initialized (gt-y24).
+	registry, regErr := session.BuildPrefixRegistryFromTown(townRoot)
+	if regErr != nil {
+		log.Printf("dashboard: failed to build prefix registry: %v (falling back to default)", regErr)
+		registry = session.DefaultRegistry()
+	}
+
 	return &LiveConvoyFetcher{
 		townRoot:                townRoot,
 		townBeads:               filepath.Join(townRoot, ".beads"),
+		registry:                registry,
 		cmdTimeout:              config.ParseDurationOrDefault(webCfg.CmdTimeout, 15*time.Second),
 		ghCmdTimeout:            config.ParseDurationOrDefault(webCfg.GhCmdTimeout, 10*time.Second),
 		tmuxCmdTimeout:          config.ParseDurationOrDefault(webCfg.TmuxCmdTimeout, 2*time.Second),
@@ -128,10 +201,17 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 }
 
 // FetchConvoys fetches all open convoys with their activity data.
+// Uses a circuit breaker to avoid hammering bd/dolt when listing fails
+// persistently (e.g., "invalid issue type: convoy" schema mismatch).
 func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
+	if !f.convoyBreaker.allow() {
+		return nil, nil // Backed off — return empty result silently
+	}
+
 	// List all open convoy issues
 	stdout, err := f.runBdCmd(f.townRoot, "list", "--type=convoy", "--status=open", "--json")
 	if err != nil {
+		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
 
@@ -165,9 +245,14 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		var mostRecentActivity time.Time
 		var mostRecentUpdated time.Time
 		var hasAssignee bool
+		assigneeSet := make(map[string]struct{})
 		for _, t := range tracked {
 			if t.Status == "closed" {
 				row.Completed++
+			} else if t.Assignee != "" {
+				row.InProgress++
+			} else {
+				row.ReadyBeads++
 			}
 			// Track most recent activity from workers
 			if t.LastActivity.After(mostRecentActivity) {
@@ -179,10 +264,21 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 			}
 			if t.Assignee != "" {
 				hasAssignee = true
+				assigneeSet[t.Assignee] = struct{}{}
 			}
 		}
 
+		// Collect unique assignees (sorted for stable display order)
+		row.Assignees = make([]string, 0, len(assigneeSet))
+		for a := range assigneeSet {
+			row.Assignees = append(row.Assignees, a)
+		}
+		sort.Strings(row.Assignees)
+
 		row.Progress = fmt.Sprintf("%d/%d", row.Completed, row.Total)
+		if row.Total > 0 {
+			row.ProgressPct = (row.Completed * 100) / row.Total
+		}
 
 		// Calculate activity info from most recent worker activity
 		if !mostRecentActivity.IsZero() {
@@ -231,6 +327,7 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		rows = append(rows, row)
 	}
 
+	f.convoyBreaker.recordSuccess()
 	return rows, nil
 }
 
@@ -243,7 +340,6 @@ type trackedIssueInfo struct {
 	LastActivity time.Time
 	UpdatedAt    time.Time // Fallback for activity when no assignee
 }
-
 
 // getTrackedIssues fetches tracked issues for a convoy.
 func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInfo, error) {
@@ -463,8 +559,10 @@ func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 		}
 
 		sessionName := parts[0]
-		// Check if it's a polecat or crew session (skip infrastructure roles)
-		identity, err := session.ParseSessionName(sessionName)
+		// Check if it's a polecat or crew session (skip infrastructure roles).
+		// Use the fetcher's own registry to avoid dependency on global
+		// DefaultRegistry initialization (gt-y24).
+		identity, err := session.ParseSessionNameWithRegistry(sessionName, f.registry)
 		if err != nil {
 			continue
 		}
@@ -727,10 +825,11 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 
 		sessionName := parts[0]
 
-		// Filter for gt-<rig>-<polecat> pattern
-		// Parse session name using canonical parser
-		identity, err := session.ParseSessionName(sessionName)
+		// Parse session name using the fetcher's own registry to avoid
+		// dependency on global DefaultRegistry initialization (gt-y24).
+		identity, err := session.ParseSessionNameWithRegistry(sessionName, f.registry)
 		if err != nil {
+			log.Printf("dashboard: FetchWorkers: skipping session %q: %v", sessionName, err)
 			continue
 		}
 
@@ -1232,7 +1331,7 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 	heartbeatFile := filepath.Join(f.townRoot, "deacon", "heartbeat.json")
 	if data, err := os.ReadFile(heartbeatFile); err == nil {
 		var hb struct {
-			LastHeartbeat   time.Time `json:"last_heartbeat"`
+			LastHeartbeat   time.Time `json:"timestamp"`
 			Cycle           int64     `json:"cycle"`
 			HealthyAgents   int       `json:"healthy_agents"`
 			UnhealthyAgents int       `json:"unhealthy_agents"`
@@ -1325,7 +1424,7 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 // FetchSessions returns active tmux sessions with role detection.
 func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		return nil, nil // tmux not running or no sessions
 	}
@@ -1357,8 +1456,8 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 			}
 		}
 
-		// Detect role from session name using canonical parser
-		if identity, err := session.ParseSessionName(name); err == nil {
+		// Detect role from session name using fetcher's own registry (gt-y24)
+		if identity, err := session.ParseSessionNameWithRegistry(name, f.registry); err == nil {
 			row.Rig = identity.Rig
 			row.Role = string(identity.Role)
 			row.Worker = identity.Name
@@ -1443,7 +1542,7 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	mayorSessionName := session.MayorSessionName()
 
 	// Check if mayor tmux session exists
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return status, nil
@@ -1468,12 +1567,86 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 		}
 	}
 
-	// Try to detect runtime from mayor config or session
 	if status.IsAttached {
-		status.Runtime = "claude" // Default; could enhance to detect actual runtime
+		status.Runtime = f.resolveMayorRuntime(mayorSessionName)
 	}
 
 	return status, nil
+}
+
+func (f *LiveConvoyFetcher) resolveMayorRuntime(sessionName string) string {
+	if agentName, err := fetcherGetSessionEnv(sessionName, "GT_AGENT"); err == nil && strings.TrimSpace(agentName) != "" {
+		agentName = strings.TrimSpace(agentName)
+		rc, _, resolveErr := config.ResolveAgentConfigWithOverride(f.townRoot, "", agentName)
+		if resolveErr == nil {
+			return runtimeLabelForRuntimeConfig(rc, agentName)
+		}
+		if roleRC := config.ResolveRoleAgentConfig(constants.RoleMayor, f.townRoot, ""); roleRC != nil && strings.TrimSpace(roleRC.ResolvedAgent) == agentName {
+			return runtimeLabelForRuntimeConfig(roleRC, agentName)
+		}
+		return agentName
+	}
+
+	return runtimeLabelForRuntimeConfig(config.ResolveRoleAgentConfig(constants.RoleMayor, f.townRoot, ""), "")
+}
+
+func runtimeLabelForRuntimeConfig(rc *config.RuntimeConfig, fallback string) string {
+	if rc == nil {
+		if fallback != "" {
+			return fallback
+		}
+		return "claude"
+	}
+	if fallback == "" {
+		fallback = rc.ResolvedAgent
+	}
+	return runtimeLabelFromConfig(rc.Command, rc.Args, fallback)
+}
+
+func runtimeLabelFromConfig(command string, args []string, fallback string) string {
+	command = strings.TrimSpace(command)
+	cmd := ""
+	if command != "" {
+		cmd = strings.TrimSpace(filepath.Base(command))
+	}
+	if cmd == "" {
+		cmd = fallback
+	}
+	if cmd == "" {
+		cmd = "claude"
+	}
+	if cmd == "cgroup-wrap" && len(args) > 0 {
+		cmd = filepath.Base(args[0])
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if (arg == "--model" || arg == "-m") && i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
+			return cmd + "/" + stripModelSuffix(strings.TrimSpace(args[i+1]))
+		}
+		if strings.HasPrefix(arg, "--model=") {
+			if v := strings.TrimSpace(strings.TrimPrefix(arg, "--model=")); v != "" {
+				return cmd + "/" + stripModelSuffix(v)
+			}
+		}
+		if strings.HasPrefix(arg, "-m=") {
+			if v := strings.TrimSpace(strings.TrimPrefix(arg, "-m=")); v != "" {
+				return cmd + "/" + stripModelSuffix(v)
+			}
+		}
+	}
+
+	return cmd
+}
+
+// stripModelSuffix removes bracketed context-window hints (e.g. "[1m]")
+// from model names so the dashboard label stays human-readable.
+// "sonnet[1m]" → "sonnet", "opus" → "opus".
+func stripModelSuffix(model string) string {
+	if idx := strings.Index(model, "["); idx > 0 {
+		return model[:idx]
+	}
+	return model
 }
 
 // FetchIssues returns open issues (the backlog).

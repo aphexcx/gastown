@@ -2,6 +2,7 @@
 package deacon
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // StaleHookConfig holds configurable parameters for stale hook detection.
@@ -154,8 +156,9 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 
 // listHookedBeads returns all beads with status=hooked.
 func listHookedBeads(townRoot string) ([]*HookedBead, error) {
-	cmd := exec.Command("bd", "list", "--status=hooked", "--json", "--limit=0")
+	cmd := exec.Command("bd", "list", "--status=hooked", "--json", "--flat", "--limit=0")
 	cmd.Dir = townRoot
+	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -166,7 +169,8 @@ func listHookedBeads(townRoot string) ([]*HookedBead, error) {
 		return nil, err
 	}
 
-	if len(output) == 0 || string(output) == "[]" || string(output) == "null\n" {
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || string(trimmed) == "null" || (trimmed[0] != '[' && trimmed[0] != '{') {
 		return nil, nil
 	}
 
@@ -250,5 +254,6 @@ func assigneeToWorktreePath(townRoot, assignee string) string {
 func unhookBead(townRoot, beadID string) error {
 	cmd := exec.Command("bd", "update", beadID, "--status=open")
 	cmd.Dir = townRoot
+	util.SetDetachedProcessGroup(cmd)
 	return cmd.Run()
 }

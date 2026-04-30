@@ -223,13 +223,15 @@ var doltSyncCmd = &cobra.Command{
 	Short: "Push Dolt databases to DoltHub remotes",
 	Long: `Push all local Dolt databases to their configured DoltHub remotes.
 
+When the Dolt server is running, pushes via SQL (CALL DOLT_PUSH) so the server
+stays up and running agents are not disrupted. Falls back to CLI push (which
+requires stopping the server) only when the server is not running.
+
 This command automates the tedious process of pushing each database individually:
-  1. Stops the Dolt server (required for CLI push)
-  2. Optionally purges closed ephemeral beads (--gc)
-  3. Iterates databases in .dolt-data/
-  4. For each database with a configured remote, runs dolt push
-  5. Reports success/failure per database
-  6. Restarts the Dolt server
+  1. Optionally purges closed ephemeral beads (--gc)
+  2. Iterates databases in .dolt-data/
+  3. For each database with a configured remote, pushes via SQL or CLI
+  4. Reports success/failure per database
 
 Use --db to sync a single database, --dry-run to preview, or --force for force-push.
 Use --gc to purge closed ephemeral beads (wisps, convoys) before pushing.
@@ -242,6 +244,26 @@ Examples:
   gt dolt sync --gc           # Purge closed ephemeral beads, then push
   gt dolt sync --gc --dry-run # Preview purge + push without changes`,
 	RunE: runDoltSync,
+}
+
+var doltPullCmd = &cobra.Command{
+	Use:   "pull",
+	Short: "Pull Dolt databases from remotes",
+	Long: `Pull all local Dolt databases from their configured remotes.
+
+When the Dolt server is running, pulls via SQL (CALL DOLT_PULL) so the server
+stays up and avoids lock contention. Falls back to CLI pull only when the server
+is not running.
+
+This is the safe way to pull databases — using 'dolt pull' directly on a database
+that the server is managing can cause exclusive lock contention and prevent
+server restarts.
+
+Examples:
+  gt dolt pull                # Pull all databases with remotes
+  gt dolt pull --db xtm       # Pull only the xtm database
+  gt dolt pull --dry-run      # Preview what would be pulled`,
+	RunE: runDoltPull,
 }
 
 var doltCleanupCmd = &cobra.Command{
@@ -316,6 +338,8 @@ var (
 	doltSyncForce       bool
 	doltSyncDB          string
 	doltSyncGC          bool
+	doltPullDry         bool
+	doltPullDB          string
 )
 
 func init() {
@@ -336,6 +360,7 @@ func init() {
 	doltCmd.AddCommand(doltCleanupCmd)
 	doltCmd.AddCommand(doltRollbackCmd)
 	doltCmd.AddCommand(doltSyncCmd)
+	doltCmd.AddCommand(doltPullCmd)
 	doltCmd.AddCommand(doltMigrateWispsCmd)
 
 	doltKillImpostersCmd.Flags().BoolVar(&doltKillImpostersDry, "dry-run", false, "Preview without killing")
@@ -354,6 +379,9 @@ func init() {
 	doltSyncCmd.Flags().BoolVar(&doltSyncForce, "force", false, "Force-push to remotes")
 	doltSyncCmd.Flags().StringVar(&doltSyncDB, "db", "", "Sync a single database instead of all")
 	doltSyncCmd.Flags().BoolVar(&doltSyncGC, "gc", false, "Purge closed ephemeral beads before push (requires bd purge)")
+
+	doltPullCmd.Flags().BoolVar(&doltPullDry, "dry-run", false, "Preview what would be pulled without pulling")
+	doltPullCmd.Flags().StringVar(&doltPullDB, "db", "", "Pull a single database instead of all")
 
 	doltMigrateWispsCmd.Flags().BoolVar(&doltMigrateWispsDry, "dry-run", false, "Preview what would be migrated without making changes")
 	doltMigrateWispsCmd.Flags().StringVar(&doltMigrateWispsDB, "db", "", "Target database (default: auto-detect from rig)")
@@ -764,6 +792,8 @@ func runDoltSQL(cmd *cobra.Command, args []string) error {
 			"sql",
 		}
 		sqlCmd := exec.Command("dolt", sqlArgs...)
+		// GH#2537: Set cmd.Dir to prevent stray .doltcfg/privileges.db in CWD.
+		sqlCmd.Dir = config.DataDir
 		if config.Password != "" {
 			sqlCmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+config.Password)
 		}
@@ -838,7 +868,10 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find workspaces with broken Dolt configuration
-	broken := doltserver.FindBrokenWorkspaces(townRoot)
+	broken, verifyWarning := doltserver.FindBrokenWorkspaces(townRoot)
+	if verifyWarning != "" {
+		fmt.Printf("  %s %s\n\n", style.Bold.Render("⚠"), verifyWarning)
+	}
 
 	// Check for orphaned databases regardless of broken workspaces
 	orphans, orphanErr := doltserver.FindOrphanedDatabases(townRoot)
@@ -871,6 +904,12 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 
 	repaired := 0
 	for _, ws := range broken {
+		if ws.NotServed {
+			fmt.Printf("  %s %s: database %q exists on disk but is not served by the running Dolt server\n",
+				style.Bold.Render("!"), ws.RigName, ws.ConfiguredDB)
+			fmt.Printf("    Try restarting the server: %s\n", style.Dim.Render("gt dolt restart"))
+			continue
+		}
 		fmt.Printf("  %s %s: metadata.json → database %q (missing from .dolt-data/)\n",
 			style.Bold.Render("!"), ws.RigName, ws.ConfiguredDB)
 		if ws.HasLocalData {
@@ -929,6 +968,23 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	if doltCleanupDry {
 		fmt.Println("\nDry run: no changes made.")
 		return nil
+	}
+
+	// BALK: If orphans are a large fraction of all databases, something is likely
+	// wrong with the orphan detection (e.g., metadata files not found). Refuse to
+	// proceed without --force to prevent accidentally dropping production databases. (gt-xvh)
+	allDBs, _ := doltserver.ListDatabases(townRoot)
+	if len(allDBs) > 0 && !doltCleanupForce {
+		orphanRatio := float64(len(orphans)) / float64(len(allDBs))
+		if orphanRatio > 0.5 && len(orphans) > 3 {
+			fmt.Printf("\n%s %d of %d databases (%.0f%%) flagged as orphans — this is suspicious.\n",
+				style.Bold.Render("!"), len(orphans), len(allDBs), orphanRatio*100)
+			fmt.Printf("  This usually means metadata.json files are missing or incorrect,\n")
+			fmt.Printf("  not that the databases are actually orphaned.\n\n")
+			fmt.Printf("  To proceed anyway: gt dolt cleanup --force\n")
+			fmt.Printf("  To diagnose: gt dolt list   (check owner column for mismatches)\n")
+			return fmt.Errorf("refusing to clean %d/%d databases without --force (safety check, gt-xvh)", len(orphans), len(allDBs))
+		}
 	}
 
 	// BALK: If there are too many orphans, SQL-based cleanup will take hours
@@ -1404,10 +1460,9 @@ func runDoltSync(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check server state
-	wasRunning, pid, _ := doltserver.IsRunning(townRoot)
+	wasRunning, _, _ := doltserver.IsRunning(townRoot)
 
-	// GC phase: purge closed ephemeral beads BEFORE stopping the server.
-	// bd purge needs SQL access via the running Dolt server.
+	// GC phase: purge closed ephemeral beads (requires running server).
 	purgeResults := make(map[string]struct {
 		purged int
 		err    error
@@ -1434,77 +1489,22 @@ func runDoltSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Park all rigs before stopping the server.
-	// This stops witnesses/refineries so they don't detect the outage
-	// and restart the server while we're pushing.
-	var parkedRigs []string
-	if wasRunning && !doltSyncDry {
-		rigs, discoverErr := discoverAllRigs(townRoot)
-		if discoverErr != nil {
-			fmt.Printf("%s Could not discover rigs (continuing without parking): %v\n",
-				style.Warning.Render("!"), discoverErr)
-		} else {
-			for _, r := range rigs {
-				name := r.Name
-				if IsRigParked(townRoot, name) {
-					continue // already parked, don't touch it
-				}
-				if err := parkOneRig(name); err != nil {
-					fmt.Printf("%s Failed to park %s: %v\n", style.Warning.Render("!"), name, err)
-				} else {
-					parkedRigs = append(parkedRigs, name)
-				}
-			}
-		}
-	}
-
-	if wasRunning {
-		fmt.Printf("Stopping Dolt server (PID %d)...\n", pid)
-		if err := doltserver.Stop(townRoot); err != nil {
-			// If --gc ran, the server may have exited during the purge window (TOCTOU).
-			// Re-check actual state rather than matching error strings — Stop() can fail
-			// with various race-related errors (not running, process gone, etc.).
-			if doltSyncGC {
-				if stillRunning, _, _ := doltserver.IsRunning(townRoot); !stillRunning {
-					fmt.Printf("%s Dolt server already stopped (exited during GC)\n", style.Bold.Render("~"))
-				} else {
-					return fmt.Errorf("stopping Dolt server: %w", err)
-				}
-			} else {
-				return fmt.Errorf("stopping Dolt server: %w", err)
-			}
-		} else {
-			fmt.Printf("%s Dolt server stopped\n", style.Bold.Render("✓"))
-		}
-
-		// Guarantee restart even if push fails
-		defer func() {
-			fmt.Printf("\nRestarting Dolt server...\n")
-			if startErr := doltserver.Start(townRoot); startErr != nil {
-				fmt.Printf("%s Failed to restart Dolt server: %v\n", style.Bold.Render("✗"), startErr)
-				fmt.Printf("  Start manually with: %s\n", style.Dim.Render("gt dolt start"))
-			} else {
-				// Start() now verifies the server is accepting connections,
-				// so if we get here it's genuinely ready.
-				fmt.Printf("%s Dolt server restarted (accepting connections)\n", style.Bold.Render("✓"))
-			}
-
-			// Unpark rigs that we parked
-			for _, name := range parkedRigs {
-				if err := unparkOneRig(name); err != nil {
-					fmt.Printf("%s Failed to unpark %s: %v\n", style.Warning.Render("!"), name, err)
-				}
-			}
-		}()
-	}
-
 	opts := doltserver.SyncOptions{
 		Force:  doltSyncForce,
 		DryRun: doltSyncDry,
 		Filter: doltSyncDB,
 	}
 
-	results := doltserver.SyncDatabases(townRoot, opts)
+	// Use SQL push through the running server (no downtime).
+	// Fall back to CLI push (with server stop/restart) only when server isn't running.
+	var results []doltserver.SyncResult
+	if wasRunning {
+		fmt.Printf("Pushing via SQL (server stays running)...\n")
+		results = doltserver.SyncDatabasesSQL(townRoot, opts)
+	} else {
+		fmt.Printf("Server not running — using CLI push...\n")
+		results = doltserver.SyncDatabases(townRoot, opts)
+	}
 
 	if len(results) == 0 {
 		fmt.Println("No databases to sync.")
@@ -1562,6 +1562,75 @@ func runDoltSync(cmd *cobra.Command, args []string) error {
 
 	if failed > 0 {
 		return fmt.Errorf("%d database(s) failed to sync", failed)
+	}
+	return nil
+}
+
+func runDoltPull(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	config := doltserver.DefaultConfig(townRoot)
+	if config.IsRemote() {
+		return fmt.Errorf("Dolt server is remote (%s) — pull requires local server access", config.HostPort())
+	}
+
+	// Validate --db flag if set
+	if doltPullDB != "" && !doltserver.DatabaseExists(townRoot, doltPullDB) {
+		return fmt.Errorf("database %q not found in .dolt-data/\nRun 'gt dolt list' to see available databases", doltPullDB)
+	}
+
+	// Check server state
+	wasRunning, _, _ := doltserver.IsRunning(townRoot)
+
+	opts := doltserver.SyncOptions{
+		DryRun: doltPullDry,
+		Filter: doltPullDB,
+	}
+
+	// Use SQL pull through the running server (no lock contention).
+	// Fall back to CLI pull only when server isn't running.
+	var results []doltserver.SyncResult
+	if wasRunning {
+		fmt.Printf("Pulling via SQL (server stays running)...\n")
+		results = doltserver.PullDatabasesSQL(townRoot, opts)
+	} else {
+		fmt.Printf("Server not running — using CLI pull...\n")
+		results = doltserver.PullDatabases(townRoot, opts)
+	}
+
+	if len(results) == 0 {
+		fmt.Println("No databases to pull.")
+		return nil
+	}
+
+	fmt.Printf("\nPulling %d database(s)...\n", len(results))
+
+	var pulled, skipped, failed int
+	for _, r := range results {
+		switch {
+		case r.Pushed: // reused field = success
+			fmt.Printf("  %s %s ← %s\n", style.Bold.Render("✓"), r.Database, r.Remote)
+			pulled++
+		case r.DryRun:
+			fmt.Printf("  %s %s ← %s (dry run)\n", style.Bold.Render("~"), r.Database, r.Remote)
+			pulled++
+		case r.Skipped:
+			fmt.Printf("  %s %s — no remote configured\n", style.Dim.Render("○"), r.Database)
+			skipped++
+		case r.Error != nil:
+			fmt.Printf("  %s %s ← remote\n", style.Bold.Render("✗"), r.Database)
+			fmt.Printf("    error: %v\n", r.Error)
+			failed++
+		}
+	}
+
+	fmt.Printf("\nSummary: %d pulled, %d skipped, %d failed\n", pulled, skipped, failed)
+
+	if failed > 0 {
+		return fmt.Errorf("%d database(s) failed to pull", failed)
 	}
 	return nil
 }

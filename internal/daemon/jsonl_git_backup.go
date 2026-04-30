@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
@@ -42,8 +43,8 @@ var testPollutionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`-wisp-`),                                       // id: wisp-pattern IDs leaked into issues table
 }
 
-// validDBName matches safe database names (alphanumeric + underscore only).
-var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+// validDBName matches safe database names (alphanumeric, underscore, hyphen).
+var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // scrubQuery is the WHERE clause for filtering ephemeral data.
 // Kept separate from Sprintf to avoid %% confusion.
@@ -78,7 +79,7 @@ func jsonlGitBackupInterval(config *DaemonPatrolConfig) time.Duration {
 // and commits/pushes to a git repository.
 // Non-fatal: errors are logged but don't stop the daemon.
 func (d *Daemon) syncJsonlGitBackup() {
-	if !IsPatrolEnabled(d.patrolConfig, "jsonl_git_backup") {
+	if !d.isPatrolActive("jsonl_git_backup") {
 		return
 	}
 
@@ -250,14 +251,6 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 	}
 	total += n
 
-	// Also write legacy flat file for backward compatibility.
-	legacyPath := filepath.Join(gitRepo, db+".jsonl")
-	newIssuesPath := filepath.Join(dbDir, "issues.jsonl")
-	// Copy instead of symlink for git compatibility.
-	if data, err := os.ReadFile(newIssuesPath); err == nil {
-		_ = os.WriteFile(legacyPath, data, 0644)
-	}
-
 	// 2. Export supplemental tables (no scrub, full export).
 	for _, table := range supplementalTables {
 		tQuery := fmt.Sprintf("SELECT * FROM `%s`.`%s` ORDER BY 1", db, table)
@@ -275,13 +268,49 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 }
 
 // exportTableToJsonl runs a query and writes the result as JSONL to {dir}/{table}.jsonl.
+// Connects to the running Dolt server via --host/--port to get current committed data,
+// falling back to embedded mode (cmd.Dir=dataDir) if no server config is available.
 // Returns the number of records exported.
 func (d *Daemon) exportTableToJsonl(table, query, dir, dataDir string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), jsonlExportTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "dolt", "sql", "-r", "json", "-q", query)
+	// Prefer querying the running server (accurate, up-to-date data) over embedded
+	// mode (reads on-disk state which may lag behind server commits).
+	host := "127.0.0.1"
+	port := 3307
+	user := "root"
+	password := ""
+	useServer := false
+	if d.doltServer != nil && d.doltServer.IsEnabled() {
+		if d.doltServer.config.Host != "" {
+			host = d.doltServer.config.Host
+		}
+		if d.doltServer.config.Port != 0 {
+			port = d.doltServer.config.Port
+		}
+		if d.doltServer.config.User != "" {
+			user = d.doltServer.config.User
+		}
+		password = d.doltServer.config.Password
+		useServer = true
+	}
+
+	var cmd *exec.Cmd
+	if useServer {
+		cmd = exec.CommandContext(ctx, "dolt",
+			"--host", host,
+			"--port", strconv.Itoa(port),
+			"--no-tls",
+			"-u", user,
+			"-p", password,
+			"sql", "-r", "json", "-q", query)
+	} else {
+		cmd = exec.CommandContext(ctx, "dolt", "sql", "-r", "json", "-q", query)
+	}
+	// Always set cmd.Dir to prevent stray .doltcfg/ creation (GH#2537).
 	cmd.Dir = dataDir
+	util.SetDetachedProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -362,6 +391,9 @@ func (d *Daemon) commitAndPushJsonlBackup(gitRepo string, databases []string, co
 		return fmt.Errorf("git commit: %w", err)
 	}
 
+	// Successful commit — clear any spike baseline since HEAD is now up to date.
+	removeSpikeBaseline(gitRepo)
+
 	// Push — only if a remote is configured. Skip gracefully if not.
 	if d.hasGitRemote(gitRepo, "origin") {
 		// Detect current branch name for push (master vs main).
@@ -385,6 +417,7 @@ func (d *Daemon) hasGitRemote(gitRepo, name string) bool {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "remote", "get-url", name)
+	util.SetDetachedProcessGroup(cmd)
 	return cmd.Run() == nil
 }
 
@@ -394,6 +427,7 @@ func (d *Daemon) currentGitBranch(gitRepo string) string {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "rev-parse", "--abbrev-ref", "HEAD")
+	util.SetDetachedProcessGroup(cmd)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
@@ -408,6 +442,7 @@ func (d *Daemon) runGitCmd(dir string, timeout time.Duration, args ...string) er
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	util.SetDetachedProcessGroup(cmd)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -430,6 +465,8 @@ func (d *Daemon) escalate(source, message string) {
 	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", "HIGH",
 		fmt.Sprintf("%s: %s", source, message))
 	cmd.Dir = d.config.TownRoot
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
+	util.SetDetachedProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("jsonl_git_backup: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
@@ -505,6 +542,7 @@ func previousCommitLineCount(gitRepo, relPath string) (int, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "show", "HEAD:"+filepath.ToSlash(relPath))
+	util.SetDetachedProcessGroup(cmd)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	// stderr intentionally not captured — "does not exist" is an expected case.
@@ -531,6 +569,72 @@ type spikeInfo struct {
 	Delta    float64 // absolute fractional change (0.0–1.0+)
 }
 
+// spikeBaseline records counts from a halted export so that subsequent runs
+// can detect when the count has stabilized at a new level.
+type spikeBaseline struct {
+	Counts    map[string]int `json:"counts"`
+	Timestamp string         `json:"timestamp"`
+}
+
+const spikeBaselineFile = ".spike-counts.json"
+
+// loadSpikeBaseline reads the spike baseline file from the git repo directory.
+// Returns nil if the file doesn't exist or can't be parsed.
+func loadSpikeBaseline(gitRepo string) *spikeBaseline {
+	path := filepath.Join(gitRepo, spikeBaselineFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var sb spikeBaseline
+	if err := json.Unmarshal(data, &sb); err != nil {
+		return nil
+	}
+	return &sb
+}
+
+// saveSpikeBaseline writes the current counts as a spike baseline file.
+// Also ensures the file is git-ignored so it doesn't get committed.
+func saveSpikeBaseline(gitRepo string, counts map[string]int) error {
+	sb := spikeBaseline{
+		Counts:    counts,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	data, err := json.MarshalIndent(sb, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Ensure the spike baseline file is git-ignored.
+	ensureGitIgnore(gitRepo, spikeBaselineFile)
+	return os.WriteFile(filepath.Join(gitRepo, spikeBaselineFile), data, 0644)
+}
+
+// ensureGitIgnore adds an entry to .gitignore if not already present.
+func ensureGitIgnore(gitRepo, entry string) {
+	ignorePath := filepath.Join(gitRepo, ".gitignore")
+	data, _ := os.ReadFile(ignorePath)
+	content := string(data)
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == entry {
+			return // Already present.
+		}
+	}
+	// Append the entry.
+	if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	content += entry + "\n"
+	if err := os.WriteFile(ignorePath, []byte(content), 0644); err != nil {
+		// Non-fatal: spike-baseline writes still work without the ignore entry.
+		return
+	}
+}
+
+// removeSpikeBaseline removes the spike baseline file after a successful commit.
+func removeSpikeBaseline(gitRepo string) {
+	os.Remove(filepath.Join(gitRepo, spikeBaselineFile))
+}
+
 // verifyExportCounts compares current export line counts against the previous
 // commit for each database. Returns a list of anomalies that exceed the spike
 // threshold. On first export (no baseline), verification is skipped.
@@ -539,10 +643,17 @@ type spikeInfo struct {
 // increases (new issues filed) use 2x the threshold since growth is normal.
 // Small absolute changes (<20 records) are always allowed to avoid false alarms
 // on small databases.
+//
+// Recovery mechanism: when spike detection fires, a baseline file is saved with
+// the current counts. On the next run, if the current count is stable relative
+// to the spike baseline (within threshold), the spike is cleared and the export
+// proceeds. This prevents permanent blocking after legitimate large changes
+// (e.g., Reaper purges, filter updates).
 func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts map[string]int, threshold float64) []spikeInfo {
 	const minAbsoluteDelta = 20 // ignore changes smaller than this many records
 
 	var spikes []spikeInfo
+	spikeBase := loadSpikeBaseline(gitRepo)
 
 	for _, db := range databases {
 		currentCount, ok := counts[db]
@@ -582,6 +693,19 @@ func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts m
 		}
 
 		if fractionalDelta > effectiveThreshold {
+			// Check spike baseline: if the current count is stable relative
+			// to a previously-halted count, this is a confirmed new level.
+			if spikeBase != nil {
+				if baseCount, ok := spikeBase.Counts[db]; ok && baseCount > 0 {
+					baseDelta := math.Abs(float64(currentCount-baseCount)) / float64(baseCount)
+					if baseDelta <= threshold {
+						d.logger.Printf("jsonl_git_backup: %s: count stable vs spike baseline (%d → %d, %.1f%% vs baseline %d), accepting new level",
+							db, prevCount, currentCount, fractionalDelta*100, baseCount)
+						continue // Stable relative to spike baseline — not a new spike.
+					}
+				}
+			}
+
 			spike := spikeInfo{
 				DB:       db,
 				File:     relPath,
@@ -599,6 +723,14 @@ func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts m
 				db, direction, prevCount, currentCount, fractionalDelta*100, direction, effectiveThreshold*100)
 		}
 	}
+
+	// Save or clear spike baseline depending on results.
+	if len(spikes) > 0 {
+		if err := saveSpikeBaseline(gitRepo, counts); err != nil {
+			d.logger.Printf("jsonl_git_backup: failed to save spike baseline: %v", err)
+		}
+	}
+
 	return spikes
 }
 
@@ -671,9 +803,6 @@ func (d *Daemon) applyPollutionFilter(gitRepo string, databases []string) int {
 				d.logger.Printf("jsonl_git_backup: %s: error writing filtered file: %v", db, err)
 				continue
 			}
-			// Also update legacy flat file.
-			legacyPath := filepath.Join(gitRepo, db+".jsonl")
-			_ = os.WriteFile(legacyPath, filtered, 0644)
 			totalRemoved += removed
 		}
 	}

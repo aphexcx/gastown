@@ -41,6 +41,10 @@ func TestCreateBatchConvoy_CreatesOneConvoyTrackingAllBeads(t *testing.T) {
 	bdScript := `#!/bin/sh
 echo "CMD:$*" >> "` + logPath + `"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   create)
@@ -70,7 +74,7 @@ exit 0
 	}
 
 	beadIDs := []string{"gt-aaa", "gt-bbb", "gt-ccc"}
-	convoyID, _, err := createBatchConvoy(beadIDs, "gastown", false, "mr")
+	convoyID, _, err := createBatchConvoy(beadIDs, "gastown", false, "mr", "")
 	if err != nil {
 		t.Fatalf("createBatchConvoy() error: %v", err)
 	}
@@ -164,7 +168,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	_, _, err = createBatchConvoy([]string{"gt-aaa"}, "gastown", true, "direct")
+	_, _, err = createBatchConvoy([]string{"gt-aaa"}, "gastown", true, "direct", "")
 	if err != nil {
 		t.Fatalf("createBatchConvoy() error: %v", err)
 	}
@@ -225,7 +229,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	_, _, err = createBatchConvoy([]string{"gt-aaa", "gt-bbb"}, "gastown", false, "direct")
+	_, _, err = createBatchConvoy([]string{"gt-aaa", "gt-bbb"}, "gastown", false, "direct", "")
 	if err != nil {
 		t.Fatalf("createBatchConvoy() error: %v", err)
 	}
@@ -246,7 +250,7 @@ exit 0
 // TestCreateBatchConvoy_EmptyBeadIDs verifies that createBatchConvoy returns
 // an error when called with no bead IDs.
 func TestCreateBatchConvoy_EmptyBeadIDs(t *testing.T) {
-	_, _, err := createBatchConvoy(nil, "gastown", false, "")
+	_, _, err := createBatchConvoy(nil, "gastown", false, "", "")
 	if err == nil {
 		t.Fatal("expected error for empty bead IDs, got nil")
 	}
@@ -295,7 +299,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	_, _, err = createBatchConvoy([]string{"gt-a", "gt-b", "gt-c", "gt-d", "gt-e"}, "myrig", false, "")
+	_, _, err = createBatchConvoy([]string{"gt-a", "gt-b", "gt-c", "gt-d", "gt-e"}, "myrig", false, "", "")
 	if err != nil {
 		t.Fatalf("createBatchConvoy() error: %v", err)
 	}
@@ -344,6 +348,10 @@ func TestCreateBatchConvoy_PartialDepFailureContinues(t *testing.T) {
 	bdScript := `#!/bin/sh
 echo "CMD:$*" >> "` + logPath + `"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   create)
@@ -377,7 +385,7 @@ exit 0
 	}
 
 	// Should NOT return error — partial tracking is acceptable
-	convoyID, tracked, err := createBatchConvoy([]string{"gt-aaa", "gt-bbb", "gt-ccc"}, "gastown", false, "")
+	convoyID, tracked, err := createBatchConvoy([]string{"gt-aaa", "gt-bbb", "gt-ccc"}, "gastown", false, "", "")
 	if err != nil {
 		t.Fatalf("createBatchConvoy() should not error on partial dep failure: %v", err)
 	}
@@ -451,9 +459,37 @@ func TestBatchSling_ErrorsOnAlreadyTrackedBead(t *testing.T) {
 	// empty results for everything else.
 	bdScript := `#!/bin/sh
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 
 case "$cmd" in
+  sql)
+    # bdDepListRawIDs up: SELECT issue_id FROM dependencies WHERE depends_on_id = '<beadID>' AND type = 'tracks'
+    case "$*" in
+      *"depends_on_id = 'gt-bbb'"*)
+        echo '[{"issue_id":"hq-cv-existing"}]'
+        ;;
+      *)
+        echo '[]'
+        ;;
+    esac
+    exit 0
+    ;;
+  show)
+    # bdShow: return convoy details for isTrackedByConvoy check
+    case "$1" in
+      hq-cv-existing)
+        echo '[{"id":"hq-cv-existing","issue_type":"convoy","status":"open"}]'
+        ;;
+      *)
+        echo '[]'
+        ;;
+    esac
+    exit 0
+    ;;
   dep)
     sub="$1"; shift || true
     beadID="$1"
@@ -679,6 +715,10 @@ func TestBatchSling_EmptyConvoyCleanupOnAllFailures(t *testing.T) {
 	// Stub bd: handles close and logs it
 	bdScript := `#!/bin/sh
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   close)
@@ -819,7 +859,8 @@ func setupTownWithBdStub(t *testing.T, bdScript string) (townRoot, logPath strin
 }
 
 // TestCreateAutoConvoy_BasicSuccess verifies that createAutoConvoy creates a
-// convoy with "Work: <title>" title, adds a tracking dep, and returns hq-cv-* ID.
+// convoy with "Work: <title>" title, delegates tracking to the helper, and
+// returns an hq-cv-* ID.
 func TestCreateAutoConvoy_BasicSuccess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
@@ -838,7 +879,17 @@ exit 0
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
 
-	convoyID, err := createAutoConvoy("gt-aaa", "Fix the widget", false, "mr")
+	var helperTownRoot, helperConvoyID, helperBeadID string
+	oldAddTracking := addTrackingRelationFn
+	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
+		helperTownRoot = townRoot
+		helperConvoyID = convoyID
+		helperBeadID = issueID
+		return nil
+	}
+	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
+
+	convoyID, err := createAutoConvoy("gt-aaa", "Fix the widget", false, "mr", "")
 	if err != nil {
 		t.Fatalf("createAutoConvoy() error: %v", err)
 	}
@@ -858,19 +909,21 @@ exit 0
 		t.Errorf("create should include 'Work: Fix the widget' in args:\n%s", logContent)
 	}
 
-	// Verify dep add was called
-	if !strings.Contains(logContent, "dep add") {
-		t.Errorf("expected dep add command in log:\n%s", logContent)
+	if helperTownRoot != townRoot {
+		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, townRoot)
 	}
-	if !strings.Contains(logContent, "gt-aaa") {
-		t.Errorf("dep add should reference gt-aaa:\n%s", logContent)
+	if helperConvoyID != convoyID {
+		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, convoyID)
+	}
+	if helperBeadID != "gt-aaa" {
+		t.Errorf("tracking helper issueID = %q, want %q", helperBeadID, "gt-aaa")
 	}
 }
 
 // TestCreateAutoConvoy_FlagLikeTitleReturnsError verifies that a title starting
 // with "--" is rejected.
 func TestCreateAutoConvoy_FlagLikeTitleReturnsError(t *testing.T) {
-	_, err := createAutoConvoy("gt-aaa", "--verbose", false, "")
+	_, err := createAutoConvoy("gt-aaa", "--verbose", false, "", "")
 	if err == nil {
 		t.Fatal("expected error for flag-like title, got nil")
 	}
@@ -897,7 +950,7 @@ exit 0
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
 
-	_, err := createAutoConvoy("gt-aaa", "My task", true, "direct")
+	_, err := createAutoConvoy("gt-aaa", "My task", true, "direct", "")
 	if err != nil {
 		t.Fatalf("createAutoConvoy() error: %v", err)
 	}
@@ -911,9 +964,12 @@ exit 0
 	}
 }
 
-// TestCreateAutoConvoy_DepFailCleansUpOrphan verifies that when the dep add
-// fails, the convoy is closed to prevent orphans.
-func TestCreateAutoConvoy_DepFailCleansUpOrphan(t *testing.T) {
+// TestCreateAutoConvoy_DepFailIsNonFatal verifies that when the dep add fails
+// (e.g., cross-rig bead), createAutoConvoy succeeds with a warning rather than
+// returning an error. Tracking failure is non-fatal since commit 103b6aaa because
+// beads v0.62 removed cross-rig routing from bd dep add. The convoy still works
+// without the tracking dep — witness and daemon provide backup tracking.
+func TestCreateAutoConvoy_DepFailIsNonFatal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
@@ -921,6 +977,10 @@ func TestCreateAutoConvoy_DepFailCleansUpOrphan(t *testing.T) {
 	bdScript := `#!/bin/sh
 echo "CMD:$*" >> "LOGPATH"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   create)
@@ -928,9 +988,6 @@ case "$cmd" in
     ;;
   dep)
     exit 1
-    ;;
-  close)
-    exit 0
     ;;
 esac
 exit 0
@@ -941,25 +998,25 @@ exit 0
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
 
-	_, err := createAutoConvoy("gt-aaa", "My task", false, "")
-	if err == nil {
-		t.Fatal("expected error when dep add fails, got nil")
+	convoyID, err := createAutoConvoy("gt-aaa", "My task", false, "", "")
+	if err != nil {
+		t.Fatalf("expected no error (dep fail is non-fatal), got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "tracking relation") {
-		t.Errorf("error should mention tracking relation, got: %v", err)
+	if convoyID == "" {
+		t.Fatal("expected non-empty convoy ID")
 	}
 
-	// Verify close was called (orphan cleanup)
+	// Verify create was called but close was NOT called (convoy is not orphaned)
 	logBytes, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
 	logContent := string(logBytes)
-	if !strings.Contains(logContent, "CMD:close") {
-		t.Errorf("expected close command for orphan cleanup:\n%s", logContent)
+	if !strings.Contains(logContent, "CMD:create") {
+		t.Errorf("expected create command in log:\n%s", logContent)
 	}
-	if !strings.Contains(logContent, "tracking dep failed") {
-		t.Errorf("close should include 'tracking dep failed' reason:\n%s", logContent)
+	if strings.Contains(logContent, "CMD:close") {
+		t.Errorf("close should NOT be called (dep fail is non-fatal):\n%s", logContent)
 	}
 }
 
@@ -968,6 +1025,7 @@ exit 0
 // ---------------------------------------------------------------------------
 
 // TestConvoyTracksBead_ExactMatch verifies exact bead ID match.
+// Uses bd sql --json output format (depends_on_id column).
 func TestConvoyTracksBead_ExactMatch(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
@@ -976,16 +1034,9 @@ func TestConvoyTracksBead_ExactMatch(t *testing.T) {
 	binDir := t.TempDir()
 	beadsDir := t.TempDir()
 
-	deps := []struct {
-		ID string `json:"id"`
-	}{
-		{ID: "gt-aaa"},
-		{ID: "gt-bbb"},
-	}
-	depsJSON, _ := json.Marshal(deps)
-
+	// bd sql returns rows with depends_on_id column
 	bdScript := `#!/bin/sh
-echo '` + string(depsJSON) + `'
+echo '[{"depends_on_id":"gt-aaa"},{"depends_on_id":"gt-bbb"}]'
 exit 0
 `
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
@@ -1003,7 +1054,7 @@ exit 0
 }
 
 // TestConvoyTracksBead_ExternalWrappedMatch verifies matching through
-// the "external:prefix:beadID" format.
+// the "external:prefix:beadID" format (unwrapped by bdDepListRawIDs).
 func TestConvoyTracksBead_ExternalWrappedMatch(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
@@ -1012,15 +1063,9 @@ func TestConvoyTracksBead_ExternalWrappedMatch(t *testing.T) {
 	binDir := t.TempDir()
 	beadsDir := t.TempDir()
 
-	deps := []struct {
-		ID string `json:"id"`
-	}{
-		{ID: "external:gt:gt-abc"},
-	}
-	depsJSON, _ := json.Marshal(deps)
-
+	// bd sql returns raw depends_on_id which may contain external: wrapping
 	bdScript := `#!/bin/sh
-echo '` + string(depsJSON) + `'
+echo '[{"depends_on_id":"external:gt:gt-abc"}]'
 exit 0
 `
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
@@ -1042,15 +1087,8 @@ func TestConvoyTracksBead_NoMatch(t *testing.T) {
 	binDir := t.TempDir()
 	beadsDir := t.TempDir()
 
-	deps := []struct {
-		ID string `json:"id"`
-	}{
-		{ID: "gt-aaa"},
-	}
-	depsJSON, _ := json.Marshal(deps)
-
 	bdScript := `#!/bin/sh
-echo '` + string(depsJSON) + `'
+echo '[{"depends_on_id":"gt-aaa"}]'
 exit 0
 `
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
@@ -1121,6 +1159,10 @@ func TestBatchSling_CrossRigGuardRejectsPrefix(t *testing.T) {
 	// Stub bd: show succeeds (verifyBeadExists), everything else succeeds
 	bdScript := `#!/bin/sh
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   show)
@@ -1251,6 +1293,10 @@ func TestCreateBatchConvoy_ReturnsTrackedBeadSet(t *testing.T) {
 	// Stub bd: create succeeds, dep add fails for gt-bbb only
 	bdScript := `#!/bin/sh
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   create) exit 0 ;;
@@ -1278,7 +1324,7 @@ exit 0
 		t.Fatalf("chdir: %v", err)
 	}
 
-	convoyID, tracked, err := createBatchConvoy([]string{"gt-aaa", "gt-bbb", "gt-ccc"}, "gastown", false, "")
+	convoyID, tracked, err := createBatchConvoy([]string{"gt-aaa", "gt-bbb", "gt-ccc"}, "gastown", false, "", "")
 	if err != nil {
 		t.Fatalf("createBatchConvoy() error: %v", err)
 	}
@@ -1407,6 +1453,10 @@ func TestFindConvoyByDescription_MatchesDescriptionPattern(t *testing.T) {
 	bdScript := fmt.Sprintf(`#!/bin/sh
 echo "CMD:$*" >> "%s"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   list)
@@ -1440,6 +1490,10 @@ func TestFindConvoyByDescription_NoMatch(t *testing.T) {
 	bdScript := fmt.Sprintf(`#!/bin/sh
 echo "CMD:$*" >> "%s"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   list)
@@ -1478,10 +1532,19 @@ func TestFindConvoyByDescription_FallsBackToTrackedDeps(t *testing.T) {
 	bdScript := fmt.Sprintf(`#!/bin/sh
 echo "CMD:$*" >> "%s"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   list)
     echo '[{"id":"hq-cv-manual","description":"Manually created convoy"}]'
+    exit 0
+    ;;
+  sql)
+    # bdDepListRawIDs down: return tracked bead IDs
+    echo '[{"depends_on_id":"gt-abc"}]'
     exit 0
     ;;
   dep)
@@ -1515,12 +1578,26 @@ func TestIsTrackedByConvoy_FoundViaDepList(t *testing.T) {
 
 	townRoot, logPath := setupTownWithBdStub(t, "")
 
-	// bd stub: dep list returns a tracking convoy for direction=up.
+	// bd stub: sql returns a tracking convoy ID for direction=up, show returns details.
 	bdScript := fmt.Sprintf(`#!/bin/sh
 echo "CMD:$*" >> "%s"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
+  sql)
+    # bdDepListRawIDs up: return convoy IDs tracking this bead
+    echo '[{"issue_id":"hq-cv-found"}]'
+    exit 0
+    ;;
+  show)
+    # bdShow: return convoy details
+    echo '[{"id":"hq-cv-found","issue_type":"convoy","status":"open"}]'
+    exit 0
+    ;;
   dep)
     echo '[{"id":"hq-cv-found","issue_type":"convoy","status":"open"}]'
     exit 0
@@ -1551,6 +1628,10 @@ func TestIsTrackedByConvoy_NotFound(t *testing.T) {
 	bdScript := fmt.Sprintf(`#!/bin/sh
 echo "CMD:$*" >> "%s"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
   dep)
@@ -1598,18 +1679,36 @@ func TestPrintConvoyConflict_PrintsConflictInfo(t *testing.T) {
 	bdScript := fmt.Sprintf(`#!/bin/sh
 echo "CMD:$*" >> "%s"
 cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
 shift || true
 case "$cmd" in
+  sql)
+    # bdDepListRawIDs down: return tracked bead IDs for convoy
+    echo '[{"depends_on_id":"gt-aaa"},{"depends_on_id":"gt-bbb"}]'
+    exit 0
+    ;;
   show)
-    # Check if this is a convoy show or a batch issue details show
-    first_id="$1"
-    case "$first_id" in
-      hq-cv-test)
+    # Check all remaining args to handle both single and batch show
+    all_show_args="$*"
+    case "$all_show_args" in
+      hq-cv-test*)
         echo '[{"title":"Test convoy title","labels":[]}]'
         ;;
-      *)
+      *gt-aaa*gt-bbb*|*gt-bbb*gt-aaa*)
         # Batch show for issue details - return details for each ID
         echo '[{"id":"gt-aaa","title":"First bead","status":"open","issue_type":"task"},{"id":"gt-bbb","title":"Second bead","status":"closed","issue_type":"task"}]'
+        ;;
+      *gt-aaa*)
+        echo '[{"id":"gt-aaa","title":"First bead","status":"open","issue_type":"task"}]'
+        ;;
+      *gt-bbb*)
+        echo '[{"id":"gt-bbb","title":"Second bead","status":"closed","issue_type":"task"}]'
+        ;;
+      *)
+        echo '[]'
         ;;
     esac
     exit 0

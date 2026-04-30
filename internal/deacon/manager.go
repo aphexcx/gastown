@@ -24,14 +24,12 @@ var (
 type tmuxOps interface {
 	HasSession(name string) (bool, error)
 	IsAgentAlive(session string) bool
-	IsPaneDead(session string) bool
-	RespawnPaneDefault(session string) error
 	KillSessionWithProcesses(name string) error
 	NewSessionWithCommand(name, workDir, command string) error
 	SetRemainOnExit(pane string, on bool) error
 	SetEnvironment(session, key, value string) error
 	GetPaneID(session string) (string, error)
-	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
+	ConfigureGasTownSession(session string, theme *tmux.Theme, rig, worker, role string) error
 	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
 	SetAutoRespawnHook(session string) error
 	AcceptStartupDialogs(session string) error
@@ -86,23 +84,9 @@ func (m *Manager) Start(agentOverride string) error {
 			return ErrAlreadyRunning
 		}
 
-		// Pane dead (remain-on-exit) vs zombie shell: different recovery paths.
-		// A dead pane means the agent exited cleanly (e.g., patrol cycle complete)
-		// and the pane is waiting for respawn. Use respawn-pane to restart in place,
-		// which is cheaper and avoids incrementing the daemon's crash counter.
-		// A zombie shell (pane alive but agent dead) needs kill+recreate.
-		if t.IsPaneDead(sessionID) {
-			if err := t.RespawnPaneDefault(sessionID); err == nil {
-				// Give the respawned process a moment to start
-				time.Sleep(500 * time.Millisecond)
-				if t.IsAgentAlive(sessionID) {
-					return ErrAlreadyRunning
-				}
-			}
-			// Respawn failed or agent didn't come back — fall through to kill+recreate
-		}
-
-		// Zombie - tmux alive but agent dead. Kill and recreate.
+		// Session exists but agent is dead. Kill and recreate uniformly.
+		// The auto-respawn hook (SetAutoRespawnHook) handles clean exits at the
+		// tmux level — Go doesn't need to distinguish dead pane vs zombie shell.
 		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 		if err := t.KillSessionWithProcesses(sessionID); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
@@ -125,7 +109,7 @@ func (m *Manager) Start(agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, create mol-deacon-patrol wisp and execute it.")
+	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, run gt sling mol-deacon-patrol deacon, then execute the hook it creates.")
 	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
 		Role:        "deacon",
 		TownRoot:    m.townRoot,
@@ -167,7 +151,7 @@ func (m *Manager) Start(agentOverride string) error {
 	}
 
 	// Apply Deacon theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.DeaconTheme()
+	theme := tmux.ResolveSessionTheme(m.townRoot, "", "deacon", "")
 	_ = t.ConfigureGasTownSession(sessionID, theme, "", "Deacon", "health-check")
 
 	// Wait for Claude to start - fatal if Claude fails to launch

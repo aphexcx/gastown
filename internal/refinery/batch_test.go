@@ -112,6 +112,12 @@ func makeMR(id, branch, target string) *MRInfo {
 	}
 }
 
+func failMarkerGateCmd() string {
+	// Gate commands already run inside workDir, so use a relative path.
+	// Raw Windows paths like D:\... confuse `sh test -f` under MSYS.
+	return "test ! -f FAIL_MARKER"
+}
+
 // --- DefaultBatchConfig tests ---
 
 func TestDefaultBatchConfig(t *testing.T) {
@@ -244,8 +250,9 @@ func TestBuildRebaseStack_SingleMR(t *testing.T) {
 	if readErr != nil {
 		t.Fatalf("expected a.txt to exist: %v", readErr)
 	}
-	if string(content) != "hello a\n" {
-		t.Errorf("expected 'hello a\\n', got %q", string(content))
+	got := strings.ReplaceAll(string(content), "\r\n", "\n")
+	if got != "hello a\n" {
+		t.Errorf("expected 'hello a\\n', got %q", got)
 	}
 }
 
@@ -466,7 +473,7 @@ func TestProcessBatch_GateFailure_BisectsToFindCulprit(t *testing.T) {
 	e := newTestEngineer(t, workDir, g)
 	// Gate that fails if FAIL_MARKER exists
 	e.config.Gates = map[string]*GateConfig{
-		"check": {Cmd: fmt.Sprintf("test ! -f %s/FAIL_MARKER", workDir)},
+		"check": {Cmd: failMarkerGateCmd()},
 	}
 	e.config.GatesParallel = false
 
@@ -600,7 +607,7 @@ func TestBisectBatch_SingleMR(t *testing.T) {
 
 	e := newTestEngineer(t, workDir, g)
 	e.config.Gates = map[string]*GateConfig{
-		"check": {Cmd: fmt.Sprintf("test ! -f %s/FAIL_MARKER", workDir)},
+		"check": {Cmd: failMarkerGateCmd()},
 	}
 
 	batch := []*MRInfo{makeMR("mr-a", "feature-a", "main")}
@@ -623,7 +630,7 @@ func TestBisectBatch_TwoMRs_SecondBad(t *testing.T) {
 
 	e := newTestEngineer(t, workDir, g)
 	e.config.Gates = map[string]*GateConfig{
-		"check": {Cmd: fmt.Sprintf("test ! -f %s/FAIL_MARKER", workDir)},
+		"check": {Cmd: failMarkerGateCmd()},
 	}
 
 	batch := []*MRInfo{
@@ -649,7 +656,7 @@ func TestBisectBatch_TwoMRs_FirstBad(t *testing.T) {
 
 	e := newTestEngineer(t, workDir, g)
 	e.config.Gates = map[string]*GateConfig{
-		"check": {Cmd: fmt.Sprintf("test ! -f %s/FAIL_MARKER", workDir)},
+		"check": {Cmd: failMarkerGateCmd()},
 	}
 
 	batch := []*MRInfo{
@@ -678,7 +685,7 @@ func TestBisectBatch_FourMRs_ThirdBad(t *testing.T) {
 	e := newTestEngineer(t, workDir, g)
 	e.output = os.Stderr
 	e.config.Gates = map[string]*GateConfig{
-		"check": {Cmd: fmt.Sprintf("test ! -f %s/FAIL_MARKER", workDir)},
+		"check": {Cmd: failMarkerGateCmd()},
 	}
 
 	batch := []*MRInfo{
@@ -743,7 +750,7 @@ func TestProcessBatch_BisectAndMergeGood(t *testing.T) {
 
 	e := newTestEngineer(t, workDir, g)
 	e.config.Gates = map[string]*GateConfig{
-		"check": {Cmd: fmt.Sprintf("test ! -f %s/FAIL_MARKER", workDir)},
+		"check": {Cmd: failMarkerGateCmd()},
 	}
 
 	batch := []*MRInfo{
@@ -821,6 +828,37 @@ func TestGetMergeMessage_Fallback(t *testing.T) {
 	}
 	if !strings.Contains(msg, "gt-abc") {
 		t.Errorf("expected source issue in fallback, got %q", msg)
+	}
+}
+
+// TestProcessBatch_SingleMR_BranchNotFound verifies that a missing branch is treated as a
+// skippable condition (added to Conflicts) rather than a fatal infrastructure error.
+func TestProcessBatch_SingleMR_BranchNotFound(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+
+	e := newTestEngineer(t, workDir, g)
+
+	// MR pointing to a branch that doesn't exist locally or remotely.
+	batch := []*MRInfo{makeMR("mr-gone", "ghost-branch", "main")}
+
+	result := e.ProcessBatch(context.Background(), batch, "main", DefaultBatchConfig())
+
+	// Must NOT be a fatal error.
+	if result.Error != nil {
+		t.Fatalf("expected no fatal error for missing branch, got: %v", result.Error)
+	}
+	// Must be skipped (added to conflicts, not merged or culprits).
+	if len(result.Merged) != 0 {
+		t.Errorf("expected no merged MRs, got %d", len(result.Merged))
+	}
+	if len(result.Conflicts) != 1 || result.Conflicts[0].ID != "mr-gone" {
+		t.Errorf("expected mr-gone in conflicts (skipped), got %v", stackedIDs(result.Conflicts))
+	}
+	// Verify the log message indicates the branch was not found (escalating, not fatal).
+	log := e.output.(*bytes.Buffer).String()
+	if !strings.Contains(log, "not found") {
+		t.Errorf("expected 'not found' in log output, got: %s", log)
 	}
 }
 

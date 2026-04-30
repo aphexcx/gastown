@@ -68,8 +68,8 @@ func getRig(rigName string) (string, *rig.Rig, error) {
 // Returns false if the rig config or bead can't be loaded (safe default).
 func hasRigBeadLabel(townRoot, rigName, label string) bool {
 	rigPath := filepath.Join(townRoot, rigName)
-	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err != nil || rigCfg.Beads == nil {
+	prefix := rigBeadsPrefix(townRoot, rigPath, rigName)
+	if prefix == "" {
 		return false
 	}
 
@@ -79,7 +79,7 @@ func hasRigBeadLabel(townRoot, rigName, label string) bool {
 	}
 
 	bd := beads.New(beadsPath)
-	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 
 	rigBead, err := bd.Show(rigBeadID)
 	if err != nil {
@@ -111,10 +111,12 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 		return true, "parked"
 	}
 
-	// Single bead lookup for both parked and docked labels
+	// Single bead lookup for both parked and docked labels.
+	// Look up the beads prefix from rigs.json (the rig registry), with fallback
+	// to the rig's own config.json for isolated/test scenarios.
 	rigPath := filepath.Join(townRoot, rigName)
-	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err != nil || rigCfg.Beads == nil {
+	prefix := rigBeadsPrefix(townRoot, rigPath, rigName)
+	if prefix == "" {
 		return false, ""
 	}
 
@@ -124,7 +126,7 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 	}
 
 	bd := beads.New(beadsPath)
-	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 	rigBead, err := bd.Show(rigBeadID)
 	if err != nil {
 		return false, ""
@@ -140,4 +142,44 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 	}
 
 	return false, ""
+}
+
+func rigBeadsPrefix(townRoot, rigPath, rigName string) string {
+	rigsConfigPath := constants.MayorRigsPath(townRoot)
+	if rigsConfig, err := config.LoadRigsConfig(rigsConfigPath); err == nil {
+		if entry, ok := rigsConfig.Rigs[rigName]; ok && entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
+			return entry.BeadsConfig.Prefix
+		}
+	}
+
+	rigConfigPath := filepath.Join(rigPath, "config.json")
+	if rigCfg, err := config.LoadRigConfig(rigConfigPath); err == nil && rigCfg.Beads != nil && rigCfg.Beads.Prefix != "" {
+		return rigCfg.Beads.Prefix
+	}
+
+	return ""
+}
+
+// getAllRigs discovers all rigs in the current Gas Town workspace.
+// Returns the list of rigs and any error.
+func getAllRigs() ([]*rig.Rig, error) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
+	}
+
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	rigs, err := rigMgr.DiscoverRigs()
+	if err != nil {
+		return nil, err
+	}
+
+	return rigs, nil
 }

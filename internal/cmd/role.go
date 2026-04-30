@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -338,6 +339,12 @@ func detectRole(cwd, townRoot string) RoleInfo {
 func parseRoleString(s string) (Role, string, string) {
 	s = strings.TrimSpace(s)
 
+	// Normalize consecutive slashes (e.g. "gamestore//refinery" → "gamestore/refinery")
+	for strings.Contains(s, "//") {
+		s = strings.ReplaceAll(s, "//", "/")
+	}
+	s = strings.TrimSuffix(s, "/")
+
 	// Simple roles
 	switch s {
 	case constants.RoleMayor:
@@ -666,7 +673,11 @@ func runRoleEnv(cmd *cobra.Command, args []string) error {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Printf("export %s=%s\n", k, envVars[k])
+		if runtime.GOOS == "windows" {
+			fmt.Printf("$env:%s=%s\n", k, envVars[k])
+		} else {
+			fmt.Printf("export %s=%s\n", k, envVars[k])
+		}
 	}
 
 	return nil

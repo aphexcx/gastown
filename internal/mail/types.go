@@ -33,6 +33,9 @@ const (
 	// TypeTask indicates a message requiring action from the recipient.
 	TypeTask MessageType = "task"
 
+	// TypeEscalation indicates a structured escalation copy persisted in mail.
+	TypeEscalation MessageType = "escalation"
+
 	// TypeScavenge indicates optional first-come-first-served work.
 	TypeScavenge MessageType = "scavenge"
 
@@ -83,7 +86,7 @@ type Message struct {
 	// Priority is the message priority.
 	Priority Priority `json:"priority"`
 
-	// Type indicates the message type (task, scavenge, notification, reply).
+	// Type indicates the message type (task, escalation, scavenge, notification, reply).
 	Type MessageType `json:"type"`
 
 	// Delivery specifies how the message is delivered (queue or interrupt).
@@ -401,7 +404,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 	// Convert message type, default to notification
 	msgType := TypeNotification
 	switch MessageType(bm.msgType) {
-	case TypeTask, TypeScavenge, TypeReply:
+	case TypeTask, TypeEscalation, TypeScavenge, TypeReply:
 		msgType = MessageType(bm.msgType)
 	}
 
@@ -529,7 +532,7 @@ func PriorityFromInt(p int) Priority {
 // ParseMessageType parses a message type string, returning TypeNotification for invalid values.
 func ParseMessageType(s string) MessageType {
 	switch MessageType(s) {
-	case TypeTask, TypeScavenge, TypeNotification, TypeReply:
+	case TypeTask, TypeEscalation, TypeScavenge, TypeNotification, TypeReply:
 		return MessageType(s)
 	default:
 		return TypeNotification
@@ -561,10 +564,22 @@ func normalizeAddress(s string) string {
 		return "deacon/"
 	}
 
+	// Resolve rig-scoped town-level roles to their canonical form (gt-te23).
+	// "gastown/mayor" → "mayor/", "gastown/deacon" → "deacon/"
+	// Mayor and deacon are town-level singletons, not rig-level agents.
+	parts := strings.Split(s, "/")
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "mayor":
+			return "mayor/"
+		case "deacon":
+			return "deacon/"
+		}
+	}
+
 	// Normalize crew/ and polecats/ to canonical form:
 	// "rig/crew/name" → "rig/name"
 	// "rig/polecats/name" → "rig/name"
-	parts := strings.Split(s, "/")
 	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
 		return parts[0] + "/" + parts[2]
 	}

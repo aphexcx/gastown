@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -129,7 +130,7 @@ func runDailyDigest() error {
 	}
 
 	var result compactResult
-	if err := json.Unmarshal(compactOut, &result); err != nil {
+	if err := json.Unmarshal(extractJSONObject(compactOut), &result); err != nil {
 		return fmt.Errorf("parsing compaction output: %w", err)
 	}
 
@@ -199,20 +200,20 @@ func buildReport(dateStr string, result *compactResult, activeWisps []*compactIs
 
 	// Tally deleted by category
 	for _, d := range result.Deleted {
-		cat := wispTypeToCategory(d.WispType)
+		cat := wispTypeToCategory(d.WispType, d.Title)
 		report.Categories[cat].Deleted++
 	}
 
 	// Tally promoted by category
 	for _, p := range result.Promoted {
-		cat := wispTypeToCategory(p.WispType)
+		cat := wispTypeToCategory(p.WispType, p.Title)
 		report.Categories[cat].Promoted++
 		report.Promotions = append(report.Promotions, p)
 	}
 
 	// Tally active wisps by category
 	for _, w := range activeWisps {
-		cat := wispTypeToCategory(w.WispType)
+		cat := wispTypeToCategory(w.WispType, w.Title)
 		report.Categories[cat].Active++
 	}
 
@@ -220,9 +221,12 @@ func buildReport(dateStr string, result *compactResult, activeWisps []*compactIs
 }
 
 // wispTypeToCategory maps a wisp_type string to its display category.
-func wispTypeToCategory(wispType string) string {
+func wispTypeToCategory(wispType, title string) string {
 	if cat, ok := wispCategoryMap[wispType]; ok {
 		return cat
+	}
+	if wispType == "" && strings.Contains(strings.ToLower(title), "patrol") {
+		return "Patrols"
 	}
 	return "Untyped"
 }
@@ -465,7 +469,7 @@ func queryCompactionReports(startDate, endDate string) ([]*compactReport, error)
 		Title        string `json:"title"`
 		EventPayload string `json:"event_payload"`
 	}
-	if err := json.Unmarshal(listOutput, &events); err != nil {
+	if err := json.Unmarshal(extractJSONArray(listOutput), &events); err != nil {
 		return nil, fmt.Errorf("parsing event list: %w", err)
 	}
 
@@ -560,6 +564,7 @@ func findExistingCompactReport(dateStr string) (string, error) {
 
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
+		"--status=closed",
 		"--json",
 		"--limit=50",
 	)
@@ -572,7 +577,7 @@ func findExistingCompactReport(dateStr string) (string, error) {
 		ID    string `json:"id"`
 		Title string `json:"title"`
 	}
-	if err := json.Unmarshal(listOutput, &events); err != nil {
+	if err := json.Unmarshal(extractJSONArray(listOutput), &events); err != nil {
 		return "", err
 	}
 
@@ -603,7 +608,7 @@ func findExistingWeeklyRollup(weekStart, weekEnd string) (string, error) {
 		ID    string `json:"id"`
 		Title string `json:"title"`
 	}
-	if err := json.Unmarshal(listOutput, &events); err != nil {
+	if err := json.Unmarshal(extractJSONArray(listOutput), &events); err != nil {
 		return "", err
 	}
 
@@ -613,6 +618,16 @@ func findExistingWeeklyRollup(weekStart, weekEnd string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// extractJSONObject finds the first '{' byte in data and returns from that
+// point onward. Strips non-JSON prefix from subprocess output.
+func extractJSONObject(data []byte) []byte {
+	idx := bytes.IndexByte(data, '{')
+	if idx < 0 {
+		return data
+	}
+	return data[idx:]
 }
 
 // createWeeklyRollupBead creates a permanent audit bead for the weekly rollup.

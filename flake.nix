@@ -4,10 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    beads = {
-      url = "github:steveyegge/beads/v0.55.4";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    beads.url = "github:gastownhall/beads";
   };
 
   outputs =
@@ -20,19 +17,21 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
-        beads = self.inputs.beads.packages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+        };
+        beadsPkg = beads.packages.${system}.default;
       in
       {
         packages = {
           gt = pkgs.buildGoModule {
             pname = "gt";
-            version = "0.8.0";
+            version = "1.0.0";
             src = ./.;
-            vendorHash = "sha256-XWv/slFm796AO928eqzVHms0uUX4ZMJk0I4mZz+kp54=";
+            vendorHash = "sha256-mJzpsl4XnIm3ZSg7fFn0MOdQQW1bdOkAJ+TikiLMXJM=";
 
             ldflags = [
-              "-X github.com/steveyegge/gastown/internal/cmd.Build=nix"
+              "-X github.com/gastownhall/gastown/internal/cmd.Build=nix"
               "-X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1"
             ];
 
@@ -40,7 +39,7 @@
 
             meta = with pkgs.lib; {
               description = "Multi-agent orchestration system for Claude Code with persistent work tracking";
-              homepage = "https://github.com/steveyegge/gastown";
+              homepage = "https://github.com/gastownhall/gastown";
               license = licenses.mit;
               mainProgram = "gt";
             };
@@ -56,12 +55,12 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            beads
-            go
-            gopls
-            gotools
-            go-tools
+          buildInputs = [
+            beadsPkg
+            pkgs.go_1_25
+            pkgs.gopls
+            pkgs.gotools
+            pkgs.go-tools
           ];
         };
       }

@@ -34,10 +34,12 @@ Workspace checks:
   - rigs-registry-exists     Check mayor/rigs.json exists (fixable)
   - rigs-registry-valid      Check registered rigs exist (fixable)
   - mayor-exists             Check mayor/ directory structure
+  - disk-space               Check filesystem has sufficient free space
 
 Town root protection:
   - town-git                 Verify town root is under version control
   - town-root-branch         Verify town root is on main branch (fixable)
+  - foreign-remotes          Detect git remotes from unrelated repos (fixable)
   - pre-checkout-hook        Verify pre-checkout hook prevents branch switches (fixable)
 
 Infrastructure checks:
@@ -49,6 +51,7 @@ Infrastructure checks:
 
 Cleanup checks (fixable):
   - orphan-sessions          Detect orphaned tmux sessions
+  - stalled-polecats         Detect polecats with dead sessions and unpushed work (fixable)
   - orphan-processes         Detect orphaned Claude processes
   - session-name-format      Detect sessions with outdated naming format (fixable)
   - wisp-gc                  Detect and clean abandoned wisps (>1h)
@@ -86,6 +89,9 @@ Routing checks (fixable):
 
 Lifecycle checks (fixable):
   - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)
+
+Formula overlay checks (fixable):
+  - overlay-health           Check formula overlay step IDs are valid (fixable)
 
 Migration checks:
   - town-claude-md           Check town-root CLAUDE.md matches embedded version (fixable)
@@ -151,6 +157,11 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	d.Register(doctor.NewGlobalStateCheck())
 
+	// Disk space check — most fundamental resource check. Low disk space is the
+	// root cause of cascading failures (Dolt data loss, polecat death, lost commits).
+	// Must run before infrastructure checks that might fail confusingly on full disks.
+	d.Register(doctor.NewDiskSpaceCheck())
+
 	// Infrastructure prerequisites — these must pass before any check that
 	// shells out to bd/dolt or queries the database. Order matters:
 	// 1. gt binary freshness
@@ -160,10 +171,13 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewStaleBinaryCheck())
 	d.Register(doctor.NewBeadsBinaryCheck())
 	d.Register(doctor.NewDoltBinaryCheck())
+	d.Register(doctor.NewClaudeBinaryCheck())
+	d.Register(doctor.NewGroqCompoundCheck())
 	d.Register(doctor.NewDoltServerReachableCheck())
 
 	d.Register(doctor.NewTownGitCheck())
 	d.Register(doctor.NewTownRootBranchCheck())
+	d.Register(doctor.NewForeignRemoteCheck())
 	d.Register(doctor.NewPreCheckoutHookCheck())
 	// Claude settings must be fixed BEFORE the daemon starts, so sessions
 	// launched by the daemon find correct settings files. If daemon runs first,
@@ -176,29 +190,36 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewTownBeadsConfigCheck())
 	d.Register(doctor.NewCustomTypesCheck())
 	d.Register(doctor.NewCustomStatusesCheck())
-	d.Register(doctor.NewRoleLabelCheck())
 	d.Register(doctor.NewFormulaCheck())
+	d.Register(doctor.NewOverlayHealthCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
+	d.Register(doctor.NewRigConfigSyncCheck()) // Check all registered rigs have config.json
+	d.Register(doctor.NewStaleDoltPortCheck())      // Check for stale Dolt port files
+	d.Register(doctor.NewStaleSQLServerInfoCheck()) // Check for stale sql-server.info files (GH#2770)
 	d.Register(doctor.NewPrefixMismatchCheck())
 	d.Register(doctor.NewDatabasePrefixCheck())
+	d.Register(doctor.NewIdleTimeoutCheck()) // Verify dolt.idle-timeout: "0" for all rigs
 	d.Register(doctor.NewRoutesCheck())
 	d.Register(doctor.NewRigRoutesJSONLCheck())
 	d.Register(doctor.NewRoutingModeCheck())
 	d.Register(doctor.NewMalformedSessionNameCheck())
 	d.Register(doctor.NewOrphanSessionCheck())
 	d.Register(doctor.NewZombieSessionCheck())
+	d.Register(doctor.NewStalledPolecatCheck())
 	d.Register(doctor.NewOrphanProcessCheck())
 	d.Register(doctor.NewWispGCCheck())
 	d.Register(doctor.NewCheckMisclassifiedWisps())
 	d.Register(doctor.NewCheckJSONLBloat())
 	d.Register(doctor.NewStaleBeadsRedirectCheck())
 	d.Register(doctor.NewBeadsRedirectTargetCheck())
+	d.Register(doctor.NewStaleRuntimeFilesCheck())
 	d.Register(doctor.NewBranchCheck())
 	d.Register(doctor.NewCloneDivergenceCheck())
 	d.Register(doctor.NewDefaultBranchAllRigsCheck())
 	d.Register(doctor.NewIdentityCollisionCheck())
 	d.Register(doctor.NewLinkedPaneCheck())
+	d.Register(doctor.NewSocketSplitBrainCheck())
 	d.Register(doctor.NewThemeCheck())
 	d.Register(doctor.NewCrashReportCheck())
 	d.Register(doctor.NewEnvVarsCheck())
@@ -208,6 +229,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewPatrolHooksWiredCheck())
 	d.Register(doctor.NewPatrolNotStuckCheck())
 	d.Register(doctor.NewPatrolPluginsAccessibleCheck())
+	d.Register(doctor.NewPatrolPluginDriftCheck())
 	d.Register(doctor.NewAgentBeadsCheck())
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())

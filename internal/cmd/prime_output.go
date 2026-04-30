@@ -4,12 +4,15 @@ import (
 	"github.com/steveyegge/gastown/internal/cli"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -91,6 +94,69 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	return output, nil
 }
 
+// outputRoleDirectives loads and emits operator-provided role directives.
+// These come from the directive file layout (town-level and/or rig-level)
+// and override formula defaults where they conflict.
+//
+// w and explainEnabled are injected so tests can capture output without
+// mutating os.Stdout or the primeExplain global (avoiding data races
+// under t.Parallel).
+func outputRoleDirectives(ctx RoleContext, w io.Writer, explainEnabled bool) {
+	role := string(ctx.Role)
+	townRoot := ctx.TownRoot
+	rigName := ctx.Rig
+
+	townPath := filepath.Join(townRoot, "directives", role+".md")
+	rigPath := ""
+	if rigName != "" {
+		rigPath = filepath.Join(townRoot, rigName, "directives", role+".md")
+	}
+
+	explainf := func(format string, args ...any) {
+		if explainEnabled {
+			fmt.Fprintf(w, "\n[EXPLAIN] "+format+"\n", args...)
+		}
+	}
+
+	content := config.LoadRoleDirective(role, townRoot, rigName)
+	if content == "" {
+		explainf("Role directives: no directive files found (checked %s", townPath)
+		if rigPath != "" {
+			explainf("Role directives: also checked %s", rigPath)
+		}
+		return
+	}
+
+	// Determine source label for the header
+	hasTown := false
+	hasRig := false
+	if data, err := os.ReadFile(townPath); err == nil { //nolint:gosec // G304: path is from trusted config
+		if s := strings.TrimSpace(string(data)); s != "" {
+			hasTown = true
+		}
+	}
+	if rigPath != "" {
+		if data, err := os.ReadFile(rigPath); err == nil { //nolint:gosec // G304: path is from trusted config
+			if s := strings.TrimSpace(string(data)); s != "" {
+				hasRig = true
+			}
+		}
+	}
+
+	explainf("Role directives: town=%v rig=%v (town=%s, rig=%s)", hasTown, hasRig, townPath, rigPath)
+
+	fmt.Fprintln(w)
+	if hasTown && hasRig {
+		fmt.Fprintln(w, "## Town & Rig Directives (operator policy — overrides formula where they conflict)")
+	} else if hasRig {
+		fmt.Fprintln(w, "## Rig Directives (operator policy — overrides formula where they conflict)")
+	} else {
+		fmt.Fprintln(w, "## Town Directives (operator policy — overrides formula where they conflict)")
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, content)
+}
+
 func outputPrimeContextFallback(ctx RoleContext) {
 	switch ctx.Role {
 	case RoleMayor:
@@ -129,6 +195,15 @@ func outputMayorContext(ctx RoleContext) {
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
+	fmt.Println()
+	fmt.Println("## Lifecycle Nudges (SLOT_OPEN)")
+	fmt.Println("When you receive a SLOT_OPEN nudge from the Witness, a polecat has completed")
+	fmt.Println("work and its slot is available. **Always verify via CLI before deciding action:**")
+	fmt.Println()
+	fmt.Println("1. Run `" + cli.Name() + " polecat list` to get ground truth on polecat state")
+	fmt.Println("2. Do NOT trust your in-context belief about polecat state — it may be stale")
+	fmt.Println("3. If slots are open and beads are queued: `" + cli.Name() + " sling <bead> <rig>`")
+	fmt.Println("4. Witness lifecycle events are authoritative — never second-guess them")
 	fmt.Println()
 	fmt.Println("## Startup")
 	fmt.Println("Check for handoff messages with 🤝 HANDOFF in subject - continue predecessor's work.")
@@ -278,6 +353,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 	case RoleMayor:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Dispatch work to polecat | `%s sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |\n", c)
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
 		fmt.Printf("| Kill stuck polecat | `%s polecat nuke <rig>/<name> --force` | ~~gt polecat kill~~ (not a command) |\n", c)
@@ -288,6 +364,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 	case RoleCrew:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
 		fmt.Printf("| Dispatch work to polecat | `%s sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |\n", c)
 		fmt.Printf("| Stop my session | `%s crew stop %s` | ~~gt rig stop~~ (stops rig agents, not crew) |\n", c, ctx.Polecat)
@@ -298,6 +375,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
 		fmt.Printf("| Signal work complete | `%s done` | ~~bd close <root-issue>~~ (Refinery closes it) |\n", c)
+		fmt.Println("| Close a sub-issue | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
 		fmt.Println("| Check workflow steps | `bd mol current` | ~~bd ready~~ (excludes molecule steps) |")
 		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
@@ -306,6 +384,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 	case RoleWitness:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Message a polecat | `%s nudge %s/<name> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c, ctx.Rig)
 		fmt.Printf("| Kill stuck polecat | `%s polecat nuke %s/<name> --force` | ~~gt polecat kill~~ (not a command) |\n", c, ctx.Rig)
 		fmt.Printf("| View polecat output | `%s peek %s/<name> 50` | |\n", c, ctx.Rig)
@@ -402,6 +481,13 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("   - If mol attached → **RUN IT** (no human input needed)")
 		fmt.Println("   - If no mol → await user instruction")
 	case RoleWitness:
+		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
+			return
+		}
 		fmt.Println()
 		fmt.Println("---")
 		fmt.Println()
@@ -427,6 +513,13 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("DO NOT wait. DO NOT escalate. DO NOT send idle alerts.")
 		fmt.Println("Just run `" + cli.Name() + " done` and exit.")
 	case RoleRefinery:
+		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
+			return
+		}
 		fmt.Println()
 		fmt.Println("---")
 		fmt.Println()
@@ -448,7 +541,9 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("4. If there's a 🤝 HANDOFF message, read it and continue the work")
 		fmt.Println("5. Check for attached work: `" + cli.Name() + " hook`")
 		fmt.Println("   - If attachment found → **RUN IT** (no human input needed)")
-		fmt.Println("   - If no attachment → await user instruction")
+		fmt.Println("   - If no attachment → **STOP and wait for input**. Do NOT run")
+		fmt.Println("     any more commands. Do NOT poll mail. Do NOT check status.")
+		fmt.Println("     Sit idle at your prompt — a nudge or user message will arrive.")
 	case RoleDeacon:
 		// Skip startup protocol if paused - the pause message was already shown
 		paused, _, _ := deacon.IsPaused(ctx.TownRoot)
@@ -466,6 +561,22 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("5. Check for attached patrol: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (resume from current step)")
 		fmt.Println("   - If no mol → create patrol: `bd mol wisp mol-deacon-patrol`")
+	case RoleDog:
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+		fmt.Println("**STARTUP PROTOCOL**: You are a dog with NO WORK on your hook.")
+		fmt.Println()
+		fmt.Println("This likely means dispatch had a timing race (hook write not yet propagated).")
+		fmt.Println("Before going idle, try to recover work:")
+		fmt.Println()
+		fmt.Println("1. Check mail: `" + cli.Name() + " mail inbox` — dispatcher may have sent instructions")
+		fmt.Println("2. If mail has work → execute it")
+		fmt.Println("3. If no mail → check ready queue: `bd ready`")
+		fmt.Println("4. If ready queue has work → claim top bead: `bd update <id> --claim`")
+		fmt.Println("5. If nothing available → run `" + cli.Name() + " done` and exit")
+		fmt.Println()
+		fmt.Println("DO NOT sit idle waiting. Recover or terminate. (GH#2748)")
 	case RoleBoot:
 		fmt.Println()
 		fmt.Println("---")
@@ -508,7 +619,7 @@ func outputAttachmentStatus(ctx RoleContext) {
 
 	// Check first pinned bead for attachment
 	attachment := beads.ParseAttachmentFields(pinnedBeads[0])
-	if attachment == nil || attachment.AttachedMolecule == "" {
+	if !hasWorkflowAttachment(attachment) {
 		// No attachment - interactive mode
 		return
 	}
@@ -517,9 +628,21 @@ func outputAttachmentStatus(ctx RoleContext) {
 	fmt.Println()
 	fmt.Printf("%s\n\n", style.Bold.Render("## 🎯 ATTACHED WORK DETECTED"))
 	fmt.Printf("Pinned bead: %s\n", pinnedBeads[0].ID)
-	fmt.Printf("Attached molecule: %s\n", attachment.AttachedMolecule)
+	if attachment.AttachedFormula != "" {
+		fmt.Printf("Attached formula: %s\n", attachment.AttachedFormula)
+	}
+	if attachment.AttachedMolecule != "" {
+		fmt.Printf("Attached molecule: %s\n", attachment.AttachedMolecule)
+	}
 	if attachment.AttachedAt != "" {
 		fmt.Printf("Attached at: %s\n", attachment.AttachedAt)
+	}
+	if len(attachment.AttachedVars) > 0 {
+		fmt.Println()
+		fmt.Printf("%s\n", style.Bold.Render("🧩 VARS (instantiated formula inputs):"))
+		for _, variable := range attachment.AttachedVars {
+			fmt.Printf("  --var %s\n", variable)
+		}
 	}
 	if attachment.AttachedArgs != "" {
 		fmt.Println()
@@ -530,7 +653,7 @@ func outputAttachmentStatus(ctx RoleContext) {
 
 	// Show inline formula steps if formula name is known, else fall back to bd mol current
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula)
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
 	} else {
 		showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
 	}

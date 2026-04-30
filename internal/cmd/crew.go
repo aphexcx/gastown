@@ -115,14 +115,20 @@ Branch Handling:
   shown if not on the default branch). Use --reset to switch to the
   default branch and pull latest changes.
 
-Role Discovery:
+Rig Discovery:
+  The rig is resolved in order: --rig flag, rig/name format, current
+  directory, or by scanning all rigs for the crew member name. This
+  means "gt crew at dave" works from anywhere in the town if dave
+  exists in exactly one rig.
+
   If no name is provided, attempts to detect the crew workspace from the
   current directory. If you're in <rig>/crew/<name>/, it will attach to
   that workspace automatically.
 
 Examples:
-  gt crew at dave                 # Attach to dave's session
+  gt crew at dave                 # Attach to dave's session (rig auto-detected)
   gt crew at                      # Auto-detect from cwd
+  gt crew at gastown/dave         # Explicit rig/name format
   gt crew at dave --reset         # Reset to default branch first
   gt crew at dave --detached      # Start session without attaching
   gt crew at dave --no-tmux       # Just print path`,
@@ -179,11 +185,14 @@ var crewStatusCmd = &cobra.Command{
 	Long: `Show detailed status for crew workspace(s).
 
 Displays session state, git status, branch info, and mail inbox status.
-If no name given, shows status for all crew workers.
+If no name given, shows status for all crew workers across all rigs.
 
 Examples:
-  gt crew status                  # Status of all crew workers
+  gt crew status                  # Status of all crew workers across all rigs
+  gt crew status beads            # Status of all crew workers in beads
+  gt crew status --rig beads      # Status of all crew workers in beads
   gt crew status dave             # Status of specific worker
+  gt crew status beads/dave       # Status of specific worker in beads
   gt crew status --json           # JSON output`,
 	RunE: runCrewStatus,
 }
@@ -387,6 +396,7 @@ func init() {
 	crewRestartCmd.Flags().BoolVar(&crewAll, "all", false, "Restart all running crew sessions")
 	crewRestartCmd.Flags().BoolVar(&crewDryRun, "dry-run", false, "Show what would be restarted without restarting")
 
+	crewStartCmd.Flags().StringVar(&crewRig, "rig", "", "Rig to start crew in (alternative to positional rig arg)")
 	crewStartCmd.Flags().BoolVar(&crewAll, "all", false, "Start all crew members in the rig")
 	crewStartCmd.Flags().StringVar(&crewAccount, "account", "", "Claude Code account handle to use")
 	crewStartCmd.Flags().StringVar(&crewAgentOverride, "agent", "", "Agent alias to run crew worker with (overrides rig/town default)")

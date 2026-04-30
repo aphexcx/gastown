@@ -77,6 +77,170 @@ func TestDirSize_NonexistentDir(t *testing.T) {
 	}
 }
 
+func TestGetDoltFlagFromArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		flag string
+		want string
+	}{
+		{
+			name: "space separated data dir",
+			args: []string{"dolt", "sql-server", "--data-dir", "/tmp/dolt-data"},
+			flag: "--data-dir",
+			want: "/tmp/dolt-data",
+		},
+		{
+			name: "equals data dir",
+			args: []string{"dolt", "sql-server", "--data-dir=/tmp/dolt-data"},
+			flag: "--data-dir",
+			want: "/tmp/dolt-data",
+		},
+		{
+			name: "space separated config",
+			args: []string{"dolt", "sql-server", "--config", "/tmp/.dolt-data/config.yaml"},
+			flag: "--config",
+			want: "/tmp/.dolt-data/config.yaml",
+		},
+		{
+			name: "equals config",
+			args: []string{"dolt", "sql-server", "--config=/tmp/.dolt-data/config.yaml"},
+			flag: "--config",
+			want: "/tmp/.dolt-data/config.yaml",
+		},
+		{
+			name: "missing flag",
+			args: []string{"dolt", "sql-server"},
+			flag: "--config",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getDoltFlagFromArgs(tt.args, tt.flag); got != tt.want {
+				t.Fatalf("getDoltFlagFromArgs(%v, %q) = %q, want %q", tt.args, tt.flag, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDoltProcessMatchesTownPaths(t *testing.T) {
+	expectedDir := "/town/.dolt-data"
+
+	tests := []struct {
+		name             string
+		actualDataDir    string
+		actualConfigPath string
+		actualCWD        string
+		stateDataDir     string
+		want             bool
+	}{
+		{
+			name:          "matches live data dir",
+			actualDataDir: "/town/.dolt-data",
+			want:          true,
+		},
+		{
+			name:             "matches live config path",
+			actualConfigPath: "/town/.dolt-data/config.yaml",
+			want:             true,
+		},
+		{
+			name:      "matches cwd in data dir",
+			actualCWD: "/town/.dolt-data",
+			want:      true,
+		},
+		{
+			name:      "matches cwd in town root",
+			actualCWD: "/town",
+			want:      true,
+		},
+		{
+			name:         "falls back to matching state",
+			stateDataDir: "/town/.dolt-data",
+			want:         true,
+		},
+		{
+			name:             "live config beats stale matching state",
+			actualConfigPath: "/town/juplend_4/.beads/dolt/config.yaml",
+			stateDataDir:     "/town/.dolt-data",
+			want:             false,
+		},
+		{
+			name:         "foreign cwd beats stale matching state",
+			actualCWD:    "/town/juplend_4/.beads/dolt",
+			stateDataDir: "/town/.dolt-data",
+			want:         false,
+		},
+		{
+			name:             "correct config beats unusual cwd",
+			actualConfigPath: "/town/.dolt-data/config.yaml",
+			actualCWD:        "/town/juplend_4/.beads/dolt",
+			want:             true,
+		},
+		{
+			name: "rejects unknown process",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doltProcessMatchesTownPaths(expectedDir, tt.actualDataDir, tt.actualConfigPath, tt.actualCWD, tt.stateDataDir)
+			if got != tt.want {
+				t.Fatalf("doltProcessMatchesTownPaths(...) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDoltProcessOwnerPathFromEvidence(t *testing.T) {
+	tests := []struct {
+		name             string
+		actualDataDir    string
+		actualConfigPath string
+		actualCWD        string
+		stateDataDir     string
+		want             string
+	}{
+		{
+			name:          "prefers live data dir",
+			actualDataDir: "/town/.dolt-data",
+			actualCWD:     "/town",
+			stateDataDir:  "/town/.dolt-data",
+			want:          "/town/.dolt-data",
+		},
+		{
+			name:             "falls back to config path",
+			actualConfigPath: "/town/rig/.beads/dolt/config.yaml",
+			actualCWD:        "/town/rig/.beads/dolt",
+			stateDataDir:     "/town/.dolt-data",
+			want:             "/town/rig/.beads/dolt/config.yaml",
+		},
+		{
+			name:         "falls back to cwd",
+			actualCWD:    "/town/rig/.beads/dolt",
+			stateDataDir: "/town/.dolt-data",
+			want:         "/town/rig/.beads/dolt",
+		},
+		{
+			name:         "falls back to state",
+			stateDataDir: "/town/.dolt-data",
+			want:         "/town/.dolt-data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doltProcessOwnerPathFromEvidence(tt.actualDataDir, tt.actualConfigPath, tt.actualCWD, tt.stateDataDir)
+			if got != tt.want {
+				t.Fatalf("doltProcessOwnerPathFromEvidence(...) = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetHealthMetrics_NoServer(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -1470,6 +1634,102 @@ func TestEnsureMetadata_RepairsMissingDoltFields(t *testing.T) {
 	}
 }
 
+// TestEnsureMetadata_RepairsStalePort tests that EnsureMetadata overwrites
+// a stale dolt_server_port (e.g., 13729 from a previous bd init) with the
+// correct port from DefaultConfig. This is the root cause of "connection
+// refused" errors reported by community users after gt dolt fix-metadata.
+func TestEnsureMetadata_RepairsStalePort(t *testing.T) {
+	townRoot := t.TempDir()
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate stale metadata with wrong port (13729 instead of 3307)
+	stale := map[string]interface{}{
+		"backend":          "dolt",
+		"database":         "dolt",
+		"dolt_mode":        "server",
+		"dolt_database":    "hq",
+		"dolt_server_host": "127.0.0.1",
+		"dolt_server_port": 13729,
+	}
+	data, _ := json.Marshal(stale)
+	metaPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metaPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "hq"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	repaired, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("reading metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(repaired, &meta); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+
+	// Port should now be the default (3307), not the stale 13729
+	wantPort := float64(DefaultPort)
+	if meta["dolt_server_port"] != wantPort {
+		t.Errorf("dolt_server_port = %v, want %v", meta["dolt_server_port"], wantPort)
+	}
+	if meta["dolt_server_host"] != "127.0.0.1" {
+		t.Errorf("dolt_server_host = %v, want 127.0.0.1", meta["dolt_server_host"])
+	}
+}
+
+// TestEnsureMetadata_RepairsWrongDoltDatabase verifies that EnsureMetadata
+// corrects a metadata.json where dolt_database points to the wrong database
+// (e.g., "beads_gt" instead of "gastown"). This is the primary fix for the
+// PROJECT IDENTITY MISMATCH bug (gas-tc4).
+func TestEnsureMetadata_RepairsWrongDoltDatabase(t *testing.T) {
+	townRoot := t.TempDir()
+
+	beadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate wrong database name (bd init wrote "beads_gt" instead of "gastown")
+	wrong := map[string]interface{}{
+		"backend":          "dolt",
+		"database":         "dolt",
+		"dolt_mode":        "server",
+		"dolt_database":    "beads_gt",
+		"dolt_server_host": "127.0.0.1",
+		"dolt_server_port": float64(DefaultPort),
+	}
+	data, _ := json.Marshal(wrong)
+	metaPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metaPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "gastown"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	repaired, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("reading metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(repaired, &meta); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+
+	// dolt_database should now be "gastown", not "beads_gt"
+	if meta["dolt_database"] != "gastown" {
+		t.Errorf("dolt_database = %v, want %q", meta["dolt_database"], "gastown")
+	}
+}
+
 // TestEnsureAllMetadata_RepairsAllCorrupt tests that EnsureAllMetadata
 // repairs metadata for all known databases, even if some are corrupt.
 func TestEnsureAllMetadata_RepairsAllCorrupt(t *testing.T) {
@@ -1786,7 +2046,6 @@ func TestInitRig_InvalidCharacters(t *testing.T) {
 	}
 }
 
-
 // =============================================================================
 // Catalog race condition tests (isDoltRetryableError coverage)
 // =============================================================================
@@ -1810,16 +2069,24 @@ func TestIsDoltRetryableError_CatalogRace(t *testing.T) {
 }
 
 func TestWaitForCatalog_NoServer(t *testing.T) {
-	// When no Dolt server is running, waitForCatalog should fail immediately
-	// (not retry) because the error is non-retryable (not a catalog race).
+	// When no Dolt server is reachable, waitForCatalog should fail.
+	// Use port 13399 (unlikely to be in use) to ensure no server responds.
 	townRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Write a config.yaml with an unreachable port so buildServerSQLCmd
+	// tries to connect to a port that nobody is listening on.
+	configContent := "listener:\n  port: 13399\ndata_dir: " + dataDir + "\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	err := waitForCatalog(townRoot, "testdb")
 	if err == nil {
 		t.Fatal("expected error when no server is running")
 	}
+	// Connection refused or similar non-retryable error
 	if !strings.Contains(err.Error(), "non-retryable") {
 		t.Errorf("expected non-retryable error, got: %v", err)
 	}
@@ -2156,6 +2423,17 @@ func TestDatabaseExists_NoDataDir(t *testing.T) {
 func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
 	townRoot := t.TempDir()
 
+	// Point the test at a port nothing listens on so IsRunning returns false
+	// and doesn't accidentally connect to a real Dolt server on the default port.
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"),
+		[]byte("listener:\n  port: 13307\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
 	// Create a healthy workspace: metadata says dolt, and database exists
 	beadsDir := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -2179,7 +2457,7 @@ func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 0 {
 		t.Errorf("expected 0 broken workspaces, got %d: %+v", len(broken), broken)
 	}
@@ -2210,7 +2488,7 @@ func TestFindBrokenWorkspaces_MissingDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
 	}
@@ -2256,7 +2534,7 @@ func TestFindBrokenWorkspaces_WithLocalData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
 	}
@@ -2288,7 +2566,7 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 0 {
 		t.Errorf("expected 0 broken workspaces for sqlite backend, got %d", len(broken))
 	}
@@ -2296,6 +2574,16 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 
 func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 	townRoot := t.TempDir()
+
+	// Isolate from real Dolt server on default port
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"),
+		[]byte("listener:\n  port: 13307\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Set up rigs.json with two rigs
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
@@ -2329,7 +2617,7 @@ func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace (rig-a only), got %d", len(broken))
 	}
@@ -3108,6 +3396,10 @@ func TestIsRemote(t *testing.T) {
 		{"10.0.0.5", true},
 		{"dolt.internal", true},
 		{"192.168.1.100", true},
+		// Hostnames resolving to loopback should be treated as local.
+		// This covers /etc/hosts entries like "127.0.0.1 dolt.home.arpa".
+		// Note: "localhost" is already covered above; any hostname that
+		// the OS resolves to 127.0.0.1 or ::1 should also be local.
 	}
 	for _, tt := range tests {
 		c := &Config{Host: tt.host}
@@ -3278,22 +3570,26 @@ func TestBuildDoltSQLCmd_Local(t *testing.T) {
 		t.Errorf("cmd.Dir = %q, want %q", cmd.Dir, "/tmp/dolt-data")
 	}
 
-	// Should have: dolt sql -q "SELECT 1" (no connection flags)
+	// Should force a TCP client connection even for local servers.
 	args := cmd.Args
-	if len(args) < 4 {
-		t.Fatalf("expected at least 4 args, got %v", args)
+	if len(args) < 10 {
+		t.Fatalf("expected at least 10 args, got %v", args)
 	}
-	if args[1] != "sql" {
-		t.Errorf("args[1] = %q, want 'sql'", args[1])
-	}
-	if args[2] != "-q" {
-		t.Errorf("args[2] = %q, want '-q'", args[2])
-	}
-	// Should NOT have --host flag
-	for _, arg := range args {
-		if arg == "--host" {
-			t.Error("local cmd should not have --host flag")
+	argStr := strings.Join(args, " ")
+	for _, want := range []string{"--host", "127.0.0.1", "--port", "3307", "--user", "root", "--no-tls", "sql", "-q", "SELECT 1"} {
+		if !strings.Contains(argStr, want) {
+			t.Errorf("args %q missing expected %q", argStr, want)
 		}
+	}
+	found := false
+	for _, env := range cmd.Env {
+		if env == "DOLT_CLI_PASSWORD=" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("local cmd should set empty DOLT_CLI_PASSWORD to suppress prompts")
 	}
 }
 
@@ -3309,9 +3605,10 @@ func TestBuildDoltSQLCmd_Remote(t *testing.T) {
 	ctx := t.Context()
 	cmd := buildDoltSQLCmd(ctx, config, "-q", "SELECT 1")
 
-	// Should NOT set Dir for remote
-	if cmd.Dir != "" {
-		t.Errorf("cmd.Dir = %q, want empty for remote", cmd.Dir)
+	// Dir is always set to DataDir — even for remote connections (GH#2537)
+	// to prevent dolt from auto-creating .doltcfg/privileges.db in $CWD.
+	if cmd.Dir != config.DataDir {
+		t.Errorf("cmd.Dir = %q, want %q (DataDir set for remote per GH#2537)", cmd.Dir, config.DataDir)
 	}
 
 	// Should have connection flags
@@ -3346,12 +3643,13 @@ func TestBuildDoltSQLCmd_RemoteNoPassword(t *testing.T) {
 	ctx := t.Context()
 	cmd := buildDoltSQLCmd(ctx, config, "-q", "SELECT 1")
 
-	// Should NOT have DOLT_CLI_PASSWORD in env
+	// Should still have empty DOLT_CLI_PASSWORD in env to suppress prompts.
 	for _, env := range cmd.Env {
-		if strings.HasPrefix(env, "DOLT_CLI_PASSWORD=") {
-			t.Error("remote cmd without password should not have DOLT_CLI_PASSWORD env var")
+		if env == "DOLT_CLI_PASSWORD=" {
+			return
 		}
 	}
+	t.Error("remote cmd without password should set empty DOLT_CLI_PASSWORD env var")
 }
 
 // =============================================================================
@@ -3612,5 +3910,588 @@ func TestCollectDatabaseOwners_UnknownDB(t *testing.T) {
 	owners := CollectDatabaseOwners(townRoot)
 	if _, exists := owners["unknown_db"]; exists {
 		t.Error("unknown_db should not have an owner")
+	}
+}
+
+// =============================================================================
+// writeServerConfig tests
+// =============================================================================
+
+func TestWriteServerConfig_Defaults(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:           3307,
+		DataDir:        dir,
+		MaxConnections: 1000,
+		ReadTimeoutMs:  DefaultReadTimeoutMs,
+		WriteTimeoutMs: DefaultWriteTimeoutMs,
+		LogLevel:       "warning",
+	}
+
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatalf("writeServerConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+	content := string(data)
+
+	checks := []string{
+		"port: 3307",
+		"max_connections: 1000",
+		fmt.Sprintf("read_timeout_millis: %d", DefaultReadTimeoutMs),
+		fmt.Sprintf("write_timeout_millis: %d", DefaultWriteTimeoutMs),
+		"data_dir: \"" + dir + "\"",
+		"log_level: warning",
+		"auto_gc_behavior:",
+	}
+	for _, want := range checks {
+		if !strings.Contains(content, want) {
+			t.Errorf("config missing %q\nfull content:\n%s", want, content)
+		}
+	}
+}
+
+func TestWriteServerConfig_NoHost(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:    3307,
+		DataDir: dir,
+		// Host is empty — should not appear in config
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	if strings.Contains(string(data), "host:") {
+		t.Error("empty Host should not write host line to config")
+	}
+}
+
+func TestWriteServerConfig_WithHost(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:    3307,
+		Host:    "127.0.0.1",
+		DataDir: dir,
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	if !strings.Contains(string(data), "host: 127.0.0.1") {
+		t.Error("explicit Host should appear in config")
+	}
+}
+
+func TestWriteServerConfig_ZeroTimeoutsOmitted(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:           3307,
+		DataDir:        dir,
+		ReadTimeoutMs:  0, // zero = use Dolt default
+		WriteTimeoutMs: 0,
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	content := string(data)
+	if strings.Contains(content, "read_timeout_millis") {
+		t.Error("zero ReadTimeoutMs should not write read_timeout_millis")
+	}
+	if strings.Contains(content, "write_timeout_millis") {
+		t.Error("zero WriteTimeoutMs should not write write_timeout_millis")
+	}
+}
+
+func TestWriteServerConfig_Overwrites(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	// Write initial config
+	if err := os.WriteFile(configPath, []byte("old content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{Port: 3307, DataDir: dir, LogLevel: "info"}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	if strings.Contains(string(data), "old content") {
+		t.Error("writeServerConfig should overwrite existing file")
+	}
+	if !strings.Contains(string(data), "log_level: info") {
+		t.Error("new config should have updated log level")
+	}
+}
+
+// TestBuildDatabaseToRigMap tests the database name to rig name mapping.
+func TestBuildDatabaseToRigMap(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test with empty routes file
+	result := buildDatabaseToRigMap(townRoot)
+	if len(result) != 0 {
+		t.Errorf("empty routes: expected empty map, got %v", result)
+	}
+
+	// Test with typical routes.jsonl
+	routesContent := `{"prefix":"hq-","path":"."}
+{"prefix":"bd-","path":"beads/mayor/rig"}
+{"prefix":"gt-","path":"gastown/mayor/rig"}
+{"prefix":"sw-","path":"sallaWork/mayor/rig"}
+{"prefix":"hq-cv-","path":"."}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result = buildDatabaseToRigMap(townRoot)
+
+	// Check expected mappings
+	expected := map[string]string{
+		"bd": "beads",
+		"gt": "gastown",
+		"sw": "sallaWork",
+	}
+
+	for db, rig := range expected {
+		if got, want := result[db], rig; got != want {
+			t.Errorf("database %q: got rig %q, want %q", db, got, want)
+		}
+	}
+
+	// HQ routes with path "." should not be included (path[0] == ".")
+	if _, exists := result["hq"]; exists {
+		t.Error("hq database should not be in map (path is '.')")
+	}
+	if _, exists := result["hq-cv"]; exists {
+		t.Error("hq-cv database should not be in map (path is '.')")
+	}
+}
+
+// TestEnsureAllMetadata_UsesRigNames verifies that EnsureAllMetadata correctly
+// maps database names to rig names using routes.jsonl.
+// This is a regression test for the bug where databases named "bd", "gt", "sw"
+// were incorrectly used as rig names, creating stub directories at /gt/bd/, /gt/gt/, /gt/sw/
+// instead of the correct /gt/beads/, /gt/gastown/, /gt/sallaWork/.
+func TestEnsureAllMetadata_UsesRigNames(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create databases in .dolt-data with prefix names (as Dolt server does)
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "hq")
+	setupDoltDB(t, dataDir, "bd")
+	setupDoltDB(t, dataDir, "gt")
+
+	// Create routes.jsonl with correct mappings
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix":"hq-","path":"."}
+{"prefix":"bd-","path":"beads/mayor/rig"}
+{"prefix":"gt-","path":"gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create correct rig beads directories (not the buggy stub paths)
+	if err := os.MkdirAll(filepath.Join(townRoot, "beads", "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run EnsureAllMetadata
+	updated, errs := EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+
+	// Verify metadata was created in correct locations
+	hqMeta := filepath.Join(townRoot, ".beads", "metadata.json")
+	beadsMeta := filepath.Join(townRoot, "beads", "mayor", "rig", ".beads", "metadata.json")
+	gastownMeta := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads", "metadata.json")
+
+	// Buggy paths that should NOT exist
+	buggyBdMeta := filepath.Join(townRoot, "bd", ".beads", "metadata.json")
+	buggyGtMeta := filepath.Join(townRoot, "gt", ".beads", "metadata.json")
+
+	if _, err := os.Stat(hqMeta); os.IsNotExist(err) {
+		t.Error("hq metadata.json should exist")
+	}
+	if _, err := os.Stat(beadsMeta); os.IsNotExist(err) {
+		t.Error("beads metadata.json should exist in correct path")
+	}
+	if _, err := os.Stat(gastownMeta); os.IsNotExist(err) {
+		t.Error("gastown metadata.json should exist in correct path")
+	}
+
+	// Verify buggy paths were NOT created
+	if _, err := os.Stat(buggyBdMeta); err == nil {
+		t.Error("buggy path bd/.beads/metadata.json should NOT exist")
+	}
+	if _, err := os.Stat(buggyGtMeta); err == nil {
+		t.Error("buggy path gt/.beads/metadata.json should NOT exist")
+	}
+
+	// Verify correct number of updates
+	if len(updated) != 3 {
+		t.Errorf("expected 3 updated databases, got %d: %v", len(updated), updated)
+	}
+}
+
+// TestEnsureAllMetadata_FallbackToDbName tests that EnsureAllMetadata falls back
+// to using the database name as rig name when no route is found.
+func TestEnsureAllMetadata_FallbackToDbName(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create database
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "unknownrig")
+
+	// Create empty routes.jsonl
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create rig beads dir with same name as database
+	if err := os.MkdirAll(filepath.Join(townRoot, "unknownrig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, errs := EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+	if len(updated) != 1 {
+		t.Errorf("expected 1 updated, got %d: %v", len(updated), updated)
+	}
+
+	// Verify metadata was created
+	metaPath := filepath.Join(townRoot, "unknownrig", ".beads", "metadata.json")
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		t.Error("metadata.json should exist for unknown rig")
+	}
+}
+
+// TestEnsureAllMetadata_NoOscillation verifies that when two databases map to
+// the same rig (e.g. "gastown" and "gt" both map to rig "gastown" via
+// conflicting routes.jsonl/rigs.json entries), EnsureAllMetadata does not
+// oscillate the dolt_database value on repeated calls. (gas-ar0)
+func TestEnsureAllMetadata_NoOscillation(t *testing.T) {
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	// Simulate two databases that both map to "gastown":
+	//   "gastown" — matched by default (db name == rig name)
+	//   "gt"      — matched via rigs.json prefix "gt"
+	setupDoltDB(t, dataDir, "gastown")
+	setupDoltDB(t, dataDir, "gt")
+	setupDoltDB(t, dataDir, "hq")
+
+	// rigs.json: gastown rig uses prefix "gt"
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsData := `{"version":1,"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create beads dirs
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// First call: no existing metadata.json — whichever candidate wins is fine
+	_, errs := EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Fatalf("first EnsureAllMetadata errors: %v", errs)
+	}
+
+	// Read the value that was written
+	metaPath := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads", "metadata.json")
+	readDB := func() string {
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			t.Fatalf("reading metadata.json: %v", err)
+		}
+		var meta map[string]interface{}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			t.Fatalf("parsing metadata.json: %v", err)
+		}
+		db, _ := meta["dolt_database"].(string)
+		return db
+	}
+
+	firstDB := readDB()
+	if firstDB == "" {
+		t.Fatal("dolt_database should be set after first call")
+	}
+
+	// Second call: must produce the same value (no oscillation)
+	_, errs = EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Fatalf("second EnsureAllMetadata errors: %v", errs)
+	}
+	secondDB := readDB()
+	if secondDB != firstDB {
+		t.Errorf("oscillation: first call wrote %q, second call wrote %q", firstDB, secondDB)
+	}
+
+	// Third call: still no change
+	_, errs = EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Fatalf("third EnsureAllMetadata errors: %v", errs)
+	}
+	thirdDB := readDB()
+	if thirdDB != firstDB {
+		t.Errorf("oscillation: first call wrote %q, third call wrote %q", firstDB, thirdDB)
+	}
+}
+
+func TestCleanStaleSocket_RemovesStaleFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets not applicable on Windows")
+	}
+
+	// Create a regular file pretending to be a stale socket
+	socketPath := filepath.Join(t.TempDir(), "mysql.sock")
+	if err := os.WriteFile(socketPath, []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanStaleSocket(socketPath)
+
+	// lsof will report exit code 1 (no process holds it) → file should be removed
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Error("stale socket file should have been removed")
+	}
+}
+
+func TestCleanStaleSocket_NoopWhenMissing(t *testing.T) {
+	// Should not panic or error when socket doesn't exist
+	cleanStaleSocket(filepath.Join(t.TempDir(), "nonexistent.sock"))
+}
+
+// =============================================================================
+// Thundering herd fix tests (gt-nkn)
+// =============================================================================
+
+func TestCountDoltDatabases(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Non-existent directory returns 1 (safe default).
+	if got := countDoltDatabases(filepath.Join(tmpDir, "noexist")); got != 1 {
+		t.Errorf("non-existent dir: got %d, want 1", got)
+	}
+
+	// Empty directory returns 1 (safe default).
+	empty := filepath.Join(tmpDir, "empty")
+	if err := os.MkdirAll(empty, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got := countDoltDatabases(empty); got != 1 {
+		t.Errorf("empty dir: got %d, want 1", got)
+	}
+
+	// Directory with Dolt databases (subdirs containing .dolt).
+	dataDir := filepath.Join(tmpDir, "data")
+	for _, name := range []string{"hq", "gastown", "beads"} {
+		if err := os.MkdirAll(filepath.Join(dataDir, name, ".dolt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A plain directory without .dolt should not be counted.
+	if err := os.MkdirAll(filepath.Join(dataDir, "notadb"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got := countDoltDatabases(dataDir); got != 3 {
+		t.Errorf("dataDir with 3 dbs + 1 plain dir: got %d, want 3", got)
+	}
+}
+
+// TestRemoveDatabase_RefusesLargeDBWhenServerDown verifies that RemoveDatabase
+// refuses to delete databases with >1MB of data when the server is offline
+// and --force is not set. (gt-xvh)
+func TestRemoveDatabase_RefusesLargeDBWhenServerDown(t *testing.T) {
+	// Skip if a real Dolt server is running on the default port — IsRunning
+	// would detect it and take the SQL-check path instead of the size-check path.
+	if conn, err := net.DialTimeout("tcp", "127.0.0.1:3307", time.Second); err == nil {
+		conn.Close()
+		t.Skip("skipping: real Dolt server running on port 3307 would bypass size check")
+	}
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "big_db")
+
+	// Write >1MB of data to make it look like a real database
+	bigFile := filepath.Join(dataDir, "big_db", ".dolt", "noms", "data")
+	data := make([]byte, 2<<20) // 2MB
+	if err := os.WriteFile(bigFile, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Server is not running (no PID file, no process)
+	err := RemoveDatabase(townRoot, "big_db", false)
+	if err == nil {
+		t.Fatal("expected error when removing large database with server offline")
+	}
+	if !strings.Contains(err.Error(), "server offline") {
+		t.Errorf("expected 'server offline' in error, got: %v", err)
+	}
+
+	// Verify the database still exists
+	if _, statErr := os.Stat(filepath.Join(dataDir, "big_db")); statErr != nil {
+		t.Error("big_db should still exist after refused removal")
+	}
+}
+
+// TestRemoveDatabase_AllowsSmallDBWhenServerDown verifies that small databases
+// (<1MB) can be removed even when the server is offline. (gt-xvh)
+func TestRemoveDatabase_AllowsSmallDBWhenServerDown(t *testing.T) {
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "small_orphan")
+
+	// Small database (<1MB) — manifest file is only a few bytes from setupDoltDB
+	err := RemoveDatabase(townRoot, "small_orphan", true)
+	if err != nil {
+		t.Fatalf("RemoveDatabase with force: %v", err)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(dataDir, "small_orphan")); !os.IsNotExist(statErr) {
+		t.Error("small_orphan should be removed")
+	}
+}
+
+// TestQuarantine_MovesInsteadOfDeleting verifies that the quarantine logic
+// moves corrupted database dirs to .quarantine/ instead of deleting them. (gt-xvh)
+func TestQuarantine_MovesInsteadOfDeleting(t *testing.T) {
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	// Create a "corrupted" database: has .dolt/ but no noms/manifest
+	corruptDB := filepath.Join(dataDir, "corrupt_db", ".dolt")
+	if err := os.MkdirAll(corruptDB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Write some data so it's not empty
+	if err := os.WriteFile(filepath.Join(corruptDB, "somefile"), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the quarantine scan (same logic as Start)
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		doltDir := filepath.Join(dataDir, entry.Name(), ".dolt")
+		if _, statErr := os.Stat(doltDir); statErr != nil {
+			continue
+		}
+		manifest := filepath.Join(doltDir, "noms", "manifest")
+		if _, statErr := os.Stat(manifest); statErr == nil {
+			continue
+		}
+		// This is corrupted — verify quarantine moves it
+		quarantineDir := filepath.Join(dataDir, ".quarantine")
+		if mkErr := os.MkdirAll(quarantineDir, 0755); mkErr != nil {
+			t.Fatal(mkErr)
+		}
+		dest := filepath.Join(quarantineDir, entry.Name()+".test")
+		if renameErr := os.Rename(filepath.Join(dataDir, entry.Name()), dest); renameErr != nil {
+			t.Fatalf("quarantine move failed: %v", renameErr)
+		}
+	}
+
+	// Original should be gone
+	if _, err := os.Stat(filepath.Join(dataDir, "corrupt_db")); !os.IsNotExist(err) {
+		t.Error("corrupt_db should have been moved to quarantine")
+	}
+
+	// Quarantine should have it
+	quarantineEntries, err := os.ReadDir(filepath.Join(dataDir, ".quarantine"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quarantineEntries) != 1 {
+		t.Errorf("expected 1 quarantined entry, got %d", len(quarantineEntries))
+	}
+}
+
+func TestGetLastCommitAge_NoServer(t *testing.T) {
+	// With no server running, GetLastCommitAge should return an error,
+	// not panic or hang.
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := GetLastCommitAge(townRoot)
+	if err == nil {
+		// May succeed if a local Dolt is running; either outcome is valid.
+		return
+	}
+	t.Logf("GetLastCommitAge with no server: %v (expected)", err)
+}
+
+func TestGetLastCommitAge_NoDatabases(t *testing.T) {
+	townRoot := t.TempDir()
+
+	_, _, err := GetLastCommitAge(townRoot)
+	if err == nil {
+		t.Error("expected error with no databases, got nil")
+	}
+}
+
+func TestHealthMetrics_CommitFreshnessFields(t *testing.T) {
+	// Verify the new fields exist and are zero-valued when probe fails.
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := GetHealthMetrics(townRoot)
+	if metrics.LastCommitAge < 0 {
+		t.Errorf("LastCommitAge = %v, want >= 0", metrics.LastCommitAge)
 	}
 }

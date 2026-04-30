@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
@@ -28,7 +27,8 @@ const (
 
 // Find locates the town root by walking up from the given directory.
 // It prefers mayor/town.json over mayor/ directory as workspace marker.
-// When in a worktree path (polecats/ or crew/), continues to outermost workspace.
+// Always continues to the outermost workspace, correctly handling nested
+// workspace structures (e.g., rig directories with their own mayor/town.json).
 // Does not resolve symlinks to stay consistent with os.Getwd().
 func Find(startDir string) (string, error) {
 	absDir, err := filepath.Abs(startDir)
@@ -36,22 +36,18 @@ func Find(startDir string) (string, error) {
 		return "", fmt.Errorf("resolving path: %w", err)
 	}
 
-	inWorktree := isInWorktreePath(absDir)
 	var primaryMatch, secondaryMatch string
 
 	current := absDir
 	for {
+		// Always keep updating primaryMatch and secondaryMatch to find the outermost
+		// directory with the respective markers. This handles nested workspace
+		// structures where inner workspaces (e.g., rig directories or worktrees)
+		// have their own mayor/town.json, ensuring we return the actual town root.
 		if _, err := os.Stat(filepath.Join(current, PrimaryMarker)); err == nil {
-			if !inWorktree {
-				return current, nil
-			}
 			primaryMatch = current
 		}
 
-		// Always keep updating secondaryMatch to find the outermost mayor/ directory.
-		// This handles nested structures where rigs have their own mayor/ directories
-		// but only the town root should be detected as the workspace.
-		// The primary marker (mayor/town.json) is authoritative and returns early above.
 		if info, err := os.Stat(filepath.Join(current, SecondaryMarker)); err == nil && info.IsDir() {
 			secondaryMatch = current
 		}
@@ -65,11 +61,6 @@ func Find(startDir string) (string, error) {
 		}
 		current = parent
 	}
-}
-
-func isInWorktreePath(path string) bool {
-	sep := string(filepath.Separator)
-	return strings.Contains(path, sep+"polecats"+sep) || strings.Contains(path, sep+"crew"+sep)
 }
 
 // FindOrError is like Find but returns a user-friendly error if not found.
@@ -94,20 +85,31 @@ func FindFromCwd() (string, error) {
 }
 
 // FindFromCwdOrError is like FindFromCwd but returns an error if not found.
-// If getcwd fails (e.g., worktree deleted), falls back to GT_TOWN_ROOT env var.
+// It searches for a workspace starting from the CWD. If none is found, it
+// falls back to the GT_TOWN_ROOT or GT_ROOT environment variables.
 func FindFromCwdOrError() (string, error) {
 	cwd, err := os.Getwd()
-	if err != nil {
-		// Fallback: try GT_TOWN_ROOT env var (set by polecat sessions)
-		if townRoot := os.Getenv("GT_TOWN_ROOT"); townRoot != "" {
+	if err == nil {
+		root, err := Find(cwd)
+		if err == nil && root != "" {
+			return root, nil
+		}
+	}
+
+	// Fallback: try GT_TOWN_ROOT or GT_ROOT env vars (set by shell integration or session manager)
+	for _, envName := range []string{"GT_TOWN_ROOT", "GT_ROOT"} {
+		if townRoot := os.Getenv(envName); townRoot != "" {
 			// Verify it's actually a workspace
-			if _, statErr := os.Stat(filepath.Join(townRoot, PrimaryMarker)); statErr == nil {
+			if ok, _ := IsWorkspace(townRoot); ok {
 				return townRoot, nil
 			}
 		}
+	}
+
+	if err != nil {
 		return "", fmt.Errorf("getting current directory: %w", err)
 	}
-	return FindOrError(cwd)
+	return "", ErrNotFound
 }
 
 // FindFromCwdWithFallback is like FindFromCwdOrError but returns (townRoot, cwd, error).

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,15 +20,27 @@ import (
 const (
 	defaultStrandedScanInterval = 30 * time.Second
 	eventPollInterval           = 5 * time.Second
+	eventPollMaxBackoff         = 60 * time.Second
+	// Beads lifecycle events use CURRENT_TIMESTAMP in Dolt, which is second
+	// precision. Poll with a 1s overlap so transitions that happen in the same
+	// second as the previous high-water mark are still visible next cycle.
+	eventPollLookback = 1 * time.Second
+
+	// convoyGracePeriod is how long after creation a convoy is immune from
+	// auto-close. This prevents a race where the daemon's stranded scan
+	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
+	convoyGracePeriod = 5 * time.Minute
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
 type strandedConvoyInfo struct {
-	ID           string   `json:"id"`
-	Title        string   `json:"title"`
-	TrackedCount int      `json:"tracked_count"`
-	ReadyCount   int      `json:"ready_count"`
-	ReadyIssues  []string `json:"ready_issues"`
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	TrackedCount int       `json:"tracked_count"`
+	ReadyCount   int       `json:"ready_count"`
+	ReadyIssues  []string  `json:"ready_issues"`
+	CreatedAt    time.Time `json:"created_at"`
+	BaseBranch   string    `json:"base_branch,omitempty"`
 }
 
 // ConvoyManager monitors beads events for issue closes and periodically scans for stranded convoys.
@@ -80,18 +93,25 @@ type ConvoyManager struct {
 
 	// lastEventIDs tracks per-store high-water marks for event polling.
 	// Key matches stores map keys ("hq", "gastown", etc.).
-	lastEventIDs sync.Map // map[string]int64
+	lastEventIDs sync.Map // map[string]time.Time
 
 	// seeded is true once the first poll cycle has run (warm-up).
 	// The first cycle advances high-water marks without processing events,
 	// preventing a burst of historical event replay on daemon restart.
 	seeded atomic.Bool
 
-	// processedCloses tracks issue IDs that have already been processed for
-	// close events. This prevents duplicate convoy checks when the same close
+	// processedCloses tracks issue IDs whose current closed state has already
+	// been processed. This prevents duplicate convoy checks when the same close
 	// event is seen from multiple stores or across poll cycles where high-water
-	// marks don't perfectly deduplicate (e.g., event replication). See GH #1798.
+	// marks don't perfectly deduplicate (e.g., event replication). The entry is
+	// cleared when the issue is reopened so a later close is processed again.
+	// See GH #1798.
 	processedCloses sync.Map // map[string]bool
+
+	// processedLifecycleEvents tracks close/reopen event IDs that have already
+	// been handled. This allows the 1s overlap window above without replaying
+	// the same lifecycle events on every poll.
+	processedLifecycleEvents sync.Map // map[string]bool
 }
 
 // NewConvoyManager creates a new convoy manager.
@@ -176,7 +196,8 @@ func (m *ConvoyManager) runEventPoll() {
 		return
 	}
 
-	ticker := time.NewTicker(eventPollInterval)
+	currentInterval := eventPollInterval
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
 	for {
@@ -202,7 +223,25 @@ func (m *ConvoyManager) runEventPoll() {
 				snapshot[k] = v
 			}
 			m.storesMu.Unlock()
-			m.pollStoresSnapshot(snapshot)
+
+			hadError := m.pollStoresSnapshot(snapshot)
+			// Exponential backoff on consecutive errors to avoid hammering
+			// a recovering Dolt server. Reset on success. (GH#2686)
+			if hadError {
+				newInterval := currentInterval * 2
+				if newInterval > eventPollMaxBackoff {
+					newInterval = eventPollMaxBackoff
+				}
+				if newInterval != currentInterval {
+					currentInterval = newInterval
+					ticker.Reset(currentInterval)
+					m.logger("Convoy: poll backoff → %s", currentInterval)
+				}
+			} else if currentInterval != eventPollInterval {
+				currentInterval = eventPollInterval
+				ticker.Reset(currentInterval)
+				m.logger("Convoy: poll recovered, interval reset to %s", currentInterval)
+			}
 		}
 	}
 }
@@ -212,41 +251,69 @@ func (m *ConvoyManager) runEventPoll() {
 // processing events, preventing a burst of historical replay on restart.
 // A per-cycle seen set deduplicates close events across stores so each
 // issueID is processed at most once per poll cycle.
-func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) {
+// Returns true if any store poll encountered an error.
+func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) bool {
 	seen := make(map[string]bool)
+	hadError := false
 	for name, store := range stores {
 		if name != "hq" && m.isRigParked(name) {
 			continue
 		}
-		m.pollStore(name, store, stores, seen)
+		if err := m.pollStore(name, store, stores, seen); err != nil {
+			hadError = true
+		}
 	}
 	m.seeded.CompareAndSwap(false, true)
+	return hadError
 }
 
 // pollStore fetches new events from a single store and processes close events.
 // Convoy lookups always use the hq store since convoys are hq-* prefixed.
 // The stores snapshot is passed to avoid accessing m.stores without the lock.
 // The seen set deduplicates issueIDs across stores within a poll cycle.
-func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map[string]beadsdk.Storage, seen map[string]bool) {
-	// Load per-store high-water mark
-	var highWater int64
+// Returns an error if the poll failed (used by caller for backoff decisions).
+func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map[string]beadsdk.Storage, seen map[string]bool) error {
+	// Load per-store high-water mark.
+	// Default to Unix epoch (not zero time) because Go's zero time.Time
+	// (0001-01-01) causes Dolt's SQL driver to produce +Inf when converting
+	// to a float parameter, triggering "Error 1366: +Inf is not a valid
+	// value for double". Unix epoch is safe for all SQL backends.
+	highWater := time.Unix(0, 0).UTC()
 	if v, ok := m.lastEventIDs.Load(name); ok {
-		highWater = v.(int64)
+		highWater = v.(time.Time)
+	}
+	querySince := highWater
+	if !highWater.Equal(time.Unix(0, 0).UTC()) {
+		querySince = highWater.Add(-eventPollLookback)
+		if querySince.Before(time.Unix(0, 0).UTC()) {
+			querySince = time.Unix(0, 0).UTC()
+		}
 	}
 
-	events, err := store.GetAllEventsSince(m.ctx, highWater)
+	events, err := store.GetAllEventsSince(m.ctx, querySince)
 	if err != nil {
+		if isInfNaNError(err) {
+			// A corrupted row in the events table has +Inf/-Inf/NaN stored in a
+			// double column (e.g. created_at serialized from Go's zero time.Time).
+			// Advance the high-water mark to now so future polls skip past the
+			// bad row entirely. Events before now are missed, but the stranded
+			// convoy scanner will catch any completions that were lost.
+			now := time.Now().UTC()
+			m.lastEventIDs.Store(name, now)
+			m.logger("Convoy: event poll (%s): +Inf/NaN row detected, advancing HWM to %s to skip corrupt data", name, now.Format(time.RFC3339))
+			return nil
+		}
 		m.logger("Convoy: event poll error (%s): %v", name, err)
 		// Signal recovery mode so the stranded scan shortens its interval and
 		// retries quickly once Dolt comes back.
 		m.recoveryMode.Store(true)
-		return
+		return err
 	}
 
 	// Advance high-water mark from all events
 	for _, e := range events {
-		if e.ID > highWater {
-			highWater = e.ID
+		if e.CreatedAt.After(highWater) {
+			highWater = e.CreatedAt
 		}
 	}
 	m.lastEventIDs.Store(name, highWater)
@@ -254,34 +321,52 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	// First poll cycle is warm-up only: advance marks, skip processing.
 	// This prevents replaying the entire event history on daemon restart.
 	if !m.seeded.Load() {
-		return
+		for _, e := range events {
+			if e.ID == "" {
+				continue
+			}
+			if isCloseEvent(e) || isReopenEvent(e) {
+				m.processedLifecycleEvents.Store(e.ID, true)
+			}
+		}
+		return nil
 	}
 
 	// Use hq store for convoy lookups (convoys are hq-* prefixed)
 	hqStore := stores["hq"]
 	if hqStore == nil {
 		m.logger("Convoy: hq store unavailable, skipping convoy lookups for %s events", name)
-		return
+		return nil
 	}
 
 	for _, e := range events {
-		// Only interested in status changes to closed (EventStatusChanged with new_value=closed)
-		// or explicit close events (EventClosed)
-		isClose := e.EventType == beadsdk.EventClosed
-		if !isClose && e.EventType == beadsdk.EventStatusChanged {
-			isClose = e.NewValue != nil && *e.NewValue == "closed"
-		}
-		if !isClose {
-			continue
-		}
-
 		issueID := e.IssueID
 		if issueID == "" {
 			continue
 		}
 
+		if isCloseEvent(e) || isReopenEvent(e) {
+			if _, alreadyHandled := m.processedLifecycleEvents.LoadOrStore(e.ID, true); alreadyHandled {
+				continue
+			}
+		}
+
+		if isReopenEvent(e) {
+			// Reopening starts a new close epoch for this issue. Clear both the
+			// per-cycle and cross-cycle dedup so a later close is processed again.
+			delete(seen, issueID)
+			m.processedCloses.Delete(issueID)
+			continue
+		}
+
+		if !isCloseEvent(e) {
+			continue
+		}
+
 		// Deduplicate: skip if already processed this issueID in this poll cycle
 		// (same close may appear in multiple stores or as multiple event types).
+		// Reopen events clear this marker so close→reopen→close can be processed
+		// twice even when all three events land in the same poll cycle.
 		if seen[issueID] {
 			continue
 		}
@@ -296,8 +381,56 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		}
 
 		m.logger("Convoy: close detected: %s (from %s)", issueID, name)
-		convoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, "Convoy", m.logger, m.gtPath, m.isRigParked)
+		resolver := convoy.NewStoreResolver(m.townRoot, stores)
+		convoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, "Convoy", m.logger, m.gtPath, m.isRigParked, resolver)
 	}
+	return nil
+}
+
+// isInfNaNError reports whether err is a Dolt/SQL error about an invalid float
+// value (+Inf, -Inf, NaN) in a double column. These errors arise when a
+// corrupted row (e.g. created_at written from Go's zero time.Time via an old
+// driver path) is encountered during a query. The caller should advance the
+// high-water mark to skip past the offending row rather than entering
+// permanent backoff.
+func isInfNaNError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Dolt wraps values in single quotes: "'+Inf' is not a valid value for 'double'"
+	// Match both quoted and unquoted forms.
+	return strings.Contains(msg, "+Inf is not a valid value") ||
+		strings.Contains(msg, "'+Inf' is not a valid value") ||
+		strings.Contains(msg, "-Inf is not a valid value") ||
+		strings.Contains(msg, "'-Inf' is not a valid value") ||
+		strings.Contains(msg, "NaN is not a valid value") ||
+		strings.Contains(msg, "'NaN' is not a valid value")
+}
+
+func isCloseEvent(e *beadsdk.Event) bool {
+	if e == nil {
+		return false
+	}
+	if e.EventType == beadsdk.EventClosed {
+		return true
+	}
+	return e.EventType == beadsdk.EventStatusChanged &&
+		e.NewValue != nil &&
+		*e.NewValue == "closed"
+}
+
+func isReopenEvent(e *beadsdk.Event) bool {
+	if e == nil {
+		return false
+	}
+	if e.EventType == beadsdk.EventReopened {
+		return true
+	}
+	return e.EventType == beadsdk.EventStatusChanged &&
+		e.OldValue != nil &&
+		*e.OldValue == "closed" &&
+		(e.NewValue == nil || *e.NewValue != "closed")
 }
 
 // runStrandedScan is the periodic stranded convoy scan loop.
@@ -354,12 +487,20 @@ func (m *ConvoyManager) scan() {
 		if c.ReadyCount > 0 {
 			m.feedFirstReady(c)
 		} else if c.TrackedCount == 0 {
-			// Truly empty convoy — safe to auto-close mechanically.
+			// Empty convoy — but skip if it was just created (GH#2303).
+			// The sling's bd dep add may not be visible in Dolt yet.
+			if !c.CreatedAt.IsZero() && time.Since(c.CreatedAt) < convoyGracePeriod {
+				m.logger("Convoy %s: empty but within grace period (created %s ago) — skipping", c.ID, time.Since(c.CreatedAt).Round(time.Second))
+				continue
+			}
 			m.closeEmptyConvoy(c.ID)
 		} else {
-			// Tracked issues exist but none are ready. This requires agent
-			// judgment (the deacon decides what to do). Log for visibility.
-			m.logger("Convoy %s: %d tracked issues, 0 ready — needs agent review", c.ID, c.TrackedCount)
+			// Tracked issues exist but none are ready. This could mean:
+			// (a) all tracked issues are closed → convoy should auto-close
+			// (b) issues are blocked/in-progress → needs agent review
+			// Run convoy check to handle case (a); it's a no-op for (b).
+			m.logger("Convoy %s: %d tracked issues, 0 ready — checking completion", c.ID, c.TrackedCount)
+			m.checkConvoyCompletion(c.ID)
 		}
 	}
 }
@@ -417,7 +558,11 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 
 		m.logger("Convoy %s: feeding %s to %s", c.ID, issueID, rig)
 
-		cmd := exec.CommandContext(m.ctx, m.gtPath, "sling", issueID, rig, "--no-boot")
+		slingArgs := []string{"sling", issueID, rig, "--no-boot"}
+		if c.BaseBranch != "" {
+			slingArgs = append(slingArgs, "--base-branch="+c.BaseBranch)
+		}
+		cmd := exec.CommandContext(m.ctx, m.gtPath, slingArgs...)
 		cmd.Dir = m.townRoot
 		util.SetProcessGroup(cmd)
 		var stderr bytes.Buffer
@@ -431,6 +576,21 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 	}
 
 	m.logger("Convoy %s: no dispatchable issues (all %d skipped)", c.ID, len(c.ReadyIssues))
+}
+
+// checkConvoyCompletion runs gt convoy check to auto-close a convoy whose
+// tracked issues may all be closed. This handles the case where the event poll
+// missed the close events (e.g., daemon restart, Dolt latency).
+func (m *ConvoyManager) checkConvoyCompletion(convoyID string) {
+	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "check", convoyID)
+	cmd.Dir = m.townRoot
+	util.SetProcessGroup(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		m.logger("Convoy %s: completion check failed: %s", convoyID, util.FirstLine(stderr.String()))
+	}
 }
 
 // closeEmptyConvoy runs gt convoy check to auto-close an empty convoy.

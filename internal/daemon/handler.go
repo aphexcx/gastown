@@ -57,6 +57,27 @@ func (d *Daemon) handleDogs() {
 	d.dispatchPlugins(mgr, sm, rigsConfig)
 }
 
+// handleDogsCleanupOnly runs dog lifecycle cleanup (stuck, stale, idle) without
+// dispatching new work. Used when pressure checks block new spawns.
+func (d *Daemon) handleDogsCleanupOnly() {
+	rigsConfig, err := d.loadRigsConfig()
+	if err != nil {
+		d.logger.Printf("Handler: failed to load rigs config: %v", err)
+		return
+	}
+
+	opCfg := d.loadOperationalConfig().GetDaemonConfig()
+
+	mgr := dog.NewManager(d.config.TownRoot, rigsConfig)
+	t := tmux.NewTmux()
+	sm := dog.NewSessionManager(t, d.config.TownRoot, mgr)
+
+	d.cleanupStuckDogs(mgr, sm)
+	d.detectStaleWorkingDogs(mgr, sm, opCfg)
+	d.reapIdleDogs(mgr, sm, opCfg)
+	// Skip dispatchPlugins — under pressure
+}
+
 // cleanupStuckDogs finds dogs in state=working whose tmux session is dead and
 // clears their work so they return to idle.
 func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
@@ -253,6 +274,25 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			continue
 		}
 
+		// Send mail with plugin instructions BEFORE starting the session
+		// so the dog finds work in its inbox on first check.
+		msg := mail.NewMessage(
+			"daemon",
+			fmt.Sprintf("deacon/dogs/%s", idleDog.Name),
+			fmt.Sprintf("Plugin: %s", p.Name),
+			p.FormatMailBody(),
+		)
+		msg.Type = mail.TypeTask
+		msg.Timestamp = time.Now()
+		if err := router.Send(msg); err != nil {
+			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
+			// Roll back assignment — no point starting a session without instructions.
+			if clearErr := mgr.ClearWork(idleDog.Name); clearErr != nil {
+				d.logger.Printf("Handler: failed to clear work after mail failure for dog %s: %v", idleDog.Name, clearErr)
+			}
+			continue
+		}
+
 		if err := sm.Start(idleDog.Name, dog.SessionStartOptions{
 			WorkDesc: workDesc,
 		}); err != nil {
@@ -264,21 +304,19 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			continue
 		}
 
-		// Send mail with plugin instructions.
-		msg := mail.NewMessage(
-			"daemon",
-			fmt.Sprintf("deacon/dogs/%s", idleDog.Name),
-			fmt.Sprintf("Plugin: %s", p.Name),
-			p.FormatMailBody(),
-		)
-		msg.Type = mail.TypeTask
-		msg.Timestamp = time.Now()
-		if err := router.Send(msg); err != nil {
-			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
-			// Session is already started — dog will find no mail and idle out.
-		}
-
 		d.logger.Printf("Handler: dispatched plugin %s to dog %s", p.Name, idleDog.Name)
+
+		// Record the dispatch immediately so the cooldown gate is satisfied
+		// for the next 1h regardless of what the dog does. Dogs create their
+		// own completion beads but don't reliably use the label convention the
+		// gate requires, causing infinite re-dispatch loops.
+		if _, err := recorder.RecordRun(plugin.PluginRunRecord{
+			PluginName: p.Name,
+			Result:     plugin.ResultSuccess,
+			Body:       fmt.Sprintf("Dispatched to dog %s", idleDog.Name),
+		}); err != nil {
+			d.logger.Printf("Handler: failed to record dispatch for plugin %s: %v", p.Name, err)
+		}
 	}
 }
 

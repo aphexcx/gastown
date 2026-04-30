@@ -3,9 +3,32 @@ package runtime
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+type fakeStartupPromptSession struct {
+	nudges    []string
+	waitCalls int
+	waitRC    *config.RuntimeConfig
+	waitErr   error
+	nudgeErr  error
+}
+
+func (f *fakeStartupPromptSession) NudgeSession(_ string, message string) error {
+	if f.nudgeErr != nil {
+		return f.nudgeErr
+	}
+	f.nudges = append(f.nudges, message)
+	return nil
+}
+
+func (f *fakeStartupPromptSession) WaitForRuntimeReady(_ string, rc *config.RuntimeConfig, _ time.Duration) error {
+	f.waitCalls++
+	f.waitRC = rc
+	return f.waitErr
+}
 
 func TestSessionIDFromEnv_Default(t *testing.T) {
 	// Clear all environment variables
@@ -321,7 +344,7 @@ func TestGetStartupFallbackInfo_HooksNoPrompt(t *testing.T) {
 }
 
 func TestGetStartupFallbackInfo_NoHooksWithPrompt(t *testing.T) {
-	// Codex/Cursor: no hooks, but has prompt support
+	// Codex: no hooks, but has prompt support
 	rc := &config.RuntimeConfig{
 		PromptMode: "arg",
 		Hooks: &config.RuntimeHooksConfig{
@@ -386,6 +409,113 @@ func TestStartupNudgeContent(t *testing.T) {
 	}
 }
 
+func TestGetStartupPromptFallback_NoHooksNoPrompt(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		PromptMode: "none",
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+
+	fallback := GetStartupPromptFallback(rc)
+	if !fallback.Send {
+		t.Error("NoHooks+NoPrompt should nudge the startup prompt")
+	}
+	if fallback.DelayMs <= 0 {
+		t.Error("NoHooks+NoPrompt should wait for gt prime before nudging the startup prompt")
+	}
+}
+
+func TestGetStartupPromptFallback_WithPrompt(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		PromptMode: "arg",
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+
+	fallback := GetStartupPromptFallback(rc)
+	if fallback.Send {
+		t.Error("Prompt-capable runtimes should not need a startup prompt nudge")
+	}
+	if fallback.DelayMs != DefaultPrimeWaitMs {
+		t.Errorf("DelayMs = %d, want %d", fallback.DelayMs, DefaultPrimeWaitMs)
+	}
+}
+
+func TestDeliverStartupPromptFallback_NoPromptWaitsAndNudges(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		PromptMode: "none",
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "should-be-cleared",
+			ReadyDelayMs:      100,
+		},
+	}
+	tm := &fakeStartupPromptSession{}
+
+	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", rc, 30*time.Second)
+	if err != nil {
+		t.Fatalf("DeliverStartupPromptFallback() error = %v", err)
+	}
+	if tm.waitCalls != 1 {
+		t.Fatalf("waitCalls = %d, want 1", tm.waitCalls)
+	}
+	if tm.waitRC == nil || tm.waitRC.Tmux == nil {
+		t.Fatalf("waitRC missing tmux config: %#v", tm.waitRC)
+	}
+	if tm.waitRC.Tmux.ReadyPromptPrefix != "" {
+		t.Fatalf("ReadyPromptPrefix = %q, want empty", tm.waitRC.Tmux.ReadyPromptPrefix)
+	}
+	if tm.waitRC.Tmux.ReadyDelayMs < DefaultPrimeWaitMs {
+		t.Fatalf("ReadyDelayMs = %d, want >= %d", tm.waitRC.Tmux.ReadyDelayMs, DefaultPrimeWaitMs)
+	}
+	if len(tm.nudges) != 1 || tm.nudges[0] != "begin patrol" {
+		t.Fatalf("nudges = %#v, want [\"begin patrol\"]", tm.nudges)
+	}
+}
+
+func TestDeliverStartupPromptFallback_WithPromptNoOp(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		PromptMode: "arg",
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+	tm := &fakeStartupPromptSession{}
+
+	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", rc, 30*time.Second)
+	if err != nil {
+		t.Fatalf("DeliverStartupPromptFallback() error = %v", err)
+	}
+	if tm.waitCalls != 0 {
+		t.Fatalf("waitCalls = %d, want 0", tm.waitCalls)
+	}
+	if len(tm.nudges) != 0 {
+		t.Fatalf("nudges = %#v, want none", tm.nudges)
+	}
+}
+
+func TestDeliverStartupPromptFallback_WaitError(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		PromptMode: "none",
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+	tm := &fakeStartupPromptSession{waitErr: os.ErrDeadlineExceeded}
+
+	err := DeliverStartupPromptFallback(tm, "sess-1", "begin patrol", rc, 30*time.Second)
+	if err == nil {
+		t.Fatal("DeliverStartupPromptFallback() error = nil, want non-nil")
+	}
+	if len(tm.nudges) != 0 {
+		t.Fatalf("nudges = %#v, want none after wait failure", tm.nudges)
+	}
+}
+
 func TestEnsureSettingsForRole_CopilotUsesWorkDir(t *testing.T) {
 	// Copilot instructions must be installed in workDir (not settingsDir) because
 	// Copilot has no --settings equivalent for path redirection.
@@ -411,6 +541,32 @@ func TestEnsureSettingsForRole_CopilotUsesWorkDir(t *testing.T) {
 	}
 	if _, err := os.Stat(workDir + "/.copilot/copilot-instructions.md"); err != nil {
 		t.Error("Copilot instructions should be in workDir")
+	}
+}
+
+func TestEnsureSettingsForRole_CursorUsesWorkDir(t *testing.T) {
+	// Cursor hooks.json is installed under workDir (HooksUseSettingsDir false for cursor preset).
+	settingsDir := t.TempDir()
+	workDir := t.TempDir()
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "cursor",
+			Dir:          ".cursor",
+			SettingsFile: "hooks.json",
+		},
+	}
+
+	err := EnsureSettingsForRole(settingsDir, workDir, "crew", rc)
+	if err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	if _, err := os.Stat(settingsDir + "/.cursor/hooks.json"); err == nil {
+		t.Error("Cursor hooks should NOT be in settingsDir")
+	}
+	if _, err := os.Stat(workDir + "/.cursor/hooks.json"); err != nil {
+		t.Error("Cursor hooks should be in workDir")
 	}
 }
 
@@ -531,7 +687,7 @@ func TestRuntimeConfigWithMinDelay_NilTmux(t *testing.T) {
 func TestRuntimeConfigWithMinDelay_BelowMin(t *testing.T) {
 	rc := &config.RuntimeConfig{
 		Tmux: &config.RuntimeTmuxConfig{
-			ReadyDelayMs:    500,
+			ReadyDelayMs:      500,
 			ReadyPromptPrefix: "❯ ",
 		},
 	}

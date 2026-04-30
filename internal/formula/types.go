@@ -31,8 +31,9 @@ type Formula struct {
 	Description string      `toml:"description"`
 	Type        FormulaType `toml:"type"`
 	Version     int         `toml:"version"`
-	Pour        bool        `toml:"pour"` // If true, steps are materialized as sub-wisps with checkpoint recovery. Default false (inline/root-only).
-	Agent       string      `toml:"agent"` // Default agent for all legs (GH#2118)
+	Pour        bool        `toml:"pour"`        // If true, steps are materialized as sub-wisps with checkpoint recovery. Default false (inline/root-only).
+	Agent       string      `toml:"agent"`       // Default agent for all legs (GH#2118)
+	ReviewOnly  bool        `toml:"review_only"` // If true, all legs are analysis-only — no code commits expected (gt-kvf)
 
 	// Convoy-specific
 	Inputs    map[string]Input `toml:"inputs"`
@@ -45,11 +46,34 @@ type Formula struct {
 	Steps []Step           `toml:"steps"`
 	Vars  map[string]Var   `toml:"vars"`
 
+	// Composition-specific
+	Extends []string      `toml:"extends"` // Parent formula names to inherit steps from.
+	Compose *ComposeRules `toml:"compose"` // Composition rules applied after inheritance.
+
 	// Expansion-specific
 	Template []Template `toml:"template"`
 
 	// Aspect-specific (similar to convoy but for analysis)
 	Aspects []Aspect `toml:"aspects"`
+}
+
+// ComposeRules defines how a formula can be composed with others.
+type ComposeRules struct {
+	// Expand replaces a single target step with an expansion formula's template steps.
+	Expand []*ExpandRule `toml:"expand"`
+
+	// Aspects lists aspect formula names to apply to this formula.
+	// (Reserved for future implementation.)
+	Aspects []string `toml:"aspects"`
+}
+
+// ExpandRule replaces a target step with the template steps from an expansion formula.
+type ExpandRule struct {
+	// Target is the step ID to replace.
+	Target string `toml:"target"`
+
+	// With is the name of the expansion formula whose template steps replace the target.
+	With string `toml:"with"`
 }
 
 // Aspect represents a parallel analysis aspect in an aspect formula.
@@ -82,7 +106,8 @@ type Leg struct {
 	Title       string `toml:"title"`
 	Focus       string `toml:"focus"`
 	Description string `toml:"description"`
-	Agent       string `toml:"agent"` // Per-leg agent override (GH#2118)
+	Agent       string `toml:"agent"`       // Per-leg agent override (GH#2118)
+	ReviewOnly  bool   `toml:"review_only"` // If true, leg is analysis-only — no code commits expected (gt-kvf)
 }
 
 // Synthesis represents the synthesis step that combines leg outputs.
@@ -98,8 +123,9 @@ type Step struct {
 	Title       string   `toml:"title"`
 	Description string   `toml:"description"`
 	Needs       []string `toml:"needs"`
-	Parallel    bool     `toml:"parallel"`   // If true, this step can run concurrently with other parallel steps that share the same needs
-	Acceptance  string   `toml:"acceptance"` // Exit criteria for this step (used by Ralph loop mode)
+	Parallel    bool     `toml:"parallel"`    // If true, this step can run concurrently with other parallel steps that share the same needs
+	Interactive bool     `toml:"interactive"` // If true, this step requires user dialog and runs in the current session instead of being dispatched to a polecat
+	Acceptance  string   `toml:"acceptance"`  // Exit criteria for this step (used by Ralph loop mode)
 }
 
 // Template represents a template step in an expansion formula.
@@ -108,6 +134,7 @@ type Template struct {
 	Title       string   `toml:"title"`
 	Description string   `toml:"description"`
 	Needs       []string `toml:"needs"`
+	Acceptance  string   `toml:"acceptance"` // Exit criteria for this expanded step (propagated to generated Step)
 }
 
 // Var represents a variable definition for formulas.

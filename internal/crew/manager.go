@@ -11,10 +11,12 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -203,6 +205,10 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 		return nil, fmt.Errorf("creating crew dir: %w", err)
 	}
 
+	if m.rig.GitURL == "" {
+		return nil, fmt.Errorf("rig %q has no git URL configured — crew workspaces require a clonable repository (set git_url in rigs.json or re-add the rig with a remote URL)", m.rig.Name)
+	}
+
 	// Clone the rig repo on the configured default branch.
 	// CloneBranch ensures the crew lands on the rig's default_branch even when
 	// it differs from the remote's HEAD. Falls back gracefully for new/empty repos.
@@ -284,6 +290,13 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 	if err := rig.CopyOverlay(m.rig.Path, crewPath); err != nil {
 		// Non-fatal - log warning but continue
 		style.PrintWarning("could not copy overlay files: %v", err)
+	}
+
+	// Run setup hooks from .runtime/setup-hooks/.
+	// These hooks can inject local config, copy secrets, or perform other setup tasks.
+	if err := rig.RunSetupHooks(m.rig.Path, crewPath); err != nil {
+		// Non-fatal - log warning but continue
+		style.PrintWarning("could not run setup hooks: %v", err)
 	}
 
 	// Ensure .gitignore has required Gas Town patterns
@@ -507,7 +520,7 @@ func (m *Manager) getLocked(name string) (*CrewWorker, error) {
 // saveState persists crew worker state to disk using atomic write.
 func (m *Manager) saveState(crew *CrewWorker) error {
 	stateFile := m.stateFile(crew.Name)
-	if err := util.AtomicWriteJSON(stateFile, crew); err != nil {
+	if err := atomicfile.WriteJSON(stateFile, crew); err != nil {
 		return fmt.Errorf("writing state: %w", err)
 	}
 
@@ -836,7 +849,17 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	}
 
 	// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.AssignTheme(m.rig.Name)
+	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "crew", name)
+	if theme != nil {
+		theme.Window = session.ResolveWindowTint(m.rig.Name, "crew")
+		if theme.Window == nil && session.IsWindowTintEnabled(m.rig.Name) {
+			factor := session.ResolveTintFactor(m.rig.Name)
+			theme.Window = &tmux.WindowStyle{
+				BG: tmux.DarkenColor(theme.BG, factor),
+				FG: theme.FG,
+			}
+		}
+	}
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, name, "crew")
 
 	// Set up C-b n/p keybindings for crew session cycling (non-fatal)
@@ -865,6 +888,18 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 			}
 			_ = t.AcceptStartupDialogs(sessionID)
 		}
+
+		// Start background nudge-queue poller for ALL agents (gt-dgf).
+		// Claude drains its queue via UserPromptSubmit hook, but that hook only
+		// fires when the agent submits a prompt. Idle agents (waiting at prompt
+		// for work) never submit, so queued nudges deadlock: agent waits for
+		// nudge, nudge waits for agent input. The poller breaks this cycle by
+		// polling every 10s and delivering when idle. Drain() is atomic so the
+		// poller and UserPromptSubmit hook coexist safely.
+		if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
+			// Non-fatal — nudges may be delayed but the agent still works.
+			style.PrintWarning("could not start nudge poller for %s: %v", name, pollerErr)
+		}
 	}
 
 	return nil
@@ -886,6 +921,13 @@ func (m *Manager) Stop(name string) error {
 	}
 	if !running {
 		return ErrSessionNotFound
+	}
+
+	// Stop the background nudge poller before killing the session.
+	// Non-fatal — the poller will exit on its own when the session dies.
+	townRoot := filepath.Dir(m.rig.Path)
+	if pollerErr := nudge.StopPoller(townRoot, sessionID); pollerErr != nil {
+		style.PrintWarning("could not stop nudge poller for %s: %v", name, pollerErr)
 	}
 
 	// Kill the session.

@@ -10,12 +10,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // Common errors
@@ -28,6 +31,7 @@ var (
 )
 
 // bdAllowStale caches whether the installed bd supports --allow-stale.
+<<<<<<< HEAD
 // Detected once at first use via `bd --allow-stale version`.
 var (
 	bdAllowStaleOnce   sync.Once
@@ -43,6 +47,68 @@ func BdSupportsAllowStale() bool {
 		}
 	})
 	return bdAllowStaleResult
+=======
+// The cache is keyed by the resolved bd path so tests and subprocess stubs that
+// replace bd on PATH get re-probed instead of reusing stale capability state.
+var (
+	bdAllowStaleMu     sync.Mutex
+	bdAllowStalePath   string
+	bdAllowStaleResult bool
+)
+
+// ResetBdAllowStaleCacheForTest clears the cached bd --allow-stale capability.
+// It exists for tests that swap bd binaries on PATH within a single process.
+func ResetBdAllowStaleCacheForTest() {
+	bdAllowStaleMu.Lock()
+	bdAllowStalePath = ""
+	bdAllowStaleResult = false
+	bdAllowStaleMu.Unlock()
+}
+
+// BdSupportsAllowStale returns true if the installed bd binary accepts --allow-stale.
+func BdSupportsAllowStale() bool {
+	return BdSupportsAllowStaleWithEnv(nil)
+}
+
+// BdSupportsAllowStaleWithEnv returns true if the installed bd binary accepts
+// --allow-stale, probing with the provided environment when supplied.
+func BdSupportsAllowStaleWithEnv(env []string) bool {
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		return false
+	}
+
+	bdAllowStaleMu.Lock()
+	cachedPath := bdAllowStalePath
+	cachedResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+
+	if cachedPath == bdPath {
+		return cachedResult
+	}
+
+	cmd := exec.Command(bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
+	if env != nil {
+		cmd.Env = env
+	}
+	var combinedOut bytes.Buffer
+	cmd.Stdout = &combinedOut
+	cmd.Stderr = &combinedOut
+	_ = cmd.Run()
+	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
+	// Check output for "unknown flag" to detect lack of support.
+	supported := !strings.Contains(combinedOut.String(), "unknown flag")
+
+	bdAllowStaleMu.Lock()
+	if bdAllowStalePath != bdPath {
+		bdAllowStalePath = bdPath
+		bdAllowStaleResult = supported
+	}
+	result := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	return result
+>>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 }
 
 // MaybePrependAllowStale prepends --allow-stale to args if bd supports it.
@@ -54,6 +120,43 @@ func MaybePrependAllowStale(args []string) []string {
 	return args
 }
 
+<<<<<<< HEAD
+=======
+// MaybePrependAllowStaleWithEnv prepends --allow-stale to args if bd supports it,
+// probing with the provided environment when supplied.
+func MaybePrependAllowStaleWithEnv(env []string, args []string) []string {
+	if BdSupportsAllowStaleWithEnv(env) {
+		return append([]string{"--allow-stale"}, args...)
+	}
+	return args
+}
+
+// InjectFlatForListJSON adds --flat to bd list commands that use --json.
+// bd v0.59+ tree-format output ignores --json; --flat is required for JSON.
+// Exported for use by other packages that call bd list directly.
+func InjectFlatForListJSON(args []string) []string {
+	// Only apply to top-level "bd list" commands (args[0] == "list"),
+	// not subcommands like "bd dep list" where --flat is unsupported.
+	if len(args) == 0 || args[0] != "list" {
+		return args
+	}
+	hasJSON := false
+	hasFlat := false
+	for _, a := range args[1:] {
+		switch {
+		case a == "--json":
+			hasJSON = true
+		case a == "--flat":
+			hasFlat = true
+		}
+	}
+	if hasJSON && !hasFlat {
+		return append(args, "--flat")
+	}
+	return args
+}
+
+>>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 // ExtractIssueID strips the external:prefix:id wrapper from bead IDs.
 // bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for display and lookups.
@@ -118,6 +221,11 @@ type Issue struct {
 	// Detailed dependency info from show output
 	Dependencies []IssueDep `json:"dependencies,omitempty"`
 	Dependents   []IssueDep `json:"dependents,omitempty"`
+
+	// Arbitrary metadata blob (JSON object). Used for extension points such as
+	// delegation state (delegated_from key) and merge-slot state (holder/waiters).
+	// Populated by both bd show --json and the in-process store path.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // HasLabel checks if an issue has a specific label.
@@ -161,6 +269,22 @@ func IsAgentBead(issue *Issue) bool {
 	return HasLabel(issue, "gt:agent")
 }
 
+// IsProtectedBead checks if a bead has any protection labels that should
+// prevent automated status changes (AutoClose, unassign on polecat removal, etc.).
+// Protected labels: gt:standing-orders, gt:keep, gt:role, gt:rig.
+func IsProtectedBead(issue *Issue) bool {
+	if issue == nil {
+		return false
+	}
+	for _, l := range issue.Labels {
+		switch l {
+		case "gt:standing-orders", "gt:keep", "gt:role", "gt:rig":
+			return true
+		}
+	}
+	return false
+}
+
 // IssueDep represents a dependency or dependent issue with its relation.
 type IssueDep struct {
 	ID             string `json:"id"`
@@ -174,24 +298,28 @@ type IssueDep struct {
 // ListOptions specifies filters for listing issues.
 type ListOptions struct {
 	Status     string // "open", "closed", "all"
-	Type       string // Deprecated: use Label instead. "task", "bug", "feature", "epic"
+	Type       string // Deprecated: use Label instead. Was "task", "bug", "feature", "epic"; converted to "gt:" prefix.
 	Label      string // Label filter (e.g., "gt:agent", "gt:merge-request")
 	Priority   int    // 0-4, -1 for no filter
 	Parent     string // filter by parent ID
 	Assignee   string // filter by assignee (e.g., "gastown/Toast")
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
+	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
 }
 
 // CreateOptions specifies options for creating an issue.
 type CreateOptions struct {
 	Title       string
-	Type        string // "task", "bug", "feature", "epic"
-	Priority    int    // 0-4
+	Type        string   // Deprecated: use Labels instead. Was "task", "bug", "feature", "epic".
+	Label       string   // Deprecated: use Labels instead. Backward-compatible single-label form.
+	Labels      []string // Labels to set (e.g., "gt:task", "gt:merge-request")
+	Priority    int      // 0-4
 	Description string
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
+	Rig         string // Target rig database (e.g., "gantry"). When set, routes bd create to the rig's directory via --repo.
 }
 
 // UpdateOptions specifies options for updating an issue.
@@ -206,20 +334,21 @@ type UpdateOptions struct {
 	SetLabels    []string // Labels to set (replaces all existing)
 }
 
-// SyncStatus represents the sync status of the beads repository.
-type SyncStatus struct {
-	Branch    string
-	Ahead     int
-	Behind    int
-	Conflicts []string
-}
-
 // Beads wraps bd CLI operations for a working directory.
+// When store is non-nil, methods with in-process implementations use the
+// beadsdk.Storage directly instead of shelling out to the bd CLI. This
+// eliminates ~600ms of subprocess overhead per operation.
 type Beads struct {
 	workDir    string
 	beadsDir   string // Optional BEADS_DIR override for cross-database access
 	isolated   bool   // If true, suppress inherited beads env vars (for test isolation)
 	serverPort int    // If set, pass --server-port to bd init and GT_DOLT_PORT to env
+
+	// store is an optional in-process beadsdk.Storage. When set, methods
+	// bypass the bd subprocess and use the store directly. Follows the
+	// pattern in internal/daemon/convoy_manager.go. Callers are responsible
+	// for closing the store.
+	store beadsdk.Storage
 
 	// Lazy-cached town root for routing resolution.
 	// Populated on first call to getTownRoot() to avoid filesystem walk on every operation.
@@ -308,37 +437,64 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
+<<<<<<< HEAD
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	fullArgs := MaybePrependAllowStale(args)
+=======
+	// bd v0.59+ requires --flat for --json to produce JSON output on "list" commands.
+	// Without --flat, bd list --json silently returns human-readable tree format,
+	// causing all JSON parsing to fail. Inject --flat before --allow-stale prepend
+	// (which changes args[0] from "list" to "--allow-stale").
+	args = InjectFlatForListJSON(args)
+>>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 
-	// Always explicitly set BEADS_DIR to prevent inherited env vars from
-	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
-	// resolve from working directory.
+	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
+	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	beadsDir := b.beadsDir
 	if beadsDir == "" {
 		beadsDir = ResolveBeadsDir(b.workDir)
 	}
+	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
+	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
-	// In isolated mode, use --db flag to force specific database path
-	// This bypasses bd's routing logic that can redirect to .beads-planning
-	// Skip --db for init command since it creates the database
-	isInit := len(args) > 0 && args[0] == "init"
-	if b.isolated && !isInit {
-		beadsDB := filepath.Join(beadsDir, "beads.db")
-		fullArgs = append([]string{"--db", beadsDB}, fullArgs...)
-	}
-
+	// Always explicitly set BEADS_DIR to prevent inherited env vars from
+	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
+	// resolve from working directory.
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
-	cmd.Env = append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
+	cmd.Env = runEnv
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+
+	// If bd doesn't support --flat, retry without it. The retry is done here
+	// (not in callers like List) so that InjectFlatForListJSON doesn't re-add
+	// --flat on the retry path.
+	if err != nil && strings.Contains(stderr.String(), "unknown flag: --flat") {
+		retryArgs := make([]string, 0, len(fullArgs))
+		for _, a := range fullArgs {
+			if a != "--flat" {
+				retryArgs = append(retryArgs, a)
+			}
+		}
+		stdout.Reset()
+		stderr.Reset()
+		cmd = exec.Command("bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+		util.SetDetachedProcessGroup(cmd)
+		cmd.Dir = b.workDir
+		cmd.Env = runEnv
+		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err = cmd.Run()
+	}
+
 	if err != nil {
 		return nil, b.wrapError(err, stderr.String(), args)
 	}
@@ -350,7 +506,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
 	}
 
-	return stdout.Bytes(), nil
+	return stripStdoutWarnings(stdout.Bytes()), nil
 }
 
 // runWithRouting executes a bd command without setting BEADS_DIR, allowing bd's
@@ -364,12 +520,18 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
+<<<<<<< HEAD
 	fullArgs := MaybePrependAllowStale(args)
+=======
+	runEnv := b.buildRoutingEnv()
+	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
+>>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
-	cmd.Env = b.buildRoutingEnv()
+	cmd.Env = runEnv
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 
 	cmd.Stdout = &stdout
@@ -384,7 +546,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
 	}
 
-	return stdout.Bytes(), nil
+	return stripStdoutWarnings(stdout.Bytes()), nil
 }
 
 // Run executes a bd command and returns stdout.
@@ -450,6 +612,7 @@ func (b *Beads) buildRunEnv() []string {
 		return env
 	}
 	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	env = overrideDoltEnvFromBeadsDir(env, b.getResolvedBeadsDir())
 	return translateDoltPort(env)
 }
 
@@ -466,6 +629,7 @@ func (b *Beads) buildRoutingEnv() []string {
 		return env
 	}
 	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	env = overrideDoltEnvFromBeadsDir(env, b.getResolvedBeadsDir())
 	return translateDoltPort(env)
 }
 
@@ -473,14 +637,15 @@ func (b *Beads) buildRoutingEnv() []string {
 // environment slice. This ensures test isolation by preventing inherited
 // BD_ACTOR, BEADS_DB, GT_ROOT, HOME etc. from routing commands to production databases.
 //
-// Preserves GT_DOLT_PORT and BEADS_DOLT_PORT so that isolated-mode tests can
-// reach a test Dolt server on a non-default port.
+// Preserves GT_DOLT_PORT, BEADS_DOLT_PORT, and BEADS_DOLT_SERVER_HOST so that
+// isolated-mode tests can reach a test Dolt server on a non-default port/host.
 func filterBeadsEnv(environ []string) []string {
 	filtered := make([]string, 0, len(environ))
 	for _, env := range environ {
-		// Preserve port env vars needed to reach test Dolt servers.
+		// Preserve Dolt connection env vars needed to reach test/remote Dolt servers.
 		// These must be checked before the broad BEADS_ prefix strip below.
 		if strings.HasPrefix(env, "BEADS_DOLT_PORT=") ||
+			strings.HasPrefix(env, "BEADS_DOLT_SERVER_HOST=") ||
 			strings.HasPrefix(env, "GT_DOLT_PORT=") {
 			filtered = append(filtered, env)
 			continue
@@ -500,25 +665,84 @@ func filterBeadsEnv(environ []string) []string {
 	return filtered
 }
 
-// translateDoltPort ensures BEADS_DOLT_PORT is set when GT_DOLT_PORT is present.
-// Gas Town uses GT_DOLT_PORT; beads uses BEADS_DOLT_PORT. This translation
-// prevents bd subprocesses from falling back to metadata.json's port 3307
-// (production) when a test or daemon has set GT_DOLT_PORT to an alternate port.
+// translateDoltPort ensures BEADS_DOLT_PORT and BEADS_DOLT_SERVER_HOST are set
+// when their GT_ counterparts are present. Gas Town uses GT_DOLT_PORT and
+// GT_DOLT_HOST; beads uses BEADS_DOLT_PORT and BEADS_DOLT_SERVER_HOST. This
+// translation prevents bd subprocesses from falling back to localhost:3307
+// when a test or daemon has set GT_DOLT_* to alternate values.
 func translateDoltPort(env []string) []string {
-	var gtPort string
-	hasBDP := false
+	var gtPort, gtHost string
+	hasBDP, hasBDH := false, false
 	for _, e := range env {
 		if strings.HasPrefix(e, "GT_DOLT_PORT=") {
 			gtPort = strings.TrimPrefix(e, "GT_DOLT_PORT=")
 		}
+		if strings.HasPrefix(e, "GT_DOLT_HOST=") {
+			gtHost = strings.TrimPrefix(e, "GT_DOLT_HOST=")
+		}
 		if strings.HasPrefix(e, "BEADS_DOLT_PORT=") {
 			hasBDP = true
+		}
+		if strings.HasPrefix(e, "BEADS_DOLT_SERVER_HOST=") {
+			hasBDH = true
 		}
 	}
 	if gtPort != "" && !hasBDP {
 		env = append(env, "BEADS_DOLT_PORT="+gtPort)
 	}
+	if gtHost != "" && !hasBDH {
+		env = append(env, "BEADS_DOLT_SERVER_HOST="+gtHost)
+	}
 	return env
+}
+
+// overrideDoltEnvFromBeadsDir replaces inherited BEADS_DOLT_* values with the
+// authoritative connection data for the selected beads directory when present.
+// This prevents a parent shell's stale Dolt port from routing bd commands to
+// the wrong server when the command explicitly targets another rig's .beads dir.
+func overrideDoltEnvFromBeadsDir(env []string, beadsDir string) []string {
+	port, host := doltConnectionFromBeadsDir(beadsDir)
+	if port != "" {
+		env = stripEnvPrefixes(env, "BEADS_DOLT_PORT=")
+		env = append(env, "BEADS_DOLT_PORT="+port)
+	}
+	if host != "" {
+		env = stripEnvPrefixes(env, "BEADS_DOLT_SERVER_HOST=")
+		env = append(env, "BEADS_DOLT_SERVER_HOST="+host)
+	}
+	return env
+}
+
+// doltConnectionFromBeadsDir reads the preferred Dolt connection info for a
+// beads directory. The per-directory port file is authoritative when present;
+// metadata.json is used as a fallback and to supply the server host.
+func doltConnectionFromBeadsDir(beadsDir string) (port string, host string) {
+	if beadsDir == "" {
+		return "", ""
+	}
+
+	if data, err := os.ReadFile(filepath.Join(beadsDir, "dolt-server.port")); err == nil {
+		port = strings.TrimSpace(string(data))
+	}
+
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		return port, ""
+	}
+
+	var meta struct {
+		DoltServerPort int    `json:"dolt_server_port"`
+		DoltServerHost string `json:"dolt_server_host"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return port, ""
+	}
+
+	if port == "" && meta.DoltServerPort > 0 {
+		port = strconv.Itoa(meta.DoltServerPort)
+	}
+	host = strings.TrimSpace(meta.DoltServerHost)
+	return port, host
 }
 
 // stripEnvPrefixes removes entries matching any of the given prefixes from an
@@ -541,7 +765,17 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 }
 
 // List returns issues matching the given options.
+// When Ephemeral is true, uses "bd query" with ephemeral=true to search the
+// wisps table (where ephemeral issues live in beads v0.59+). Without this,
+// "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	if b.store != nil && !opts.Ephemeral {
+		return b.storeList(opts)
+	}
+	if opts.Ephemeral {
+		return b.listEphemeral(opts)
+	}
+
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
@@ -592,6 +826,87 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	return issues, nil
 }
 
+<<<<<<< HEAD
+=======
+// listEphemeral searches the wisps table using "bd query" with ephemeral=true.
+// This is necessary because "bd list" only searches the issues table and does
+// not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
+// beads) live in a separate table since beads v0.59.
+func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
+	// Build query expression: ephemeral=true AND <filters>
+	clauses := []string{"ephemeral=true"}
+
+	if opts.Label != "" {
+		clauses = append(clauses, "label="+opts.Label)
+	} else if opts.Type != "" {
+		clauses = append(clauses, "label=gt:"+opts.Type)
+	}
+	if opts.Status != "" && opts.Status != "all" {
+		clauses = append(clauses, "status="+opts.Status)
+	}
+	if opts.Priority >= 0 {
+		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
+	}
+	if opts.Parent != "" {
+		clauses = append(clauses, "parent="+opts.Parent)
+	}
+	if opts.Assignee != "" {
+		clauses = append(clauses, "assignee="+opts.Assignee)
+	}
+
+	queryExpr := strings.Join(clauses, " AND ")
+	args := []string{"query", "--json", queryExpr}
+
+	if opts.Status == "all" {
+		args = append(args, "--all")
+	}
+	if opts.Limit > 0 {
+		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	}
+
+	out, err := b.run(args...)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(out) == 0 || !isJSONBytes(out) {
+		return nil, nil
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd query output: %w", err)
+	}
+
+	return issues, nil
+}
+
+// stripStdoutWarnings removes warning/diagnostic lines that bd may emit to stdout.
+// bd sometimes prints "warning: ..." lines to stdout instead of stderr, which
+// corrupts JSON output. This strips those lines so downstream JSON parsing works.
+func stripStdoutWarnings(data []byte) []byte {
+	if !bytes.Contains(data, []byte("warning:")) {
+		return data
+	}
+
+	lines := bytes.Split(data, []byte("\n"))
+	var cleaned [][]byte
+	stripped := false
+	for _, line := range lines {
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("warning:")) {
+			stripped = true
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+
+	if !stripped {
+		return data
+	}
+	return bytes.Join(cleaned, []byte("\n"))
+}
+
+>>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 // isJSONBytes returns true if the byte slice starts with [ or { (after whitespace).
 // bd list --json may return plain text like "No issues found." instead of JSON
 // when there are no results.
@@ -609,6 +924,94 @@ func isJSONBytes(b []byte) bool {
 	return false
 }
 
+<<<<<<< HEAD
+=======
+// ListMergeRequests returns merge-request beads from both the issues table
+// and the wisps table. MRs are created as ephemeral (wisps) by gt mq submit,
+// but bd list only queries the issues table. This method queries the wisps
+// table via bd sql --json to get full data including labels and assignee.
+func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
+	// 1. Query issues table (bd list) — don't use Ephemeral since bd query
+	// can't parse colons in label values like "gt:merge-request".
+	opts.Ephemeral = false
+	issueResults, err := b.List(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build dedup map from issues
+	seen := make(map[string]bool, len(issueResults))
+	for _, issue := range issueResults {
+		seen[issue.ID] = true
+	}
+
+	// 2. Query wisps table via SQL for merge-request wisps with full data
+	statusFilter := "w.status = 'open'"
+	if opts.Status != "" && strings.EqualFold(opts.Status, "all") {
+		statusFilter = "1=1"
+	} else if opts.Status != "" {
+		statusFilter = fmt.Sprintf("w.status = '%s'", strings.ReplaceAll(strings.ToLower(opts.Status), "'", "''"))
+	}
+
+	labelFilter := "l.label = 'gt:merge-request'"
+	if opts.Label != "" {
+		labelFilter = fmt.Sprintf("l.label = '%s'", strings.ReplaceAll(opts.Label, "'", "''"))
+	}
+
+	query := fmt.Sprintf(
+		"SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, "+
+			"w.created_at, w.updated_at, w.created_by, "+
+			"GROUP_CONCAT(al.label) as labels_csv "+
+			"FROM wisps w "+
+			"JOIN wisp_labels l ON w.id = l.issue_id "+
+			"LEFT JOIN wisp_labels al ON w.id = al.issue_id "+
+			"WHERE %s AND %s "+
+			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by",
+		labelFilter, statusFilter)
+
+	sqlOut, sqlErr := b.run("sql", "--json", query)
+	if sqlErr == nil && len(sqlOut) > 0 && isJSONBytes(sqlOut) {
+		var rows []struct {
+			ID          string `json:"id"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Status      string `json:"status"`
+			Priority    int    `json:"priority"`
+			Assignee    string `json:"assignee"`
+			CreatedAt   string `json:"created_at"`
+			UpdatedAt   string `json:"updated_at"`
+			CreatedBy   string `json:"created_by"`
+			LabelsCSV   string `json:"labels_csv"`
+		}
+		if jsonErr := json.Unmarshal(sqlOut, &rows); jsonErr == nil {
+			for _, row := range rows {
+				if seen[row.ID] {
+					continue
+				}
+				issue := &Issue{
+					ID:          row.ID,
+					Title:       row.Title,
+					Description: row.Description,
+					Status:      row.Status,
+					Priority:    row.Priority,
+					Assignee:    row.Assignee,
+					CreatedAt:   row.CreatedAt,
+					UpdatedAt:   row.UpdatedAt,
+					CreatedBy:   row.CreatedBy,
+					Ephemeral:   true,
+				}
+				if row.LabelsCSV != "" {
+					issue.Labels = strings.Split(row.LabelsCSV, ",")
+				}
+				issueResults = append(issueResults, issue)
+			}
+		}
+	}
+
+	return issueResults, nil
+}
+
+>>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 // ListByAssignee returns all issues assigned to a specific assignee.
 // The assignee is typically in the format "rig/polecats/polecatName" (e.g., "gastown/polecats/Toast").
 func (b *Beads) ListByAssignee(assignee string) ([]*Issue, error) {
@@ -644,6 +1047,10 @@ func (b *Beads) GetAssignedIssue(assignee string) (*Issue, error) {
 
 // Ready returns issues that are ready to work (not blocked).
 func (b *Beads) Ready() ([]*Issue, error) {
+	if b.store != nil {
+		return b.storeReady()
+	}
+
 	out, err := b.run("ready", "--json")
 	if err != nil {
 		return nil, err
@@ -662,6 +1069,13 @@ func (b *Beads) Ready() ([]*Issue, error) {
 // (blocked_issues_cache), handling all blocking types, transitive propagation,
 // and conditional-blocks resolution.
 func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {
+	if b.store != nil {
+		return b.storeReadyWithFilter(beadsdk.WorkFilter{
+			ParentID: &moleculeID,
+			Limit:    100,
+		})
+	}
+
 	out, err := b.run("ready", "--mol", moleculeID, "--json", "-n", "100")
 	if err != nil {
 		return nil, err
@@ -679,6 +1093,13 @@ func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {
 // Uses bd ready --label flag for server-side filtering.
 // The issueType is converted to a gt:<type> label (e.g., "molecule" -> "gt:molecule").
 func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
+	if b.store != nil {
+		return b.storeReadyWithFilter(beadsdk.WorkFilter{
+			Labels: []string{"gt:" + issueType},
+			Limit:  100,
+		})
+	}
+
 	out, err := b.run("ready", "--json", "--label", "gt:"+issueType, "-n", "100")
 	if err != nil {
 		return nil, err
@@ -702,6 +1123,10 @@ func (b *Beads) Show(id string) (*Issue, error) {
 		return target.Show(id)
 	}
 
+	if b.store != nil {
+		return b.storeShow(id)
+	}
+
 	out, err := b.run("show", id, "--json")
 	if err != nil {
 		return nil, err
@@ -720,11 +1145,45 @@ func (b *Beads) Show(id string) (*Issue, error) {
 	return issues[0], nil
 }
 
+// FindLatestIssueByTitleAndAssignee finds the newest issue matching the given title and assignee.
+func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issue, error) {
+	out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", assignee)
+	if err != nil {
+		return nil, fmt.Errorf("bd list: %w", err)
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	}
+	if len(issues) == 0 {
+		return nil, ErrNotFound
+	}
+
+	var newest *Issue
+	for _, issue := range issues {
+		if issue.Title != title || issue.Assignee != assignee {
+			continue
+		}
+		if newest == nil || issue.CreatedAt > newest.CreatedAt {
+			newest = issue
+		}
+	}
+	if newest == nil {
+		return nil, ErrNotFound
+	}
+	return newest, nil
+}
+
 // ShowMultiple fetches multiple issues by ID in a single bd call.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
+	}
+
+	if b.store != nil {
+		return b.storeShowMultiple(ids)
 	}
 
 	// bd show supports multiple IDs
@@ -749,6 +1208,10 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 
 // Blocked returns issues that are blocked by dependencies.
 func (b *Beads) Blocked() ([]*Issue, error) {
+	if b.store != nil {
+		return b.storeBlocked()
+	}
+
 	out, err := b.run("blocked", "--json")
 	if err != nil {
 		return nil, err
@@ -771,13 +1234,21 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
 	}
 
+	if b.store != nil && !opts.Ephemeral {
+		return b.storeCreate(opts)
+	}
+
 	args := []string{"create", "--json"}
 
 	if opts.Title != "" {
 		args = append(args, "--title="+opts.Title)
 	}
-	// Type is deprecated: convert to gt:<type> label
-	if opts.Type != "" {
+	// Labels takes precedence; fall back to deprecated single-label/Type fields.
+	if len(opts.Labels) > 0 {
+		args = append(args, "--labels="+strings.Join(opts.Labels, ","))
+	} else if opts.Label != "" {
+		args = append(args, "--labels="+opts.Label)
+	} else if opts.Type != "" {
 		args = append(args, "--labels=gt:"+opts.Type)
 	}
 	if opts.Priority >= 0 {
@@ -791,6 +1262,13 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	}
 	if opts.Ephemeral {
 		args = append(args, "--ephemeral")
+	}
+	if opts.Rig != "" {
+		if townRoot := b.getTownRoot(); townRoot != "" {
+			if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
+				args = append(args, "--repo="+rigDir)
+			}
+		}
 	}
 	// Default Actor from BD_ACTOR env var if not specified
 	// Uses getActor() to respect isolated mode (tests)
@@ -832,8 +1310,12 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 	if opts.Title != "" {
 		args = append(args, "--title="+opts.Title)
 	}
-	// Type is deprecated: convert to gt:<type> label
-	if opts.Type != "" {
+	// Labels takes precedence; fall back to deprecated single-label/Type fields.
+	if len(opts.Labels) > 0 {
+		args = append(args, "--labels="+strings.Join(opts.Labels, ","))
+	} else if opts.Label != "" {
+		args = append(args, "--labels="+opts.Label)
+	} else if opts.Type != "" {
 		args = append(args, "--labels=gt:"+opts.Type)
 	}
 	if opts.Priority >= 0 {
@@ -879,6 +1361,10 @@ type SearchOptions struct {
 
 // Search searches issues by text query across title, description, and ID.
 func (b *Beads) Search(opts SearchOptions) ([]*Issue, error) {
+	if b.store != nil {
+		return b.storeSearch(opts)
+	}
+
 	args := []string{"search", "--json"}
 
 	if opts.Query != "" {
@@ -979,6 +1465,10 @@ func normalizeBugTitle(title string) string {
 
 // Update updates an existing issue.
 func (b *Beads) Update(id string, opts UpdateOptions) error {
+	if b.store != nil {
+		return b.storeUpdate(id, opts)
+	}
+
 	args := []string{"update", id}
 
 	if opts.Title != nil {
@@ -1022,6 +1512,10 @@ func (b *Beads) Close(ids ...string) error {
 		return nil
 	}
 
+	if b.store != nil {
+		return b.storeClose("", runtime.SessionIDFromEnv(), ids...)
+	}
+
 	args := append([]string{"close"}, ids...)
 
 	// Pass session ID for work attribution if available
@@ -1039,6 +1533,10 @@ func (b *Beads) Close(ids ...string) error {
 func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+
+	if b.store != nil {
+		return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -1059,6 +1557,15 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+
+	// In-process store close doesn't enforce dependency checks (no --force
+	// needed). Note: this means the store path bypasses the dependency
+	// validation that the CLI's --force flag overrides. Callers relying on
+	// ForceCloseWithReason (e.g., gt done nuking polecat wisps) are already
+	// accepting that deps may remain dangling, so this is intentional.
+	if b.store != nil {
+		return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -1083,6 +1590,19 @@ func (b *Beads) Release(id string) error {
 // ReleaseWithReason moves an in_progress issue back to open status with a reason.
 // The reason is added as a note to the issue for tracking purposes.
 func (b *Beads) ReleaseWithReason(id, reason string) error {
+	if b.store != nil {
+		updates := map[string]interface{}{
+			"status":   "open",
+			"assignee": "",
+		}
+		if reason != "" {
+			updates["notes"] = "Released: " + reason
+		}
+		ctx, cancel := storeCtx()
+		defer cancel()
+		return b.store.UpdateIssue(ctx, id, updates, b.getActor())
+	}
+
 	args := []string{"update", id, "--status=open", "--assignee="}
 
 	// Add reason as a note if provided
@@ -1096,45 +1616,22 @@ func (b *Beads) ReleaseWithReason(id, reason string) error {
 
 // AddDependency adds a dependency: issue depends on dependsOn.
 func (b *Beads) AddDependency(issue, dependsOn string) error {
+	if b.store != nil {
+		return b.storeAddDependency(issue, dependsOn)
+	}
+
 	_, err := b.run("dep", "add", issue, dependsOn)
 	return err
 }
 
 // RemoveDependency removes a dependency.
 func (b *Beads) RemoveDependency(issue, dependsOn string) error {
+	if b.store != nil {
+		return b.storeRemoveDependency(issue, dependsOn)
+	}
+
 	_, err := b.run("dep", "remove", issue, dependsOn)
 	return err
-}
-
-// Sync syncs beads with remote.
-func (b *Beads) Sync() error {
-	_, err := b.run("sync")
-	return err
-}
-
-// SyncFromMain syncs beads updates from main branch.
-func (b *Beads) SyncFromMain() error {
-	_, err := b.run("sync", "--from-main")
-	return err
-}
-
-// GetSyncStatus returns the sync status without performing a sync.
-func (b *Beads) GetSyncStatus() (*SyncStatus, error) {
-	out, err := b.run("sync", "--status", "--json")
-	if err != nil {
-		// If sync branch doesn't exist, return empty status
-		if strings.Contains(err.Error(), "does not exist") {
-			return &SyncStatus{}, nil
-		}
-		return nil, err
-	}
-
-	var status SyncStatus
-	if err := json.Unmarshal(out, &status); err != nil {
-		return nil, fmt.Errorf("parsing bd sync status output: %w", err)
-	}
-
-	return &status, nil
 }
 
 // Stats returns repository statistics.

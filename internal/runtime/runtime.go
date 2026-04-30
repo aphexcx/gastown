@@ -2,50 +2,18 @@
 package runtime
 
 import (
+	"fmt"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/steveyegge/gastown/internal/claude"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/copilot"
-	"github.com/steveyegge/gastown/internal/gemini"
-	"github.com/steveyegge/gastown/internal/omp"
-	"github.com/steveyegge/gastown/internal/opencode"
-	"github.com/steveyegge/gastown/internal/pi"
+	"github.com/steveyegge/gastown/internal/hooks"
+	"github.com/steveyegge/gastown/internal/hookutil"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
-
-func init() {
-	// Register hook installers for all agents that support hooks.
-	// This replaces the provider switch statement in EnsureSettingsForRole.
-	// Adding a new hook-supporting agent = adding a registration here.
-	config.RegisterHookInstaller("claude", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
-		return claude.EnsureSettingsForRoleAt(settingsDir, role, hooksDir, hooksFile)
-	})
-	config.RegisterHookInstaller("gemini", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
-		// Gemini CLI has no --settings flag; install settings in workDir.
-		return gemini.EnsureSettingsForRoleAt(workDir, role, hooksDir, hooksFile)
-	})
-	config.RegisterHookInstaller("opencode", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
-		// OpenCode plugins stay in workDir — no --settings equivalent.
-		return opencode.EnsurePluginAt(workDir, hooksDir, hooksFile)
-	})
-	config.RegisterHookInstaller("copilot", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
-		// Copilot custom instructions stay in workDir — no --settings equivalent.
-		return copilot.EnsureSettingsAt(workDir, hooksDir, hooksFile)
-	})
-	config.RegisterHookInstaller("omp", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
-		// OMP hooks stay in workDir — loaded via --hook flag.
-		return omp.EnsureHookAt(workDir, hooksDir, hooksFile)
-	})
-	config.RegisterHookInstaller("pi", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
-		// Pi extensions stay in workDir — loaded via -e flag.
-		return pi.EnsureHookAt(workDir, hooksDir, hooksFile)
-	})
-}
 
 // EnsureSettingsForRole provisions all agent-specific configuration for a role.
 // settingsDir is where provider settings (e.g., .claude/settings.json) are installed.
@@ -67,12 +35,14 @@ func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.Runtime
 		return nil
 	}
 
-	// 1. Provider-specific settings (settings.json for Claude, plugin for OpenCode, etc.)
-	// Hook installers are registered in init() — no switch statement needed.
-	if installer := config.GetHookInstaller(provider); installer != nil {
-		if err := installer(settingsDir, workDir, role, rc.Hooks.Dir, rc.Hooks.SettingsFile); err != nil {
-			return err
-		}
+	// 1. Provider-specific settings via generic installer.
+	// Reads template metadata from the preset and installs the appropriate template.
+	useSettingsDir := false
+	if preset := config.GetAgentPresetByName(provider); preset != nil {
+		useSettingsDir = preset.HooksUseSettingsDir
+	}
+	if err := hooks.InstallForRole(provider, settingsDir, workDir, role, rc.Hooks.Dir, rc.Hooks.SettingsFile, useSettingsDir); err != nil {
+		return err
 	}
 
 	// 2. Slash commands (agent-agnostic, uses shared body with provider-specific frontmatter)
@@ -84,6 +54,11 @@ func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.Runtime
 	}
 
 	return nil
+}
+
+type startupPromptSession interface {
+	NudgeSession(sessionID, message string) error
+	WaitForRuntimeReady(sessionID string, rc *config.RuntimeConfig, timeout time.Duration) error
 }
 
 // SessionIDFromEnv returns the runtime session ID, if present.
@@ -140,19 +115,10 @@ func RunStartupFallback(t *tmux.Tmux, sessionID, role string, rc *config.Runtime
 }
 
 // isAutonomousRole returns true if the given role should automatically
-// inject mail check on startup. Autonomous roles (polecat, witness,
-// refinery, deacon, boot) operate without human prompting and need mail injection
-// to receive work assignments.
-//
-// Non-autonomous roles (mayor, crew) are human-guided and should not
-// have automatic mail injection to avoid confusion.
+// inject mail check on startup. Delegates to hookutil.IsAutonomousRole
+// for the single source of truth on role classification.
 func isAutonomousRole(role string) bool {
-	switch role {
-	case constants.RolePolecat, constants.RoleWitness, constants.RoleRefinery, constants.RoleDeacon, "boot":
-		return true
-	default:
-		return false
-	}
+	return hookutil.IsAutonomousRole(role)
 }
 
 // DefaultPrimeWaitMs is the default wait time in milliseconds for non-hook agents
@@ -188,6 +154,18 @@ type StartupFallbackInfo struct {
 	StartupNudgeDelayMs int
 }
 
+// StartupPromptFallback describes whether a role's startup prompt must be
+// delivered via nudge after startup fallback commands have run.
+type StartupPromptFallback struct {
+	// Send indicates the startup prompt must be nudged because the runtime
+	// cannot receive it as a CLI prompt argument.
+	Send bool
+
+	// DelayMs is the minimum wait before sending the startup prompt so
+	// non-hook agents have time to finish `gt prime`.
+	DelayMs int
+}
+
 // GetStartupFallbackInfo returns the fallback actions needed based on agent capabilities.
 func GetStartupFallbackInfo(rc *config.RuntimeConfig) *StartupFallbackInfo {
 	if rc == nil {
@@ -219,6 +197,41 @@ func GetStartupFallbackInfo(rc *config.RuntimeConfig) *StartupFallbackInfo {
 	// else: hooks + prompt - nothing needed, all in CLI prompt + hook
 
 	return info
+}
+
+// GetStartupPromptFallback returns the post-startup prompt delivery behavior
+// for runtimes that cannot accept the startup prompt as a CLI argument.
+func GetStartupPromptFallback(rc *config.RuntimeConfig) StartupPromptFallback {
+	info := GetStartupFallbackInfo(rc)
+	return StartupPromptFallback{
+		Send:    info.SendBeaconNudge,
+		DelayMs: info.StartupNudgeDelayMs,
+	}
+}
+
+// DeliverStartupPromptFallback sends the startup prompt via nudge for runtimes
+// that cannot accept the prompt as a CLI argument.
+func DeliverStartupPromptFallback(
+	t startupPromptSession,
+	sessionID, prompt string,
+	rc *config.RuntimeConfig,
+	timeout time.Duration,
+) error {
+	fallback := GetStartupPromptFallback(rc)
+	if !fallback.Send {
+		return nil
+	}
+
+	if fallback.DelayMs > 0 {
+		if err := t.WaitForRuntimeReady(sessionID, RuntimeConfigWithMinDelay(rc, fallback.DelayMs), timeout); err != nil {
+			return fmt.Errorf("waiting for startup prompt fallback: %w", err)
+		}
+	}
+
+	if err := t.NudgeSession(sessionID, prompt); err != nil {
+		return fmt.Errorf("nudging startup prompt fallback: %w", err)
+	}
+	return nil
 }
 
 // StartupNudgeContent returns the work instructions to send as a startup nudge.

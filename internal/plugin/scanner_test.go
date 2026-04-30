@@ -3,6 +3,7 @@ package plugin
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -376,8 +377,8 @@ func TestParsePluginMD_GitHubSheriff(t *testing.T) {
 	if plugin.Gate.Type != GateCooldown {
 		t.Errorf("expected gate type 'cooldown', got %q", plugin.Gate.Type)
 	}
-	if plugin.Gate.Duration != "5m" {
-		t.Errorf("expected gate duration '5m', got %q", plugin.Gate.Duration)
+	if plugin.Gate.Duration != "2h" {
+		t.Errorf("expected gate duration '2h', got %q", plugin.Gate.Duration)
 	}
 	if plugin.Tracking == nil {
 		t.Fatal("expected tracking to be non-nil")
@@ -399,20 +400,103 @@ func TestParsePluginMD_GitHubSheriff(t *testing.T) {
 	}
 }
 
-func TestParsePluginMD_SessionHygiene(t *testing.T) {
-	// Verify the actual session-hygiene plugin.md parses correctly.
-	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "session-hygiene", "plugin.md"))
+func TestParsePluginMD_StuckAgentDogUsesCanonicalHeartbeatPath(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "stuck-agent-dog", "plugin.md"))
 	if err != nil {
-		t.Skipf("session-hygiene plugin not found (expected in plugins/): %v", err)
+		t.Skipf("stuck-agent-dog plugin not found (expected in plugins/): %v", err)
 	}
 
-	plugin, err := parsePluginMD(content, "/test/session-hygiene", LocationRig, "gastown")
+	plugin, err := parsePluginMD(content, "/test/stuck-agent-dog", LocationRig, "gastown")
 	if err != nil {
 		t.Fatalf("parsePluginMD failed: %v", err)
 	}
 
-	if plugin.Name != "session-hygiene" {
-		t.Errorf("expected name 'session-hygiene', got %q", plugin.Name)
+	if plugin.Name != "stuck-agent-dog" {
+		t.Fatalf("expected name 'stuck-agent-dog', got %q", plugin.Name)
+	}
+	if !strings.Contains(plugin.Instructions, "deacon/heartbeat.json") {
+		t.Fatalf("expected canonical heartbeat path in instructions, got:\n%s", plugin.Instructions)
+	}
+	if strings.Contains(plugin.Instructions, ".deacon-heartbeat") {
+		t.Fatalf("did not expect legacy heartbeat path in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "Fallback for older/runtime-copied layouts") {
+		t.Fatalf("expected rigs.json fallback guidance in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "RIGS_JSON_PATH=\"${TOWN_ROOT}/rigs.json\"") {
+		t.Fatalf("expected town-root rigs.json as canonical source in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "$TOWN_ROOT/mayor/rigs.json") {
+		t.Fatalf("expected mayor/ fallback in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "Filter out any malformed/blank rows") {
+		t.Fatalf("expected fail-safe blank/malformed rigs row handling in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "could not parse rigs.json") {
+		t.Fatalf("expected fail-safe rigs.json parse handling in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, ">15m threshold") {
+		t.Fatalf("expected canonical deacon very-stale threshold in instructions, got:\n%s", plugin.Instructions)
+	}
+}
+
+func TestParsePluginMD_WithRunScript(t *testing.T) {
+	// Use a temp dir with a fixture plugin.md and run.sh so the test
+	// doesn't depend on the local filesystem layout (fails in CI).
+	pluginDir := t.TempDir()
+
+	pluginContent := []byte(`+++
+name = "example-plugin"
+description = "Example plugin with run script and all features"
+version = 2
+
+[gate]
+type = "cooldown"
+duration = "30m"
+
+[tracking]
+labels = ["plugin:example-plugin", "category:cleanup"]
+digest = true
+
+[execution]
+timeout = "5m"
+notify_on_failure = true
+severity = "low"
++++
+
+# Example Plugin
+
+Deterministic cleanup plugin with run.sh script.
+`)
+
+	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), pluginContent, 0644); err != nil {
+		t.Fatalf("writing plugin.md fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, "run.sh"), []byte("#!/bin/bash\necho ok\n"), 0755); err != nil {
+		t.Fatalf("writing run.sh fixture: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(pluginDir, "plugin.md"))
+	if err != nil {
+		t.Fatalf("reading plugin.md fixture: %v", err)
+	}
+
+	plugin, err := parsePluginMD(content, pluginDir, LocationRig, "gastown")
+	if err != nil {
+		t.Fatalf("parsePluginMD failed: %v", err)
+	}
+
+	// Verify run.sh detection (loadPlugin does this, not parsePluginMD)
+	runScriptPath := filepath.Join(pluginDir, "run.sh")
+	if info, statErr := os.Stat(runScriptPath); statErr == nil && !info.IsDir() {
+		plugin.HasRunScript = true
+	}
+	if !plugin.HasRunScript {
+		t.Error("expected HasRunScript=true for plugin with run.sh")
+	}
+
+	if plugin.Name != "example-plugin" {
+		t.Errorf("expected name 'example-plugin', got %q", plugin.Name)
 	}
 	if plugin.Gate == nil {
 		t.Fatal("expected gate to be non-nil")
@@ -507,5 +591,276 @@ version = 1
 	}
 	if plugins[0].Location != LocationRig {
 		t.Errorf("expected location 'rig', got %q", plugins[0].Location)
+	}
+}
+
+func TestLoadPlugin_DetectsRunScript(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "plugin-runsh-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create plugin dir with plugin.md AND run.sh
+	pluginDir := filepath.Join(tmpDir, "plugins", "with-script")
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		t.Fatalf("failed to create plugin dir: %v", err)
+	}
+	pluginContent := []byte(`+++
+name = "with-script"
+description = "Plugin with run.sh"
+version = 1
++++
+
+# Instructions (should be ignored when run.sh exists)
+`)
+	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), pluginContent, 0644); err != nil {
+		t.Fatalf("failed to write plugin.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, "run.sh"), []byte("#!/bin/bash\necho hello\n"), 0755); err != nil {
+		t.Fatalf("failed to write run.sh: %v", err)
+	}
+
+	// Create plugin dir with plugin.md only (no run.sh)
+	pluginDirNoScript := filepath.Join(tmpDir, "plugins", "no-script")
+	if err := os.MkdirAll(pluginDirNoScript, 0755); err != nil {
+		t.Fatalf("failed to create plugin dir: %v", err)
+	}
+	noScriptContent := []byte(`+++
+name = "no-script"
+description = "Plugin without run.sh"
+version = 1
++++
+
+# Instructions
+`)
+	if err := os.WriteFile(filepath.Join(pluginDirNoScript, "plugin.md"), noScriptContent, 0644); err != nil {
+		t.Fatalf("failed to write plugin.md: %v", err)
+	}
+
+	scanner := NewScanner(tmpDir, nil)
+	plugins, err := scanner.DiscoverAll()
+	if err != nil {
+		t.Fatalf("DiscoverAll failed: %v", err)
+	}
+
+	if len(plugins) != 2 {
+		t.Fatalf("expected 2 plugins, got %d", len(plugins))
+	}
+
+	byName := make(map[string]*Plugin)
+	for _, p := range plugins {
+		byName[p.Name] = p
+	}
+
+	if p, ok := byName["with-script"]; !ok {
+		t.Fatal("expected to find 'with-script' plugin")
+	} else if !p.HasRunScript {
+		t.Error("expected HasRunScript=true for plugin with run.sh")
+	}
+
+	if p, ok := byName["no-script"]; !ok {
+		t.Fatal("expected to find 'no-script' plugin")
+	} else if p.HasRunScript {
+		t.Error("expected HasRunScript=false for plugin without run.sh")
+	}
+}
+
+func TestFormatMailBody_WithRunScript(t *testing.T) {
+	p := &Plugin{
+		Name:         "test-plugin",
+		Description:  "A test plugin",
+		Path:         "/home/user/gt/plugins/test-plugin",
+		HasRunScript: true,
+	}
+
+	body := p.FormatMailBody()
+
+	// Must contain the bash command to run the script
+	if !strings.Contains(body, "cd /home/user/gt/plugins/test-plugin && bash run.sh") {
+		t.Error("expected mail body to contain run.sh execution command")
+	}
+	// Must instruct dog NOT to interpret markdown
+	if !strings.Contains(body, "Do NOT interpret the plugin.md instructions") {
+		t.Error("expected mail body to warn against interpreting markdown")
+	}
+	// Must NOT contain "## Instructions" section
+	if strings.Contains(body, "## Instructions") {
+		t.Error("expected mail body to NOT contain markdown instructions section")
+	}
+}
+
+func TestParsePluginMD_ExecWrapper(t *testing.T) {
+	content := []byte(`+++
+name = "exitbox-sandbox"
+description = "Sandbox polecat execution with exitbox"
+version = 1
+
+[execution]
+type = "exec-wrapper"
+wrapper = ["exitbox", "run", "--profile=gastown-polecat", "--"]
++++
+
+# Exitbox Sandbox
+
+Wraps polecat sessions in an exitbox sandbox for filesystem and network isolation.
+`)
+
+	p, err := parsePluginMD(content, "/test/exitbox-sandbox", LocationRig, "gastown")
+	if err != nil {
+		t.Fatalf("parsePluginMD failed: %v", err)
+	}
+
+	if p.Name != "exitbox-sandbox" {
+		t.Errorf("expected name 'exitbox-sandbox', got %q", p.Name)
+	}
+	if p.Execution == nil {
+		t.Fatal("expected execution to be non-nil")
+	}
+	if p.Execution.Type != ExecTypeExecWrapper {
+		t.Errorf("expected execution type 'exec-wrapper', got %q", p.Execution.Type)
+	}
+	if len(p.Execution.Wrapper) != 4 {
+		t.Fatalf("expected 4 wrapper tokens, got %d: %v", len(p.Execution.Wrapper), p.Execution.Wrapper)
+	}
+	if p.Execution.Wrapper[0] != "exitbox" {
+		t.Errorf("expected wrapper[0]='exitbox', got %q", p.Execution.Wrapper[0])
+	}
+	if p.Execution.Wrapper[3] != "--" {
+		t.Errorf("expected wrapper[3]='--', got %q", p.Execution.Wrapper[3])
+	}
+	if !p.IsExecWrapper() {
+		t.Error("expected IsExecWrapper() to return true")
+	}
+	args := p.ExecWrapperArgs()
+	if len(args) != 4 {
+		t.Errorf("expected ExecWrapperArgs to return 4 tokens, got %d", len(args))
+	}
+}
+
+func TestPlugin_IsExecWrapper_False(t *testing.T) {
+	// Regular plugin should not be an exec-wrapper
+	p := &Plugin{
+		Name: "regular",
+		Execution: &Execution{
+			Timeout: "5m",
+		},
+	}
+	if p.IsExecWrapper() {
+		t.Error("expected IsExecWrapper() to return false for regular plugin")
+	}
+	if args := p.ExecWrapperArgs(); args != nil {
+		t.Errorf("expected ExecWrapperArgs to return nil, got %v", args)
+	}
+}
+
+func TestPlugin_ExecWrapperSummary(t *testing.T) {
+	p := &Plugin{
+		Name:     "exitbox-sandbox",
+		Location: LocationRig,
+		RigName:  "gastown",
+		Execution: &Execution{
+			Type:    ExecTypeExecWrapper,
+			Wrapper: []string{"exitbox", "run", "--"},
+		},
+	}
+
+	summary := p.Summary()
+	if summary.ExecutionType != ExecTypeExecWrapper {
+		t.Errorf("expected execution type 'exec-wrapper', got %q", summary.ExecutionType)
+	}
+}
+
+func TestScanner_DiscoverExecWrappers(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "plugin-wrapper-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a regular plugin
+	regularDir := filepath.Join(tmpDir, "plugins", "regular")
+	if err := os.MkdirAll(regularDir, 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(regularDir, "plugin.md"), []byte(`+++
+name = "regular"
+description = "Regular plugin"
+version = 1
+
+[execution]
+timeout = "5m"
++++
+
+# Regular
+`), 0644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	// Create an exec-wrapper plugin
+	wrapperDir := filepath.Join(tmpDir, "plugins", "sandbox")
+	if err := os.MkdirAll(wrapperDir, 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wrapperDir, "plugin.md"), []byte(`+++
+name = "sandbox"
+description = "Sandbox wrapper"
+version = 1
+
+[execution]
+type = "exec-wrapper"
+wrapper = ["exitbox", "run", "--"]
++++
+
+# Sandbox
+`), 0644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	scanner := NewScanner(tmpDir, nil)
+
+	// DiscoverAll should find both
+	all, err := scanner.DiscoverAll()
+	if err != nil {
+		t.Fatalf("DiscoverAll failed: %v", err)
+	}
+	if len(all) != 2 {
+		t.Errorf("expected 2 plugins, got %d", len(all))
+	}
+
+	// DiscoverExecWrappers should find only the wrapper
+	wrappers, err := scanner.DiscoverExecWrappers()
+	if err != nil {
+		t.Fatalf("DiscoverExecWrappers failed: %v", err)
+	}
+	if len(wrappers) != 1 {
+		t.Fatalf("expected 1 exec-wrapper, got %d", len(wrappers))
+	}
+	if wrappers[0].Name != "sandbox" {
+		t.Errorf("expected wrapper name 'sandbox', got %q", wrappers[0].Name)
+	}
+}
+
+func TestFormatMailBody_WithoutRunScript(t *testing.T) {
+	p := &Plugin{
+		Name:         "test-plugin",
+		Description:  "A test plugin",
+		Path:         "/home/user/gt/plugins/test-plugin",
+		Instructions: "Do the thing.",
+		HasRunScript: false,
+	}
+
+	body := p.FormatMailBody()
+
+	// Must contain the instructions section
+	if !strings.Contains(body, "## Instructions") {
+		t.Error("expected mail body to contain instructions section")
+	}
+	if !strings.Contains(body, "Do the thing.") {
+		t.Error("expected mail body to contain plugin instructions")
+	}
+	// Must NOT contain run.sh dispatch
+	if strings.Contains(body, "bash run.sh") {
+		t.Error("expected mail body to NOT contain run.sh command")
 	}
 }

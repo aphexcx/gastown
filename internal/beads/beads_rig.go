@@ -144,11 +144,17 @@ func (b *Beads) CreateRigBead(name string, fields *RigFields) (*Issue, error) {
 	id := RigBeadIDWithPrefix(prefix, name)
 	description := FormatRigDescription(name, fields)
 
+	// Ensure target database has custom types configured (including "rig").
+	// This matches what CreateAgentBead does — without it, bd rejects
+	// --type=rig on databases that haven't registered custom types yet.
+	_ = EnsureCustomTypes(b.getResolvedBeadsDir())
+
 	args := []string{"create", "--json",
 		"--id=" + id,
 		"--title=" + name,
 		"--description=" + description,
 		"--labels=gt:rig",
+		"--type=rig",
 	}
 	if NeedsForceForID(id) {
 		args = append(args, "--force")
@@ -249,6 +255,9 @@ func (b *Beads) ListRigBeads() (map[string]*RigFields, error) {
 		return nil, err
 	}
 
+	if !isJSONBytes(out) {
+		return nil, nil
+	}
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)

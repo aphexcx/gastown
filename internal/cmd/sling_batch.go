@@ -66,7 +66,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	}
 
 	// Issue #288: Auto-apply formula for batch sling (resolved via flags)
-	formulaName := resolveFormula(slingFormula, slingHookRawBead)
+	formulaName := resolveFormula(slingFormula, slingHookRawBead, filepath.Dir(townBeadsDir), rigName)
 
 	if slingDryRun {
 		fmt.Printf("%s Batch slinging %d beads to rig '%s':\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
@@ -88,7 +88,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	fmt.Printf("%s Batch slinging %d beads to rig '%s'...\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
 
 	if slingMaxConcurrent > 0 {
-		fmt.Printf("  Max concurrent spawns: %d\n", slingMaxConcurrent)
+		fmt.Printf("  Spawn batch size: %d (spawns N, pauses, spawns N more)\n", slingMaxConcurrent)
 	}
 
 	// Cook formula once before the loop for efficiency
@@ -123,9 +123,11 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 	// Dispatch each bead via executeSling
 	for i, beadID := range beadIDs {
-		// Admission control: throttle spawns when --max-concurrent is set
+		// Spawn-rate throttle: when --max-concurrent is set, pause between batches
+		// of N spawns. This does NOT limit total concurrent polecats — all spawned
+		// polecats remain running. It only slows down how fast they are created.
 		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
-			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
+			fmt.Printf("\n%s Spawn batch of %d complete, pausing before next batch...\n",
 				style.Warning.Render("⏳"), slingMaxConcurrent)
 			// Wait for sessions to settle before spawning more
 			for wait := 0; wait < 30; wait++ {
@@ -154,6 +156,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			NoConvoy:         slingNoConvoy,
 			Owned:            slingOwned,
 			NoMerge:          slingNoMerge,
+			ReviewOnly:       slingReviewOnly,
 			Force:            slingForce,
 			HookRawBead:      slingHookRawBead,
 			NoBoot:           slingNoBoot,

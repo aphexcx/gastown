@@ -389,6 +389,26 @@ type PolecatListItem struct {
 	SessionName    string        `json:"session_name,omitempty"`
 }
 
+// effectivePolecatState returns the observable state used by polecat list output.
+// Session liveness is ground truth for working/idle/done transitions. Zombie entries
+// are never auto-rewritten.
+func effectivePolecatState(item PolecatListItem) polecat.State {
+	state := item.State
+	// A running session overrides both "done" and "idle" — the polecat is working.
+	// "idle" can be stale when a polecat is reused (cross-rig beads, stale heartbeat,
+	// or beads query timing), and "done" can be stale when gt done didn't complete.
+	if item.SessionRunning && (state == polecat.StateDone || state == polecat.StateIdle) {
+		return polecat.StateWorking
+	}
+	// When session is dead but beads still says "working", mark as stalled
+	// (not done — work was interrupted, not completed). The manager's loadFromBeads
+	// now returns StateStalled for this case, but list reconciliation may override.
+	if !item.SessionRunning && !item.Zombie && state == polecat.StateWorking {
+		return polecat.StateStalled
+	}
+	return state
+}
+
 // getPolecatManager creates a polecat manager for the given rig.
 func getPolecatManager(rigName string) (*polecat.Manager, *rig.Rig, error) {
 	_, r, err := getRig(rigName)
@@ -408,7 +428,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 
 	if polecatListAll {
 		// List all rigs
-		allRigs, _, err := getAllRigs()
+		allRigs, err := getAllRigs()
 		if err != nil {
 			return err
 		}
@@ -477,6 +497,10 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output
+	for i := range allPolecats {
+		allPolecats[i].State = effectivePolecatState(allPolecats[i])
+	}
+
 	if polecatListJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -496,24 +520,15 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			sessionStatus = style.Success.Render("●")
 		}
 
-		// Display actual state, reconciled with tmux session liveness.
-		// Per gt-zecmc design: tmux is ground truth for observable states.
-		// If session is running but beads says done, the polecat is still alive.
-		// If session is dead but beads says working, the polecat is actually done.
-		displayState := p.State
-		if p.SessionRunning && displayState == polecat.StateDone {
-			displayState = polecat.StateWorking
-		} else if !p.SessionRunning && !p.Zombie && displayState == polecat.StateWorking {
-			displayState = polecat.StateDone
-		}
-
 		// State color
-		stateStr := string(displayState)
-		switch displayState {
+		stateStr := string(p.State)
+		switch p.State {
 		case polecat.StateWorking:
 			stateStr = style.Info.Render(stateStr)
 		case polecat.StateStuck:
 			stateStr = style.Warning.Render(stateStr)
+		case polecat.StateStalled:
+			stateStr = style.Error.Render(stateStr)
 		case polecat.StateDone:
 			stateStr = style.Success.Render(stateStr)
 		case polecat.StateZombie:
@@ -703,6 +718,8 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 		stateStr = style.Info.Render(stateStr)
 	case polecat.StateStuck:
 		stateStr = style.Warning.Render(stateStr)
+	case polecat.StateStalled:
+		stateStr = style.Error.Render(stateStr)
 	case polecat.StateDone:
 		stateStr = style.Success.Render(stateStr)
 	default:
@@ -1282,11 +1299,12 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 	// proceed — --force already means "I accept data loss".
 	if branchToDelete != "" {
 		var pushGit *git.Git
-		// Try worktree first (may still exist), then bare repo fallback
-		if polecatInfo != nil {
-			wtPath := filepath.Join(r.Path, "polecats", polecatName)
-			if _, statErr := os.Stat(wtPath); statErr == nil {
-				pushGit = git.NewGit(wtPath)
+		// Try worktree first (may still exist), then bare repo fallback.
+		// Use ClonePath from the polecat record — the worktree lives at
+		// <rig>/polecats/<name>/<rigName>/, not <rig>/polecats/<name>/.
+		if polecatInfo != nil && polecatInfo.ClonePath != "" {
+			if _, statErr := os.Stat(polecatInfo.ClonePath); statErr == nil {
+				pushGit = git.NewGit(polecatInfo.ClonePath)
 			}
 		}
 		if pushGit == nil {
@@ -1348,6 +1366,11 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 	} else {
 		fmt.Printf("  %s closed agent bead %s\n", style.Success.Render("✓"), agentBeadID)
 	}
+
+	// Step 6: Purge closed ephemeral beads (wisps) accumulated during sessions.
+	// Without this, closed wisps from mol-polecat-work steps, mol-witness-patrol
+	// cycles, etc. accumulate across sessions and pollute bd ready/list (hq-6161m).
+	purgeClosedEphemeralBeads(bd)
 
 	return nil
 }

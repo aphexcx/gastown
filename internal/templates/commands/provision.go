@@ -40,6 +40,16 @@ func getAgentConfigDir(agent string) string {
 // Commands is the registry of available commands.
 var Commands = []Command{
 	{
+		Name:        "done",
+		Description: "Signal work complete and submit to merge queue",
+		AgentFields: map[string][]Field{
+			"claude": {
+				{"allowed-tools", "Bash(gt done:*), Bash(git status:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git push:*), Bash(bd close:*)"},
+				{"argument-hint", "[--status COMPLETED|ESCALATED|DEFERRED] [--pre-verified]"},
+			},
+		},
+	},
+	{
 		Name:        "handoff",
 		Description: "Hand off to fresh session, work continues from hook",
 		AgentFields: map[string][]Field{
@@ -48,6 +58,16 @@ var Commands = []Command{
 				{"argument-hint", "[message]"},
 			},
 			// opencode: no extra fields, just description
+		},
+	},
+	{
+		Name:        "review",
+		Description: "Review code changes with structured grading (A-F)",
+		AgentFields: map[string][]Field{
+			"claude": {
+				{"allowed-tools", "Bash(git diff:*), Bash(git rev-parse:*), Bash(gh pr diff:*)"},
+				{"argument-hint", "[--staged | --branch | --pr <url>]"},
+			},
 		},
 	},
 }
@@ -128,6 +148,16 @@ func MissingFor(workspacePath, agent string) []string {
 	}
 
 	return missing
+}
+
+// FindByName returns the command with the given name, or nil if not found.
+func FindByName(name string) *Command {
+	for i := range Commands {
+		if Commands[i].Name == name {
+			return &Commands[i]
+		}
+	}
+	return nil
 }
 
 // Names returns the names of all registered commands.

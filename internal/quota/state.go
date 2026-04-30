@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/util"
@@ -87,7 +88,7 @@ func (m *Manager) Save(state *config.QuotaState) error {
 	defer unlock()
 
 	state.Version = config.CurrentQuotaVersion
-	return util.EnsureDirAndWriteJSON(m.statePath(), state)
+	return atomicfile.EnsureDirAndWriteJSON(m.statePath(), state)
 }
 
 // WithLock acquires the quota file lock, runs fn, then releases the lock.
@@ -107,7 +108,7 @@ func (m *Manager) WithLock(fn func() error) error {
 // of WithLock will corrupt state under concurrent access.
 func (m *Manager) SaveUnlocked(state *config.QuotaState) error {
 	state.Version = config.CurrentQuotaVersion
-	return util.EnsureDirAndWriteJSON(m.statePath(), state)
+	return atomicfile.EnsureDirAndWriteJSON(m.statePath(), state)
 }
 
 // MarkLimited marks an account as rate-limited with an optional reset time.
@@ -131,7 +132,7 @@ func (m *Manager) MarkLimited(handle string, resetsAt string) error {
 		LastUsed:  state.Accounts[handle].LastUsed,
 	}
 
-	return util.EnsureDirAndWriteJSON(m.statePath(), state)
+	return atomicfile.EnsureDirAndWriteJSON(m.statePath(), state)
 }
 
 // MarkAvailable marks an account as available (not rate-limited).
@@ -153,7 +154,7 @@ func (m *Manager) MarkAvailable(handle string) error {
 		LastUsed: existing.LastUsed,
 	}
 
-	return util.EnsureDirAndWriteJSON(m.statePath(), state)
+	return atomicfile.EnsureDirAndWriteJSON(m.statePath(), state)
 }
 
 // AvailableAccounts returns account handles that are not rate-limited,
@@ -205,6 +206,37 @@ func (m *Manager) EnsureAccountsTracked(state *config.QuotaState, accounts map[s
 			}
 		}
 	}
+}
+
+// RecordSwap records a keychain swap mapping in quota state.
+// targetConfigDir is the config dir whose keychain entry was overwritten.
+// sourceHandle is the account handle whose token was swapped in.
+// The caller must hold the quota lock or call this within WithLock.
+func RecordSwap(state *config.QuotaState, targetConfigDir, sourceHandle string) {
+	if state.ActiveSwaps == nil {
+		state.ActiveSwaps = make(map[string]string)
+	}
+	state.ActiveSwaps[targetConfigDir] = sourceHandle
+}
+
+// ClearSwap removes a swap mapping when the config dir is no longer swapped.
+// The caller must hold the quota lock or call this within WithLock.
+func ClearSwap(state *config.QuotaState, targetConfigDir string) {
+	delete(state.ActiveSwaps, targetConfigDir)
+}
+
+// ResolveSwapSourceDirs resolves activeSwaps (targetConfigDir -> accountHandle)
+// to targetConfigDir -> sourceConfigDir using the accounts config.
+func ResolveSwapSourceDirs(activeSwaps map[string]string, accounts map[string]config.Account) map[string]string {
+	resolved := make(map[string]string, len(activeSwaps))
+	for targetDir, handle := range activeSwaps {
+		acct, ok := accounts[handle]
+		if !ok {
+			continue
+		}
+		resolved[targetDir] = util.ExpandHome(acct.ConfigDir)
+	}
+	return resolved
 }
 
 // ClearExpired checks all limited accounts and marks them available if their

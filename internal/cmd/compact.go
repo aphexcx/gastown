@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -34,10 +36,11 @@ var defaultTTLs = map[string]time.Duration{
 
 // compactResult tracks what happened to each wisp during compaction.
 type compactResult struct {
-	Promoted []compactAction `json:"promoted"`
-	Deleted  []compactAction `json:"deleted"`
-	Skipped  int             `json:"skipped"` // wisps still within TTL
-	Errors   []string        `json:"errors,omitempty"`
+	Promoted         []compactAction `json:"promoted"`
+	Deleted          []compactAction `json:"deleted"`
+	Skipped          int             `json:"skipped"`            // wisps still within TTL
+	OrphanedWispDeps int             `json:"orphaned_wisp_deps"` // stale wisp_dependencies removed
+	Errors           []string        `json:"errors,omitempty"`
 }
 
 type compactAction struct {
@@ -254,6 +257,14 @@ func runCompact(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Clean up orphaned wisp_dependencies left behind by deleted wisps.
+	// When bd delete removes a wisp, it doesn't cascade-delete dependency
+	// records in wisp_dependencies that reference the deleted wisp. Over many
+	// compaction cycles these accumulate as dangling refs. We sweep them here.
+	if !compactDryRun {
+		cleanOrphanedWispDeps(bd, result)
+	}
+
 	// Output results
 	if compactJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -265,6 +276,27 @@ func runCompact(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// cleanOrphanedWispDeps removes wisp_dependencies rows where either side no
+// longer exists in the wisps table. This happens when bd delete removes a wisp
+// but leaves behind its dependency records (bd delete has no cascade logic for
+// the wisp-level tables). Runs as a post-compact sweep.
+func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
+	const q = `DELETE FROM wisp_dependencies WHERE ` +
+		`NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.issue_id) ` +
+		`OR NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.depends_on_id)`
+	out, err := bd.Run("sql", q)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("orphaned wisp_deps cleanup: %v", err))
+		return
+	}
+	// bd sql reports "OK, N rows affected" for non-SELECT statements.
+	// Parse the count if present; a non-zero result means refs were cleaned.
+	var n int
+	if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "OK, %d rows affected", &n); scanErr == nil {
+		result.OrphanedWispDeps = n
+	}
+}
+
 // listWisps queries all ephemeral issues from the database.
 // Returns extended issue structs with comment_count and wisp_type.
 func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
@@ -273,6 +305,12 @@ func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Strip any non-JSON prefix (warnings, notices) that bd may emit to
+	// stdout before the JSON array. Without this, unicode characters like
+	// emoji in wisp subjects can trigger "invalid character looking for
+	// beginning of value" errors when a warning line contains non-ASCII.
+	out = extractJSONArray(out)
 
 	var allIssues []*compactIssue
 	if err := json.Unmarshal(out, &allIssues); err != nil {
@@ -288,6 +326,18 @@ func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
 	}
 
 	return wisps, nil
+}
+
+// extractJSONArray finds the first '[' byte in data and returns from that
+// point onward. This strips any non-JSON prefix (warning messages, notices)
+// that a subprocess may emit to stdout before the actual JSON payload.
+// Returns the original data unchanged if no '[' is found.
+func extractJSONArray(data []byte) []byte {
+	idx := bytes.IndexByte(data, '[')
+	if idx < 0 {
+		return data
+	}
+	return data[idx:]
 }
 
 // promoteWisp makes a wisp permanent by setting --persistent and adding a comment.
@@ -364,6 +414,9 @@ func printCompactSummary(result *compactResult) {
 	fmt.Printf("  Promoted: %d\n", promoted)
 	fmt.Printf("  Deleted:  %d\n", deleted)
 	fmt.Printf("  Skipped:  %d (within TTL)\n", result.Skipped)
+	if result.OrphanedWispDeps > 0 {
+		fmt.Printf("  Cleaned:  %d orphaned wisp dependency ref(s)\n", result.OrphanedWispDeps)
+	}
 
 	if len(result.Errors) > 0 {
 		fmt.Printf("\n%s %d errors:\n", style.Warning.Render("⚠"), len(result.Errors))
@@ -381,15 +434,17 @@ func printCompactSummary(result *compactResult) {
 	}
 }
 
-// compactTruncate shortens a string to maxLen, adding "..." if truncated.
+// compactTruncate shortens a string to maxLen runes, adding "..." if truncated.
+// Uses rune count instead of byte length so multi-byte UTF-8 characters
+// (emoji, CJK, etc.) are never split mid-sequence.
 func compactTruncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if utf8.RuneCountInString(s) <= maxLen {
 		return s
 	}
 	if maxLen <= 3 {
-		return s[:maxLen]
+		return string([]rune(s)[:maxLen])
 	}
-	return s[:maxLen-3] + "..."
+	return string([]rune(s)[:maxLen-3]) + "..."
 }
 
 // hasComments checks the comment_count on the compactIssue.

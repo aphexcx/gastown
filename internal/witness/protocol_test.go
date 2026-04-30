@@ -467,6 +467,359 @@ func TestFormatHelpSummary_MinimalPayload(t *testing.T) {
 	}
 }
 
+// --- AssessHelp tests (gt-td6p) ---
+
+func TestAssessHelp_Emergency(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "Security vulnerability found",
+		Problem: "Exposed secret in logs",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryEmergency {
+		t.Errorf("Category = %q, want %q", assessment.Category, HelpCategoryEmergency)
+	}
+	if assessment.Severity != HelpSeverityCritical {
+		t.Errorf("Severity = %q, want %q", assessment.Severity, HelpSeverityCritical)
+	}
+	if assessment.SuggestTo != "overseer" {
+		t.Errorf("SuggestTo = %q, want %q", assessment.SuggestTo, "overseer")
+	}
+}
+
+func TestAssessHelp_Failed(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "Database error",
+		Problem: "Connection refused on port 3307",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryFailed {
+		t.Errorf("Category = %q, want %q", assessment.Category, HelpCategoryFailed)
+	}
+	if assessment.Severity != HelpSeverityHigh {
+		t.Errorf("Severity = %q, want %q", assessment.Severity, HelpSeverityHigh)
+	}
+	if assessment.SuggestTo != "deacon" {
+		t.Errorf("SuggestTo = %q, want %q", assessment.SuggestTo, "deacon")
+	}
+}
+
+func TestAssessHelp_Blocked(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "Merge conflict in main.go",
+		Problem: "Cannot proceed with rebase",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryBlocked {
+		t.Errorf("Category = %q, want %q", assessment.Category, HelpCategoryBlocked)
+	}
+	if assessment.Severity != HelpSeverityHigh {
+		t.Errorf("Severity = %q, want %q", assessment.Severity, HelpSeverityHigh)
+	}
+	if assessment.SuggestTo != "mayor" {
+		t.Errorf("SuggestTo = %q, want %q", assessment.SuggestTo, "mayor")
+	}
+}
+
+func TestAssessHelp_Decision(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "Which approach for caching?",
+		Problem: "Multiple options available, need guidance",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryDecision {
+		t.Errorf("Category = %q, want %q", assessment.Category, HelpCategoryDecision)
+	}
+	if assessment.Severity != HelpSeverityMedium {
+		t.Errorf("Severity = %q, want %q", assessment.Severity, HelpSeverityMedium)
+	}
+	if assessment.SuggestTo != "deacon" {
+		t.Errorf("SuggestTo = %q, want %q", assessment.SuggestTo, "deacon")
+	}
+}
+
+func TestAssessHelp_Lifecycle(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "Polecat zombie detected",
+		Problem: "Session dead but bead still in_progress",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryLifecycle {
+		t.Errorf("Category = %q, want %q", assessment.Category, HelpCategoryLifecycle)
+	}
+	if assessment.Severity != HelpSeverityMedium {
+		t.Errorf("Severity = %q, want %q", assessment.Severity, HelpSeverityMedium)
+	}
+	if assessment.SuggestTo != "witness" {
+		t.Errorf("SuggestTo = %q, want %q", assessment.SuggestTo, "witness")
+	}
+}
+
+func TestAssessHelp_DefaultHelp(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "Need guidance on implementation",
+		Problem: "Not sure how to approach this feature",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryHelp {
+		t.Errorf("Category = %q, want %q", assessment.Category, HelpCategoryHelp)
+	}
+	if assessment.Severity != HelpSeverityMedium {
+		t.Errorf("Severity = %q, want %q", assessment.Severity, HelpSeverityMedium)
+	}
+	if assessment.SuggestTo != "deacon" {
+		t.Errorf("SuggestTo = %q, want %q", assessment.SuggestTo, "deacon")
+	}
+	if assessment.Rationale == "" {
+		t.Error("Rationale should not be empty")
+	}
+}
+
+func TestAssessHelp_CaseInsensitive(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Topic:   "SECURITY issue found",
+		Problem: "Possible BREACH in auth",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryEmergency {
+		t.Errorf("Category = %q, want %q (case-insensitive match expected)", assessment.Category, HelpCategoryEmergency)
+	}
+}
+
+func TestAssessHelp_PriorityOrder(t *testing.T) {
+	t.Parallel()
+	// Emergency keywords should take priority over blocked keywords
+	payload := &HelpPayload{
+		Topic:   "Data corruption causing blocked state",
+		Problem: "Cannot proceed due to corrupted data",
+	}
+	assessment := AssessHelp(payload)
+	if assessment.Category != HelpCategoryEmergency {
+		t.Errorf("Category = %q, want %q (emergency should take priority over blocked)", assessment.Category, HelpCategoryEmergency)
+	}
+}
+
+func TestFormatHelpSummary_WithAssessment(t *testing.T) {
+	t.Parallel()
+	payload := &HelpPayload{
+		Agent:   "gastown/polecats/nux",
+		Topic:   "Merge conflict",
+		Problem: "Cannot rebase",
+		Assessment: &HelpAssessment{
+			Category:  HelpCategoryBlocked,
+			Severity:  HelpSeverityHigh,
+			SuggestTo: "mayor",
+			Rationale: "matched keyword \"merge conflict\"",
+		},
+	}
+	summary := FormatHelpSummary(payload)
+	if !strings.Contains(summary, "Assessment:") {
+		t.Errorf("summary should contain assessment line, got: %s", summary)
+	}
+	if !strings.Contains(summary, "blocked") {
+		t.Errorf("summary should contain category, got: %s", summary)
+	}
+	if !strings.Contains(summary, "high") {
+		t.Errorf("summary should contain severity, got: %s", summary)
+	}
+	if !strings.Contains(summary, "mayor") {
+		t.Errorf("summary should contain suggested target, got: %s", summary)
+	}
+}
+
+// --- Dispatch message types (te-l0o) ---
+
+func TestClassifyMessage_DispatchTypes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		subject  string
+		expected ProtocolType
+	}{
+		{"DISPATCH_ATTEMPT nux", ProtoDispatchAttempt},
+		{"DISPATCH_ATTEMPT slit", ProtoDispatchAttempt},
+		{"DISPATCH_OK nux", ProtoDispatchOK},
+		{"DISPATCH_OK furiosa", ProtoDispatchOK},
+		{"DISPATCH_FAIL nux", ProtoDispatchFail},
+		{"DISPATCH_FAIL ace", ProtoDispatchFail},
+		{"IDLE_PASSIVATED nux", ProtoIdlePassivated},
+		{"IDLE_PASSIVATED slit", ProtoIdlePassivated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.subject, func(t *testing.T) {
+			result := ClassifyMessage(tc.subject)
+			if result != tc.expected {
+				t.Errorf("ClassifyMessage(%q) = %v, want %v", tc.subject, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestParseDispatchAttempt(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_ATTEMPT nux"
+	body := "Bead: gt-abc123"
+
+	payload, err := ParseDispatchAttempt(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchAttempt() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.BeadID != "gt-abc123" {
+		t.Errorf("BeadID = %q, want %q", payload.BeadID, "gt-abc123")
+	}
+	if payload.AttemptedAt.IsZero() {
+		t.Error("AttemptedAt should not be zero")
+	}
+}
+
+func TestParseDispatchAttempt_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDispatchAttempt("Not a dispatch", "body")
+	if err == nil {
+		t.Error("ParseDispatchAttempt() expected error for invalid subject")
+	}
+}
+
+func TestParseDispatchOK(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_OK nux"
+	body := "Bead: gt-abc123"
+
+	payload, err := ParseDispatchOK(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchOK() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.BeadID != "gt-abc123" {
+		t.Errorf("BeadID = %q, want %q", payload.BeadID, "gt-abc123")
+	}
+	if payload.DispatchedAt.IsZero() {
+		t.Error("DispatchedAt should not be zero")
+	}
+}
+
+func TestParseDispatchOK_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDispatchOK("Not a dispatch ok", "body")
+	if err == nil {
+		t.Error("ParseDispatchOK() expected error for invalid subject")
+	}
+}
+
+func TestParseDispatchFail(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_FAIL nux"
+	body := `Bead: gt-abc123
+Reason: bead already claimed`
+
+	payload, err := ParseDispatchFail(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchFail() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.BeadID != "gt-abc123" {
+		t.Errorf("BeadID = %q, want %q", payload.BeadID, "gt-abc123")
+	}
+	if payload.Reason != "bead already claimed" {
+		t.Errorf("Reason = %q, want %q", payload.Reason, "bead already claimed")
+	}
+	if payload.FailedAt.IsZero() {
+		t.Error("FailedAt should not be zero")
+	}
+}
+
+func TestParseDispatchFail_MinimalBody(t *testing.T) {
+	t.Parallel()
+	subject := "DISPATCH_FAIL ace"
+	body := "Reason: polecat state changed"
+
+	payload, err := ParseDispatchFail(subject, body)
+	if err != nil {
+		t.Fatalf("ParseDispatchFail() error = %v", err)
+	}
+
+	if payload.PolecatName != "ace" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "ace")
+	}
+	if payload.BeadID != "" {
+		t.Errorf("BeadID = %q, want empty", payload.BeadID)
+	}
+	if payload.Reason != "polecat state changed" {
+		t.Errorf("Reason = %q, want %q", payload.Reason, "polecat state changed")
+	}
+}
+
+func TestParseDispatchFail_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDispatchFail("Not a dispatch fail", "body")
+	if err == nil {
+		t.Error("ParseDispatchFail() expected error for invalid subject")
+	}
+}
+
+func TestParseIdlePassivated(t *testing.T) {
+	t.Parallel()
+	subject := "IDLE_PASSIVATED nux"
+	body := "IdleDuration: 24h0m0s"
+
+	payload, err := ParseIdlePassivated(subject, body)
+	if err != nil {
+		t.Fatalf("ParseIdlePassivated() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.IdleDuration != "24h0m0s" {
+		t.Errorf("IdleDuration = %q, want %q", payload.IdleDuration, "24h0m0s")
+	}
+	if payload.PassivatedAt.IsZero() {
+		t.Error("PassivatedAt should not be zero")
+	}
+}
+
+func TestParseIdlePassivated_MinimalBody(t *testing.T) {
+	t.Parallel()
+	subject := "IDLE_PASSIVATED slit"
+	body := ""
+
+	payload, err := ParseIdlePassivated(subject, body)
+	if err != nil {
+		t.Fatalf("ParseIdlePassivated() error = %v", err)
+	}
+
+	if payload.PolecatName != "slit" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "slit")
+	}
+	if payload.IdleDuration != "" {
+		t.Errorf("IdleDuration = %q, want empty", payload.IdleDuration)
+	}
+}
+
+func TestParseIdlePassivated_InvalidSubject(t *testing.T) {
+	t.Parallel()
+	_, err := ParseIdlePassivated("Not idle passivated", "body")
+	if err == nil {
+		t.Error("ParseIdlePassivated() expected error for invalid subject")
+	}
+}
+
 // --- Agent state and exit type constants (gt-x7t9) ---
 
 func TestAgentStateConstants(t *testing.T) {

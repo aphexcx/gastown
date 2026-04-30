@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
@@ -62,10 +63,20 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 	// serving different databases, resulting in hangs until the read timeout kills it.
 	beads.CleanStaleDoltServerPID(beadsDir)
 
+	// bd v0.59+ requires --flat for list --json to produce JSON output.
+	// Without it, bd returns human-readable tree format that fails JSON parsing.
+	// The mail package calls bd directly (not via beads.Run), so it needs its
+	// own injection. (GH#2746)
+	args = beads.InjectFlatForListJSON(args)
+
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = workDir
+	util.SetDetachedProcessGroup(cmd)
 
 	env := append(cmd.Environ(), "BEADS_DIR="+beadsDir)
+	if dbEnv := beads.DatabaseEnv(beadsDir); dbEnv != "" {
+		env = append(env, dbEnv)
+	}
 	env = append(env, extraEnv...)
 	env = append(env, telemetry.OTELEnvForSubprocess()...)
 	cmd.Env = env
@@ -75,6 +86,26 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 	cmd.Stderr = &stderr
 
 	runErr := cmd.Run()
+
+	// If bd doesn't support --flat (< v0.59), retry without it.
+	// Same fallback pattern as beads.Run. (GH#2746)
+	if runErr != nil && strings.Contains(stderr.String(), "unknown flag: --flat") {
+		retryArgs := make([]string, 0, len(args))
+		for _, a := range args {
+			if a != "--flat" {
+				retryArgs = append(retryArgs, a)
+			}
+		}
+		stdout.Reset()
+		stderr.Reset()
+		retryCmd := exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+		retryCmd.Dir = workDir
+		util.SetDetachedProcessGroup(retryCmd)
+		retryCmd.Env = env
+		retryCmd.Stdout = &stdout
+		retryCmd.Stderr = &stderr
+		runErr = retryCmd.Run()
+	}
 
 	if runErr != nil {
 		return nil, &bdError{
@@ -95,11 +126,17 @@ func firstArg(args []string) string {
 }
 
 // bdReadCtx returns a context with the standard bd read timeout.
+//
+//nolint:gosec // The cancel function is returned to callers, who are responsible for invoking it.
 func bdReadCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), bdReadTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), bdReadTimeout)
+	return ctx, cancel
 }
 
 // bdWriteCtx returns a context with the standard bd write timeout.
+//
+//nolint:gosec // The cancel function is returned to callers, who are responsible for invoking it.
 func bdWriteCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), bdWriteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), bdWriteTimeout)
+	return ctx, cancel
 }

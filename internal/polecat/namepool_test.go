@@ -465,6 +465,58 @@ func TestThemeForRigDeterministic(t *testing.T) {
 	}
 }
 
+func TestThemeForRigAvoiding(t *testing.T) {
+	themes := ListThemes()
+
+	t.Run("avoids used themes", func(t *testing.T) {
+		// Use all themes except one
+		used := themes[:len(themes)-1]
+		result := ThemeForRigAvoiding("newrig", used)
+		// Should pick the remaining unused theme
+		for _, u := range used {
+			if result == u {
+				t.Errorf("ThemeForRigAvoiding returned already-used theme %q", result)
+			}
+		}
+	})
+
+	t.Run("all themes taken falls back", func(t *testing.T) {
+		result := ThemeForRigAvoiding("newrig", themes)
+		// Should still return a valid theme (falls back to hash-based)
+		if result == "" {
+			t.Error("ThemeForRigAvoiding returned empty string when all themes taken")
+		}
+		expected := ThemeForRig("newrig")
+		if result != expected {
+			t.Errorf("expected fallback to ThemeForRig result %q, got %q", expected, result)
+		}
+	})
+
+	t.Run("no used themes", func(t *testing.T) {
+		result := ThemeForRigAvoiding("newrig", nil)
+		// Should pick a valid theme
+		found := false
+		for _, th := range themes {
+			if result == th {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("ThemeForRigAvoiding returned unknown theme %q", result)
+		}
+	})
+
+	t.Run("deterministic", func(t *testing.T) {
+		used := []string{"mad-max"}
+		r1 := ThemeForRigAvoiding("myrig", used)
+		r2 := ThemeForRigAvoiding("myrig", used)
+		if r1 != r2 {
+			t.Errorf("not deterministic: %q vs %q", r1, r2)
+		}
+	})
+}
+
 func TestNamePool_ReservedNamesExcluded(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "namepool-test-*")
 	if err != nil {
@@ -1174,5 +1226,28 @@ func TestGetNames_FallbackOnDeletedThemeFile(t *testing.T) {
 	// Should get the first name from the default theme (mad-max), which is "furiosa"
 	if name != "furiosa" {
 		t.Errorf("expected fallback to default theme (furiosa), got %s", name)
+	}
+}
+
+func TestGetNames_UnresolvableTheme_FallsBackToDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	pool := NewNamePoolWithConfig(tmpDir, "testrig", "nonexistent-theme", nil, 10)
+	pool.SetTownRoot(tmpDir)
+
+	name, err := pool.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	defaultNames := BuiltinThemes[DefaultTheme]
+	found := false
+	for _, dn := range defaultNames {
+		if dn == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected name from default theme, got %q", name)
 	}
 }

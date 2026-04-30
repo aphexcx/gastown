@@ -18,6 +18,44 @@ import (
 	"github.com/steveyegge/gastown/internal/testutil"
 )
 
+func TestBuildWitnessPatrolVars_NilContext(t *testing.T) {
+	ctx := RoleContext{}
+	vars := buildWitnessPatrolVars(ctx)
+	if len(vars) != 0 {
+		t.Errorf("expected empty vars for nil context, got %v", vars)
+	}
+}
+
+func TestBuildWitnessPatrolVars_InjectsRigAndPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigDir := filepath.Join(tmpDir, "testrig")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := RoleContext{
+		TownRoot: tmpDir,
+		Rig:      "testrig",
+	}
+	vars := buildWitnessPatrolVars(ctx)
+	if len(vars) != 2 {
+		t.Fatalf("expected 2 vars (rig, prefix), got %v", vars)
+	}
+	varMap := make(map[string]string)
+	for _, v := range vars {
+		parts := splitFirstEquals(v)
+		if len(parts) == 2 {
+			varMap[parts[0]] = parts[1]
+		}
+	}
+	if got := varMap["rig"]; got != "testrig" {
+		t.Errorf("rig = %q, want %q", got, "testrig")
+	}
+	if got := varMap["prefix"]; got != "gt" {
+		t.Errorf("prefix = %q, want %q (default fallback)", got, "gt")
+	}
+}
+
 func TestBuildRefineryPatrolVars_NilContext(t *testing.T) {
 	ctx := RoleContext{}
 	vars := buildRefineryPatrolVars(ctx)
@@ -126,15 +164,20 @@ func TestBuildRefineryPatrolVars_FullConfig(t *testing.T) {
 	vars := buildRefineryPatrolVars(ctx)
 
 	// DefaultMergeQueueConfig: refinery_enabled=true, auto_land=false, run_tests=true,
-	// test_command="go test ./...", target_branch="main" (from rig config), delete_merged_branches=true
+	// test_command="" (language-agnostic), target_branch="main" (from rig config),
+	// delete_merged_branches=true, judgment_enabled=false, review_depth="standard"
+	// merge_strategy is omitted when not explicitly set (formula default "direct" applies)
 	// New commands (setup, typecheck, lint, build) default to empty = omitted
+	// judgment_enabled defaults to false, review_depth defaults to "standard"
 	expected := map[string]string{
 		"integration_branch_refinery_enabled": "true",
 		"integration_branch_auto_land":        "false",
 		"run_tests":                           "true",
-		"test_command":                        "go test ./...",
 		"target_branch":                       "main",
 		"delete_merged_branches":              "true",
+		"judgment_enabled":                    "false",
+		"review_depth":                        "standard",
+		"require_review":                      "false",
 	}
 
 	varMap := make(map[string]string)
@@ -156,10 +199,10 @@ func TestBuildRefineryPatrolVars_FullConfig(t *testing.T) {
 		}
 	}
 
-	// Verify empty commands are NOT included
-	for _, shouldBeAbsent := range []string{"setup_command", "typecheck_command", "lint_command", "build_command"} {
+	// Verify empty commands and unset strategy are NOT included
+	for _, shouldBeAbsent := range []string{"setup_command", "typecheck_command", "lint_command", "build_command", "merge_strategy"} {
 		if _, ok := varMap[shouldBeAbsent]; ok {
-			t.Errorf("%q should be omitted when empty", shouldBeAbsent)
+			t.Errorf("%q should be omitted when empty/unset", shouldBeAbsent)
 		}
 	}
 
@@ -205,12 +248,11 @@ func TestBuildRefineryPatrolVars_AllCommandsSet(t *testing.T) {
 		}
 	}
 
-	// All 5 commands should be present
+	// All configured commands should be present (test_command is empty by default)
 	commandExpected := map[string]string{
 		"setup_command":     "pnpm install",
 		"typecheck_command": "tsc --noEmit",
 		"lint_command":      "eslint .",
-		"test_command":      "go test ./...",
 		"build_command":     "pnpm build",
 	}
 	for key, want := range commandExpected {
@@ -399,6 +441,129 @@ func TestBuildRefineryPatrolVars_DefaultBranchWithoutMQ(t *testing.T) {
 	}
 	if got := varMap["target_branch"]; got != "gastown" {
 		t.Errorf("target_branch = %q, want %q (should read rig config even without MQ settings)", got, "gastown")
+	}
+}
+
+func TestBuildRefineryPatrolVars_MergeStrategy(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigDir := filepath.Join(tmpDir, "testrig")
+	settingsDir := filepath.Join(rigDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mq := config.DefaultMergeQueueConfig()
+	mq.MergeStrategy = "pr"
+	settings := config.RigSettings{
+		Type:       "rig-settings",
+		Version:    1,
+		MergeQueue: mq,
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := RoleContext{
+		TownRoot: tmpDir,
+		Rig:      "testrig",
+	}
+	vars := buildRefineryPatrolVars(ctx)
+
+	varMap := make(map[string]string)
+	for _, v := range vars {
+		parts := splitFirstEquals(v)
+		if len(parts) == 2 {
+			varMap[parts[0]] = parts[1]
+		}
+	}
+
+	if got := varMap["merge_strategy"]; got != "pr" {
+		t.Errorf("merge_strategy = %q, want %q (rig-level config must override formula default)", got, "pr")
+	}
+}
+
+func TestBuildRefineryPatrolVars_MergeStrategyDefaultOmitted(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigDir := filepath.Join(tmpDir, "testrig")
+	settingsDir := filepath.Join(rigDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// MergeStrategy not set — should not be injected (formula default "direct" applies)
+	mq := config.DefaultMergeQueueConfig()
+	settings := config.RigSettings{
+		Type:       "rig-settings",
+		Version:    1,
+		MergeQueue: mq,
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := RoleContext{
+		TownRoot: tmpDir,
+		Rig:      "testrig",
+	}
+	vars := buildRefineryPatrolVars(ctx)
+
+	varMap := make(map[string]string)
+	for _, v := range vars {
+		parts := splitFirstEquals(v)
+		if len(parts) == 2 {
+			varMap[parts[0]] = parts[1]
+		}
+	}
+
+	// merge_strategy should be absent when not explicitly configured
+	if _, ok := varMap["merge_strategy"]; ok {
+		t.Error("merge_strategy should be omitted when not configured (let formula default apply)")
+	}
+}
+
+func TestBuildRefineryPatrolVars_RequireReview(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigDir := filepath.Join(tmpDir, "testrig")
+	settingsDir := filepath.Join(rigDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mq := config.DefaultMergeQueueConfig()
+	mq.MergeStrategy = "pr"
+	requireReview := true
+	mq.RequireReview = &requireReview
+	settings := config.RigSettings{
+		Type:       "rig-settings",
+		Version:    1,
+		MergeQueue: mq,
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := RoleContext{
+		TownRoot: tmpDir,
+		Rig:      "testrig",
+	}
+	vars := buildRefineryPatrolVars(ctx)
+
+	varMap := make(map[string]string)
+	for _, v := range vars {
+		parts := splitFirstEquals(v)
+		if len(parts) == 2 {
+			varMap[parts[0]] = parts[1]
+		}
+	}
+
+	if got := varMap["require_review"]; got != "true" {
+		t.Errorf("require_review = %q, want %q", got, "true")
+	}
+	if got := varMap["merge_strategy"]; got != "pr" {
+		t.Errorf("merge_strategy = %q, want %q", got, "pr")
 	}
 }
 
@@ -663,17 +828,6 @@ func TestFindActivePatrolMultiple(t *testing.T) {
 		t.Errorf("patrolID = %q, want %q (should return the active one)", patrolID, activeID)
 	}
 
-	// Verify both stale patrols were closed
-	for _, id := range []string{stale1, stale2} {
-		issue, err := b.Show(id)
-		if err != nil {
-			t.Fatalf("show stale %s: %v", id, err)
-		}
-		if issue.Status != "closed" {
-			t.Errorf("stale patrol %s status = %q, want %q", id, issue.Status, "closed")
-		}
-	}
-
 	// Verify active patrol is still hooked
 	issue, err := b.Show(activeID)
 	if err != nil {
@@ -681,6 +835,98 @@ func TestFindActivePatrolMultiple(t *testing.T) {
 	}
 	if issue.Status != beads.StatusHooked {
 		t.Errorf("active patrol status = %q, want %q", issue.Status, beads.StatusHooked)
+	}
+
+	// Stale patrol cleanup is not guaranteed when an active patrol is found —
+	// findActivePatrol breaks early on active discovery to prevent N+1 Dolt queries
+	// (gt-18dzn6p). Remaining stale beads are cleaned by burnPreviousPatrolWisps
+	// when the patrol cycle ends. Verify stale beads are either closed or still hooked
+	// (not left in an intermediate broken state).
+	for _, id := range []string{stale1, stale2} {
+		staleIssue, showErr := b.Show(id)
+		if showErr != nil {
+			t.Fatalf("show stale %s: %v", id, showErr)
+		}
+		if staleIssue.Status != "closed" && staleIssue.Status != beads.StatusHooked {
+			t.Errorf("stale patrol %s status = %q, want closed or hooked", id, staleIssue.Status)
+		}
+	}
+}
+
+// TestFindActivePatrol_StaleCleanupCapped verifies that when many stale patrols
+// accumulate with no active patrol, cleanup is capped at maxStalePurgePerRun per call
+// to prevent overwhelming Dolt with sequential write queries (gt-18dzn6p).
+func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	// Create more stale patrols than maxStalePurgePerRun (currently 5)
+	numStale := maxStalePurgePerRun + 3 // e.g., 8 total
+	staleIDs := make([]string, numStale)
+	for i := 0; i < numStale; i++ {
+		id := createHookedPatrol(t, b, molName, assignee, true /* with child */)
+		staleIDs[i] = id
+
+		// Close the child to make the patrol stale
+		children, err := b.List(beads.ListOptions{Parent: id, Status: "all", Priority: -1})
+		if err != nil {
+			t.Fatalf("list children of %s: %v", id, err)
+		}
+		for _, child := range children {
+			if closeErr := b.ForceCloseWithReason("test cleanup", child.ID); closeErr != nil {
+				t.Fatalf("close child of %s: %v", id, closeErr)
+			}
+		}
+	}
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	}
+
+	_, _, found, findErr := findActivePatrol(cfg)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if found {
+		t.Fatal("expected no active patrol (all stale)")
+	}
+
+	// Count how many stale patrols were actually closed
+	closedCount := 0
+	hookedCount := 0
+	for _, id := range staleIDs {
+		issue, err := b.Show(id)
+		if err != nil {
+			t.Fatalf("show stale %s: %v", id, err)
+		}
+		switch issue.Status {
+		case "closed":
+			closedCount++
+		case beads.StatusHooked:
+			hookedCount++
+		default:
+			t.Errorf("stale patrol %s unexpected status %q", id, issue.Status)
+		}
+	}
+
+	// Cleanup must be capped: at most maxStalePurgePerRun beads closed per run
+	if closedCount > maxStalePurgePerRun {
+		t.Errorf("closed %d stale patrols, want at most %d (cap exceeded — Dolt DoS risk)",
+			closedCount, maxStalePurgePerRun)
+	}
+	// But at least some cleanup must happen (the cap should not be zero)
+	if closedCount == 0 {
+		t.Errorf("no stale patrols were closed, expected up to %d", maxStalePurgePerRun)
+	}
+	// Total accounted for
+	if closedCount+hookedCount != numStale {
+		t.Errorf("closed=%d + hooked=%d != total=%d", closedCount, hookedCount, numStale)
 	}
 }
 

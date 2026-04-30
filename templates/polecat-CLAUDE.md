@@ -196,20 +196,28 @@ When your work is done, follow this checklist — **step 4 is REQUIRED**:
 **Quality gates are not optional.** Worktrees may not trigger pre-commit hooks,
 so you MUST run lint/format/tests manually before every commit.
 
+**Project-specific gates:** Read CLAUDE.md and AGENTS.md in the repo root for
+the project's definition of done. Many projects require a specific test harness
+(not just `go test` or `dotnet test`). If AGENTS.md exists, its "Core rule"
+section defines what "done" means for this project.
+
 The `gt done` command pushes your branch, creates an MR bead in the MQ, nukes
 your sandbox, and exits your session. **You are gone after `gt done`.**
 
-### No PRs in Maintainer Repos
+### Do NOT Push Directly to Main
 
-If you have direct push access (maintainer):
-- **NEVER create GitHub PRs** — push directly to main
-- Polecats: use `gt done` → Refinery merges to main
+**You are a polecat. You NEVER push directly to main.**
 
-PRs are for external contributors. Check `git remote -v` to identify repo ownership.
+Your work goes through the merge queue:
+1. You work on your branch
+2. `gt done` pushes your branch and submits an MR to the merge queue
+3. Refinery merges to main after Witness verification
+
+**Do NOT create GitHub PRs either.** The merge queue handles everything.
 
 ### The Landing Rule
 
-> **Work is NOT landed until it's on `main` OR in the Refinery MQ.**
+> **Work is NOT landed until it's in the Refinery MQ.**
 
 **Local branch → `gt done` → MR in queue → Refinery merges → LANDED**
 

@@ -68,7 +68,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		fmt.Printf("[DEBUG] after detection: name=%q, crewRig=%q\n", name, crewRig)
 	}
 
-	crewMgr, r, err := getCrewManager(crewRig)
+	crewMgr, r, err := getCrewManagerForMember(crewRig, name)
 	if err != nil {
 		return err
 	}
@@ -195,13 +195,17 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 			Topic:            "start",
 			SessionName:      sessionID,
 		})
+		// Merge liveness-critical env vars (GT_AGENT, GT_PROCESS_NAMES) so that
+		// IsAgentAlive can detect non-Claude runtimes. Without this, attach
+		// misclassifies live sessions as dead and recreates them.
+		envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 		for k, v := range envVars {
 			_ = t.SetEnvironment(sessionID, k, v)
 		}
 
 		// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
 		// Note: ConfigureGasTownSession includes cycle bindings
-		theme := getThemeForRig(r.Name)
+		theme := tmux.ResolveSessionTheme(townRoot, r.Name, "crew", name)
 		_ = t.ConfigureGasTownSession(sessionID, theme, r.Name, name, "crew")
 
 		// Wait for shell to be ready after session creation
@@ -262,6 +266,23 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		if !t.IsAgentAlive(sessionID) {
 			// Runtime has exited, restart it using respawn-pane
 			fmt.Printf("Runtime exited, restarting...\n")
+
+			// Refresh liveness env vars before restart so the next IsAgentAlive
+			// check can detect non-Claude runtimes.
+			restartEnv := config.AgentEnv(config.AgentEnvConfig{
+				Role:             "crew",
+				Rig:              r.Name,
+				AgentName:        name,
+				TownRoot:         townRoot,
+				RuntimeConfigDir: claudeConfigDir,
+				Agent:            crewAgentOverride,
+				Topic:            "restart",
+				SessionName:      sessionID,
+			})
+			restartEnv = session.MergeRuntimeLivenessEnv(restartEnv, runtimeConfig)
+			for k, v := range restartEnv {
+				_ = t.SetEnvironment(sessionID, k, v)
+			}
 
 			// Get pane ID for respawn
 			paneID, err := t.GetPaneID(sessionID)

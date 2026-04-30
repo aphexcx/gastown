@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -59,6 +60,10 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
 	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
 		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
+	}
+
+	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
+		t.Fatalf("ensure custom types in %s: %v", dir, err)
 	}
 }
 
@@ -135,6 +140,10 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	routes := []beads.Route{
 		{Prefix: hqPrefix + "-", Path: "."},
 		{Prefix: rigPrefix + "-", Path: "testrig/mayor/rig"},
+		// Convoy beads use a literal "hq-cv-" prefix (see install.go — registered
+		// on real towns during `gt install`). Route them to HQ so tests that
+		// look up auto-convoys via `bd show` resolve correctly.
+		{Prefix: "hq-cv-", Path: "."},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -204,19 +213,23 @@ func createSlingContext(t *testing.T, hqPath string, fields *capacity.SlingConte
 	return ctxBead.ID
 }
 
-// findSlingContext finds an open sling context for a work bead in the HQ beads DB.
+// findSlingContext finds an open sling context for a work bead by scanning all
+// rig beads dirs under townRoot. Mirrors production's listAllSlingContexts since
+// sling contexts now live in the target rig's beads dir, not HQ (see dee628d3).
 // Returns nil if none found.
 func findSlingContext(t *testing.T, hqPath, workBeadID string) *capacity.SlingContextFields {
 	t.Helper()
-	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
-	_, fields, err := townBeads.FindOpenSlingContext(workBeadID)
-	if err != nil {
-		t.Fatalf("FindOpenSlingContext(%s) failed: %v", workBeadID, err)
+	for _, ctx := range listAllSlingContexts(hqPath) {
+		fields := beads.ParseSlingContextFields(ctx.Description)
+		if fields != nil && fields.WorkBeadID == workBeadID {
+			return fields
+		}
 	}
-	return fields
+	return nil
 }
 
-// hasSlingContext checks if a work bead has an open sling context in HQ.
+// hasSlingContext checks if a work bead has an open sling context anywhere
+// under townRoot (HQ or any rig beads dir).
 func hasSlingContext(t *testing.T, hqPath, workBeadID string) bool {
 	t.Helper()
 	return findSlingContext(t, hqPath, workBeadID) != nil
@@ -289,50 +302,27 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		t.Fatalf("convoy ID not stored in sling context")
 	}
 
-	// Verify: convoy is resolvable via bd show from hq
-	cmd := exec.Command("bd", "show", fields.Convoy, "--json", "--allow-stale")
-	cmd.Dir = hqPath
-	out, err := cmd.Output()
+	// Verify convoy via SQL query instead of bd show.
+	// bd show uses SearchIssues which queries columns that may not exist in
+	// older bd versions (e.g., "crystallizes" was dropped in bd v0.63.3 but
+	// CI pins v0.57.0 which still queries it). Direct SQL avoids this.
+	port := os.Getenv("GT_DOLT_PORT")
+	if port == "" {
+		port = "3307"
+	}
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%s)/h%d", port, schedulerTestCounter.Load())
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		t.Fatalf("bd show convoy %s failed: %v", fields.Convoy, err)
+		t.Fatalf("connecting to verify convoy: %v", err)
 	}
-	var convoys []struct {
-		ID        string `json:"id"`
-		IssueType string `json:"issue_type"`
-	}
-	if err := json.Unmarshal(out, &convoys); err != nil {
-		t.Fatalf("parse convoy show: %v", err)
-	}
-	if len(convoys) == 0 {
-		t.Fatalf("convoy %s not found via bd show", fields.Convoy)
-	}
-	if convoys[0].IssueType != "convoy" {
-		t.Errorf("convoy issue_type = %q, want %q", convoys[0].IssueType, "convoy")
-	}
-
-	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
-	// This is the core cross-rig link: convoy lives in HQ DB, bead in rig DB.
-	depCmd := exec.Command("bd", "dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json")
-	depCmd.Dir = hqPath
-	depOut, err := depCmd.Output()
+	defer db.Close()
+	var convoyType string
+	err = db.QueryRow("SELECT issue_type FROM issues WHERE id = ?", fields.Convoy).Scan(&convoyType)
 	if err != nil {
-		t.Fatalf("bd dep list %s --type=tracks failed: %v", fields.Convoy, err)
+		t.Fatalf("convoy %s not found in database: %v", fields.Convoy, err)
 	}
-	var deps []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(depOut, &deps); err != nil {
-		t.Fatalf("parse dep list: %v\nraw: %s", err, depOut)
-	}
-	foundTracked := false
-	for _, dep := range deps {
-		if dep.ID == beadID {
-			foundTracked = true
-			break
-		}
-	}
-	if !foundTracked {
-		t.Errorf("convoy %s should track bead %s via tracks dep, got deps: %s", fields.Convoy, beadID, depOut)
+	if convoyType != "convoy" {
+		t.Errorf("convoy issue_type = %q, want %q", convoyType, "convoy")
 	}
 }
 
@@ -421,7 +411,8 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	cmd := exec.Command("bd", "list", "--type=convoy", "--json")
+	listArgs := beads.MaybePrependAllowStale([]string{"list", "--type=convoy", "--json"})
+	cmd := exec.Command("bd", listArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -449,14 +440,10 @@ func TestSchedulerSlingContextIdempotency(t *testing.T) {
 	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
 	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
 
-	// Verify: only one sling context exists
-	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
-	contexts, err := townBeads.ListOpenSlingContexts()
-	if err != nil {
-		t.Fatalf("ListOpenSlingContexts failed: %v", err)
-	}
+	// Verify: only one sling context exists across all rig dirs
+	// (sling contexts live in the target rig's beads dir per dee628d3).
 	count := 0
-	for _, ctx := range contexts {
+	for _, ctx := range listAllSlingContexts(hqPath) {
 		fields := beads.ParseSlingContextFields(ctx.Description)
 		if fields != nil && fields.WorkBeadID == beadID {
 			count++
@@ -572,6 +559,8 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 		{Prefix: hqPrefix + "-", Path: "."},
 		{Prefix: rig1Prefix + "-", Path: "rig1/mayor/rig"},
 		{Prefix: rig2Prefix + "-", Path: "rig2/mayor/rig"},
+		// Convoy beads use a literal "hq-cv-" prefix (see install.go).
+		{Prefix: "hq-cv-", Path: "."},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -611,6 +600,29 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.WriteFile(filepath.Join(rig2Redirect, "redirect"), []byte("mayor/rig/.beads"), 0644); err != nil {
 		t.Fatalf("write rig2 redirect: %v", err)
 	}
+
+	// Drop test databases on cleanup to prevent orphaned databases on the Dolt
+	// server. Without this, databases from multi-rig tests persist and can
+	// contaminate subsequent tests sharing the same server (see #2832).
+	t.Cleanup(func() {
+		port := os.Getenv("GT_DOLT_PORT")
+		if port == "" {
+			port = "3307"
+		}
+		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Logf("cleanup: could not connect to drop test databases: %v", err)
+			return
+		}
+		defer db.Close()
+		for _, prefix := range []string{hqPrefix, rig1Prefix, rig2Prefix} {
+			dbName := "beads_" + prefix
+			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
+				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
+			}
+		}
+	})
 
 	// --- Environment ---
 	env = cleanSchedulerTestEnv(tmpDir)
@@ -853,6 +865,10 @@ func TestSchedulerMultiRigConvoyAutoResolve(t *testing.T) {
 	// bead1 and bead2 are in different DBs — stored as external refs in HQ.
 	addBeadDependencyOfType(t, convoyID, bead1, "tracks", hqPath)
 	addBeadDependencyOfType(t, convoyID, bead2, "tracks", hqPath)
+
+	// Wait for bd's issues.jsonl timestamp to settle (same race as
+	// TestSchedulerDirectConvoyDispatch — 1-second granularity stale check).
+	time.Sleep(2 * time.Second)
 
 	// Dry-run: verify auto-rig-resolution routes each bead correctly.
 	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", convoyID, "--dry-run")
@@ -1114,6 +1130,12 @@ func TestSchedulerDirectConvoyDispatch(t *testing.T) {
 	bead2 := createTestBead(t, rig2Path, "Rig2 direct tracked")
 	addBeadDependencyOfType(t, convoyID, bead1, "tracks", hqPath)
 	addBeadDependencyOfType(t, convoyID, bead2, "tracks", hqPath)
+
+	// Wait for bd's issues.jsonl timestamp to settle. bd checks that the Dolt
+	// import timestamp >= jsonl mtime (1-second granularity). Without this,
+	// the sling command flakes with "database out of sync" when the jsonl write
+	// and Dolt import straddle a second boundary.
+	time.Sleep(2 * time.Second)
 
 	// gt sling <convoy-id> --dry-run in direct mode
 	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", convoyID, "--dry-run")

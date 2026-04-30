@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestNew(t *testing.T) {
 func TestListOptions(t *testing.T) {
 	opts := ListOptions{
 		Status:   "open",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 1,
 	}
 	if opts.Status != "open" {
@@ -33,11 +34,24 @@ func TestListOptions(t *testing.T) {
 	}
 }
 
+// TestListOptionsEphemeral verifies that Ephemeral flag is preserved.
+func TestListOptionsEphemeral(t *testing.T) {
+	opts := ListOptions{
+		Label:     "gt:merge-request",
+		Status:    "open",
+		Priority:  -1,
+		Ephemeral: true,
+	}
+	if !opts.Ephemeral {
+		t.Error("Ephemeral should be true")
+	}
+}
+
 // TestCreateOptions verifies CreateOptions fields.
 func TestCreateOptions(t *testing.T) {
 	opts := CreateOptions{
 		Title:       "Test issue",
-		Type:        "task",
+		Labels:      []string{"gt:task"},
 		Priority:    2,
 		Description: "A test description",
 		Parent:      "gt-abc",
@@ -47,6 +61,28 @@ func TestCreateOptions(t *testing.T) {
 	}
 	if opts.Parent != "gt-abc" {
 		t.Errorf("Parent = %q, want gt-abc", opts.Parent)
+	}
+}
+
+// TestCreateOptionsRig verifies the Rig field targets the correct rig database (gt-7y7).
+// When a polecat works on a cross-rig bead (e.g., hq-xxx), gt done must explicitly
+// set Rig on CreateOptions so the MR bead lands in the polecat's rig database,
+// not the town-level database where the source bead lives.
+func TestCreateOptionsRig(t *testing.T) {
+	opts := CreateOptions{
+		Title:     "Merge: hq-abc",
+		Labels:    []string{"gt:merge-request"},
+		Ephemeral: true,
+		Rig:       "gastown",
+	}
+	if opts.Rig != "gastown" {
+		t.Errorf("Rig = %q, want %q", opts.Rig, "gastown")
+	}
+
+	// Zero value: Rig is empty string (no --repo flag passed).
+	var empty CreateOptions
+	if empty.Rig != "" {
+		t.Errorf("zero-value Rig = %q, want empty string", empty.Rig)
 	}
 }
 
@@ -79,6 +115,88 @@ func TestIsFlagLikeTitle(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("IsFlagLikeTitle(%q) = %v, want %v", tt.title, got, tt.want)
 		}
+	}
+}
+
+func TestBdSupportsAllowStale_ReprobesWhenBinaryPathChanges(t *testing.T) {
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	supportingDir := t.TempDir()
+	nonSupportingDir := t.TempDir()
+	writeAllowStaleBDStub(t, supportingDir, true)
+	writeAllowStaleBDStub(t, nonSupportingDir, false)
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", supportingDir+string(os.PathListSeparator)+origPath)
+	if !BdSupportsAllowStale() {
+		t.Fatal("expected first stub to support --allow-stale")
+	}
+
+	t.Setenv("PATH", nonSupportingDir+string(os.PathListSeparator)+origPath)
+	if BdSupportsAllowStale() {
+		t.Fatal("expected second stub to be re-probed and report no --allow-stale support")
+	}
+}
+
+// writeAllowStaleBDStub creates a mock bd binary in dir.
+//
+// The detection function (BdSupportsAllowStaleWithEnv) ignores the exit code
+// and checks output for "unknown flag" (matching real bd v0.60+ behavior where
+// unknown flags exit 0 but print an error to stderr). The stubs must match:
+//   - Supporting: exit 0, no output
+//   - Non-supporting: exit 0, print "unknown flag" to stderr
+func writeAllowStaleBDStub(t *testing.T, dir string, supportsAllowStale bool) {
+	t.Helper()
+
+	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
+	// Detection now checks output for "unknown flag" rather than exit code.
+	var scriptPath, script string
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(dir, "bd.bat")
+		if supportsAllowStale {
+			script = `@echo off
+setlocal enableextensions
+if "%1"=="--allow-stale" exit /b 0
+exit /b 0
+`
+		} else {
+			script = `@echo off
+setlocal enableextensions
+if "%1"=="--allow-stale" (
+  echo Error: unknown flag: --allow-stale 1>&2
+  exit /b 0
+)
+exit /b 0
+`
+		}
+	} else {
+		scriptPath = filepath.Join(dir, "bd")
+		if supportsAllowStale {
+			script = `#!/bin/sh
+exit 0
+`
+		} else {
+			script = `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+fi
+exit 0
+`
+		}
+	}
+
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
 	}
 }
 
@@ -228,17 +346,6 @@ func TestIntegration(t *testing.T) {
 	}
 
 	b := New(dir)
-
-	// Sync database before testing to ensure consistent data and prevent
-	// flaky test failures from stale state.
-	// We use --allow-stale to handle cases where the daemon is actively writing and
-	// the staleness check would otherwise fail spuriously.
-	syncCmd := exec.Command("bd", "--allow-stale", "sync", "--import-only")
-	syncCmd.Dir = dir
-	if err := syncCmd.Run(); err != nil {
-		// If sync fails (e.g., no database exists), just log and continue
-		t.Logf("bd sync --import-only failed (may not have db): %v", err)
-	}
 
 	// Test List
 	t.Run("List", func(t *testing.T) {
@@ -418,6 +525,23 @@ source_issue: gt-pqr`,
 				SourceIssue: "gt-pqr",
 			},
 		},
+		{
+			name: "commit_sha field (GH#3032)",
+			issue: &Issue{
+				Description: `branch: polecat/nux/es-ixjt@mmw5d6mv
+target: main
+source_issue: es-ixjt
+rig: gastown
+commit_sha: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2`,
+			},
+			wantFields: &MRFields{
+				Branch:      "polecat/nux/es-ixjt@mmw5d6mv",
+				Target:      "main",
+				SourceIssue: "es-ixjt",
+				Rig:         "gastown",
+				CommitSHA:   "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -449,6 +573,9 @@ source_issue: gt-pqr`,
 			}
 			if fields.Rig != tt.wantFields.Rig {
 				t.Errorf("Rig = %q, want %q", fields.Rig, tt.wantFields.Rig)
+			}
+			if fields.CommitSHA != tt.wantFields.CommitSHA {
+				t.Errorf("CommitSHA = %q, want %q", fields.CommitSHA, tt.wantFields.CommitSHA)
 			}
 			if fields.MergeCommit != tt.wantFields.MergeCommit {
 				t.Errorf("MergeCommit = %q, want %q", fields.MergeCommit, tt.wantFields.MergeCommit)
@@ -517,6 +644,21 @@ worker: Toast`,
 			},
 			want: `merge_commit: deadbeef
 close_reason: rejected`,
+		},
+		{
+			name: "with commit_sha (GH#3032)",
+			fields: &MRFields{
+				Branch:      "polecat/nux/es-ixjt@mmw5d6mv",
+				Target:      "main",
+				SourceIssue: "es-ixjt",
+				Rig:         "gastown",
+				CommitSHA:   "a1b2c3d4",
+			},
+			want: `branch: polecat/nux/es-ixjt@mmw5d6mv
+target: main
+source_issue: es-ixjt
+rig: gastown
+commit_sha: a1b2c3d4`,
 		},
 	}
 
@@ -660,7 +802,7 @@ func TestMRFieldsRoundTrip(t *testing.T) {
 		t.Fatal("round-trip parse returned nil")
 	}
 
-	if *parsed != *original {
+	if !reflect.DeepEqual(parsed, original) {
 		t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", parsed, original)
 	}
 }
@@ -806,6 +948,17 @@ ATTACHED_AT: 2025-12-21T14:00:00Z`,
 				AttachedAt:       "2025-12-21T14:00:00Z",
 			},
 		},
+		{
+			name: "attached vars",
+			issue: &Issue{
+				Description: `attached_formula: mol-release
+attached_vars: ["version=1.2.3","channel=stable"]`,
+			},
+			wantFields: &AttachmentFields{
+				AttachedFormula: "mol-release",
+				AttachedVars:    []string{"version=1.2.3", "channel=stable"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -828,6 +981,9 @@ ATTACHED_AT: 2025-12-21T14:00:00Z`,
 			}
 			if fields.AttachedAt != tt.wantFields.AttachedAt {
 				t.Errorf("AttachedAt = %q, want %q", fields.AttachedAt, tt.wantFields.AttachedAt)
+			}
+			if !reflect.DeepEqual(fields.AttachedVars, tt.wantFields.AttachedVars) {
+				t.Errorf("AttachedVars = %#v, want %#v", fields.AttachedVars, tt.wantFields.AttachedVars)
 			}
 		})
 	}
@@ -865,6 +1021,14 @@ attached_at: 2025-12-21T15:30:00Z`,
 				AttachedMolecule: "mol-abc",
 			},
 			want: "attached_molecule: mol-abc",
+		},
+		{
+			name: "attached vars",
+			fields: &AttachmentFields{
+				AttachedFormula: "mol-release",
+				AttachedVars:    []string{"version=1.2.3", "channel=stable"},
+			},
+			want: "attached_formula: mol-release\nattached_vars: [\"version=1.2.3\",\"channel=stable\"]",
 		},
 	}
 
@@ -977,7 +1141,7 @@ func TestAttachmentFieldsRoundTrip(t *testing.T) {
 		t.Fatal("round-trip parse returned nil")
 	}
 
-	if *parsed != *original {
+	if !reflect.DeepEqual(parsed, original) {
 		t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", parsed, original)
 	}
 }
@@ -1050,7 +1214,7 @@ func TestNoMergeField(t *testing.T) {
 		if parsed == nil {
 			t.Fatal("round-trip parse returned nil")
 		}
-		if *parsed != *original {
+		if !reflect.DeepEqual(parsed, original) {
 			t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", parsed, original)
 		}
 	})
@@ -1897,14 +2061,100 @@ func TestDelegationTerms(t *testing.T) {
 
 // TestSetupRedirect tests the beads redirect setup for worktrees.
 func TestSetupRedirect(t *testing.T) {
-	t.Run("crew worktree with local beads", func(t *testing.T) {
-		// Setup: town/rig/.beads (local, no redirect)
+	t.Run("rig with own DB redirects to rig-level beads", func(t *testing.T) {
+		// When rig has its own dolt_database in metadata.json, crew must
+		// redirect to rig-level .beads (not town-level) to see correct prefix.
+		townRoot := t.TempDir()
+		townBeads := filepath.Join(townRoot, ".beads")
+		rigRoot := filepath.Join(townRoot, "testrig")
+		rigBeads := filepath.Join(rigRoot, ".beads")
+		crewPath := filepath.Join(rigRoot, "crew", "max")
+
+		// Create both town-level and rig-level beads
+		if err := os.MkdirAll(filepath.Join(townBeads, "dolt"), 0755); err != nil {
+			t.Fatalf("mkdir town beads: %v", err)
+		}
+		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+			t.Fatalf("mkdir rig beads: %v", err)
+		}
+		// Rig has its own database (e.g., laneassist with lc- prefix)
+		meta := []byte(`{"dolt_database":"testrig","backend":"dolt"}`)
+		if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"), meta, 0644); err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+		if err := os.MkdirAll(crewPath, 0755); err != nil {
+			t.Fatalf("mkdir crew: %v", err)
+		}
+
+		if err := SetupRedirect(townRoot, crewPath); err != nil {
+			t.Fatalf("SetupRedirect failed: %v", err)
+		}
+
+		redirectPath := filepath.Join(crewPath, ".beads", "redirect")
+		content, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("read redirect: %v", err)
+		}
+
+		// 2 levels up to rig root: crew/max -> testrig, then .beads
+		want := "../../.beads\n"
+		if string(content) != want {
+			t.Errorf("redirect content = %q, want %q", string(content), want)
+		}
+
+		// Verify redirect resolves to rig-level, NOT town-level
+		resolved := ResolveBeadsDir(crewPath)
+		if resolved != rigBeads {
+			t.Errorf("resolved = %q, want %q (rig-level)", resolved, rigBeads)
+		}
+	})
+
+	t.Run("rig without own DB redirects to town-level beads", func(t *testing.T) {
+		// When rig has no own database, crew should use town-level .beads.
+		townRoot := t.TempDir()
+		townBeads := filepath.Join(townRoot, ".beads")
+		rigRoot := filepath.Join(townRoot, "testrig")
+		crewPath := filepath.Join(rigRoot, "crew", "max")
+
+		// Create town-level beads with dolt DB
+		if err := os.MkdirAll(filepath.Join(townBeads, "dolt"), 0755); err != nil {
+			t.Fatalf("mkdir town beads: %v", err)
+		}
+		if err := os.MkdirAll(crewPath, 0755); err != nil {
+			t.Fatalf("mkdir crew: %v", err)
+		}
+
+		if err := SetupRedirect(townRoot, crewPath); err != nil {
+			t.Fatalf("SetupRedirect failed: %v", err)
+		}
+
+		redirectPath := filepath.Join(crewPath, ".beads", "redirect")
+		content, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("read redirect: %v", err)
+		}
+
+		// 3 levels up: crew/max -> testrig -> townRoot, then .beads
+		want := "../../../.beads\n"
+		if string(content) != want {
+			t.Errorf("redirect content = %q, want %q", string(content), want)
+		}
+
+		// Verify redirect resolves to town-level
+		resolved := ResolveBeadsDir(crewPath)
+		if resolved != townBeads {
+			t.Errorf("resolved = %q, want %q", resolved, townBeads)
+		}
+	})
+
+	t.Run("crew worktree falls back to rig-level beads", func(t *testing.T) {
+		// When neither rig metadata nor town-level .beads exists, fall back to rig-level (2 levels up).
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
 		rigBeads := filepath.Join(rigRoot, ".beads")
 		crewPath := filepath.Join(rigRoot, "crew", "max")
 
-		// Create rig structure
+		// Create rig-level beads only (no town-level, no metadata.json)
 		if err := os.MkdirAll(rigBeads, 0755); err != nil {
 			t.Fatalf("mkdir rig beads: %v", err)
 		}
@@ -2737,20 +2987,15 @@ func TestBdBranch_SystemScenario_FilterBeadsEnvIsolation(t *testing.T) {
 	t.Setenv("BEADS_DIR", "/tmp/filter-test-beads")
 	t.Setenv("GT_ROOT", "/tmp/filter-test-gt")
 
-	cmd := exec.Command("env")
-	cmd.Env = filterBeadsEnv(os.Environ())
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("env command failed: %v", err)
-	}
+	filtered := filterBeadsEnv(os.Environ())
 
-	output := string(out)
-	// Note: HOME= is stripped by filterBeadsEnv, but on macOS the kernel may
-	// re-inject HOME into subprocesses. Only check beads-specific vars here.
+	// Verify beads-specific vars are stripped from the filtered env.
 	forbidden := []string{"BD_ACTOR=", "BEADS_DIR=", "GT_ROOT="}
-	for _, prefix := range forbidden {
-		if strings.Contains(output, prefix) {
-			t.Errorf("filterBeadsEnv subprocess still contains %s", prefix)
+	for _, entry := range filtered {
+		for _, prefix := range forbidden {
+			if strings.HasPrefix(entry, prefix) {
+				t.Errorf("filterBeadsEnv result still contains %s", entry)
+			}
 		}
 	}
 }
@@ -2865,6 +3110,62 @@ func TestBuildRoutingEnv(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildRunEnv_OverridesStaleDoltPortFromBeadsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte("43113\n"), 0644); err != nil {
+		t.Fatalf("write dolt-server.port: %v", err)
+	}
+
+	t.Setenv("BEADS_DOLT_PORT", "3307")
+
+	env := (&Beads{workDir: tmpDir}).buildRunEnv()
+
+	found := false
+	for _, e := range env {
+		switch e {
+		case "BEADS_DOLT_PORT=43113":
+			found = true
+		case "BEADS_DOLT_PORT=3307":
+			t.Fatalf("stale BEADS_DOLT_PORT preserved in env: %v", env)
+		}
+	}
+	if !found {
+		t.Fatalf("expected BEADS_DOLT_PORT=43113 in env, got %v", env)
+	}
+}
+
+func TestBuildRoutingEnv_OverridesStaleDoltPortFromBeadsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte("43113\n"), 0644); err != nil {
+		t.Fatalf("write dolt-server.port: %v", err)
+	}
+
+	t.Setenv("BEADS_DOLT_PORT", "3307")
+
+	env := (&Beads{workDir: tmpDir}).buildRoutingEnv()
+
+	found := false
+	for _, e := range env {
+		switch e {
+		case "BEADS_DOLT_PORT=43113":
+			found = true
+		case "BEADS_DOLT_PORT=3307":
+			t.Fatalf("stale BEADS_DOLT_PORT preserved in env: %v", env)
+		}
+	}
+	if !found {
+		t.Fatalf("expected BEADS_DOLT_PORT=43113 in env, got %v", env)
 	}
 }
 

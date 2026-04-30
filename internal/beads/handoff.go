@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/lock"
@@ -44,6 +45,27 @@ func (b *Beads) FindHandoffBead(role string) (*Issue, error) {
 	return nil, nil
 }
 
+// FindAllHandoffBeads fetches all pinned beads once and returns a map from
+// role name to handoff bead. This avoids the N+1 subprocess problem where
+// FindHandoffBead is called once per agent, each spawning a bd subprocess.
+func (b *Beads) FindAllHandoffBeads() (map[string]*Issue, error) {
+	issues, err := b.List(ListOptions{Status: StatusPinned, Priority: -1})
+	if err != nil {
+		return nil, fmt.Errorf("listing pinned issues: %w", err)
+	}
+
+	result := make(map[string]*Issue)
+	for _, issue := range issues {
+		// Handoff bead titles follow the pattern "<role> Handoff"
+		if strings.HasSuffix(issue.Title, " Handoff") {
+			role := strings.TrimSuffix(issue.Title, " Handoff")
+			result[role] = issue
+		}
+	}
+
+	return result, nil
+}
+
 // GetOrCreateHandoffBead returns the handoff bead for a role, creating it if needed.
 func (b *Beads) GetOrCreateHandoffBead(role string) (*Issue, error) {
 	// Check if it exists
@@ -55,10 +77,9 @@ func (b *Beads) GetOrCreateHandoffBead(role string) (*Issue, error) {
 		return existing, nil
 	}
 
-	// Create new handoff bead (type is deprecated, uses gt:task label via backward compat)
 	issue, err := b.Create(CreateOptions{
 		Title:       HandoffBeadTitle(role),
-		Type:        "task", // Converted to gt:task label by Create()
+		Labels:      []string{"gt:task"},
 		Priority:    2,
 		Description: "", // Empty until first handoff
 		Actor:       role,

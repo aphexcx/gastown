@@ -71,13 +71,18 @@ const (
 	DialogPollTimeout = 8 * time.Second
 
 	// StartupNudgeVerifyDelay is how long to wait after sending a startup nudge
-	// before checking if the agent started working.
+	// before checking if the agent started working. 25s because Claude may
+	// still be processing gt prime output and preparing its first response;
+	// the c2claude wrapper adds extra latency. 5s was consistently too short,
+	// causing false retries that interrupted Claude mid-processing (GH#3031).
 	// Configurable via operational.session.startup_nudge_verify_delay.
-	StartupNudgeVerifyDelay = 5 * time.Second
+	StartupNudgeVerifyDelay = 25 * time.Second
 
 	// StartupNudgeMaxRetries is the maximum number of times to retry a startup nudge.
+	// With the 25s verify delay, 2 retries = 50s total before deferring to
+	// witness zombie patrol. Reduced from 3 to limit interrupt risk (GH#3031).
 	// Configurable via operational.session.startup_nudge_max_retries.
-	StartupNudgeMaxRetries = 3
+	StartupNudgeMaxRetries = 2
 
 	// MinHandoffCooldown is the minimum time between handoffs for the same
 	// component. Prevents tight restart loops when a patrol agent (e.g.,
@@ -87,7 +92,11 @@ const (
 	MinHandoffCooldown = 2 * time.Minute
 
 	// GUPPViolationTimeout is how long an agent can have work on hook without
-	// progressing before it's considered a GUPP violation.
+	// progressing before it's considered a GUPP (Gas Town Universal Propulsion
+	// Principle) violation. GUPP states: if you have work on your hook, you run it.
+	//
+	// Single source of truth — referenced by daemon lifecycle patrol,
+	// TUI feed stuck detection, and web fetcher worker status.
 	// Configurable via operational.session.gupp_violation_timeout.
 	GUPPViolationTimeout = 30 * time.Minute
 
@@ -244,6 +253,9 @@ const (
 
 	// RoleDeacon is the deacon agent role.
 	RoleDeacon = "deacon"
+
+	// RoleBoot is the boot watchdog role (modeled as a deacon dog).
+	RoleBoot = "boot"
 )
 
 // Role emojis - centralized for easy customization.
@@ -266,6 +278,9 @@ const (
 
 	// EmojiPolecat is the polecat emoji (transient worker).
 	EmojiPolecat = "😺"
+
+	// EmojiBoot is the boot watchdog emoji (dog).
+	EmojiBoot = "🐾"
 )
 
 // Molecule formula names for patrol and dog workflows.
@@ -289,6 +304,9 @@ const (
 
 	// MolDogCompactor is the Dolt compactor dog formula name.
 	MolDogCompactor = "mol-dog-compactor"
+
+	// MolDogCheckpoint is the WIP checkpoint dog formula name.
+	MolDogCheckpoint = "mol-dog-checkpoint"
 
 	// MolDogDoctor is the health anomaly tracking dog formula name.
 	MolDogDoctor = "mol-dog-doctor"
@@ -323,6 +341,8 @@ func RoleEmoji(role string) string {
 		return EmojiCrew
 	case RolePolecat:
 		return EmojiPolecat
+	case RoleBoot:
+		return EmojiBoot
 	default:
 		return "❓"
 	}
@@ -330,7 +350,7 @@ func RoleEmoji(role string) string {
 
 // SupportedShells lists shell binaries that Gas Town can detect and work with.
 // Used to identify if a tmux pane is at a shell prompt vs running a command.
-var SupportedShells = []string{"bash", "zsh", "sh", "fish", "tcsh", "ksh"}
+var SupportedShells = []string{"bash", "zsh", "sh", "fish", "tcsh", "ksh", "pwsh", "powershell"}
 
 // Path helpers construct common paths.
 

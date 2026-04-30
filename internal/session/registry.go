@@ -2,6 +2,8 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"regexp"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -120,17 +123,12 @@ func InitRegistry(townRoot string) error {
 	var errs []error
 
 	// Determine the tmux socket name from GT_TMUX_SOCKET env var:
-	//   unset / "default" → shared "default" socket (backward-compatible)
-	//   "auto"            → per-town socket derived from town dir name
-	//                       (required when running multiple towns on one machine,
-	//                       since session names like "mayor" would collide)
-	//   any other value   → use that name as-is
+	//   unset / "default" / "auto" → per-town socket derived from town directory path
+	//   any other value            → use that name as-is
 	socket := os.Getenv("GT_TMUX_SOCKET")
 	switch socket {
-	case "", "default":
-		socket = "default"
-	case "auto":
-		socket = sanitizeTownName(filepath.Base(townRoot))
+	case "", "default", "auto":
+		socket = townSocketName(townRoot)
 	}
 	tmux.SetDefaultSocket(socket)
 
@@ -155,6 +153,34 @@ var sanitizeRe = regexp.MustCompile(`[^a-z0-9-]+`)
 
 // sanitizeTownName cleans a town name to be a valid tmux socket name.
 // Lowercases, replaces non-alphanumeric characters with hyphens, trims hyphens.
+// townSocketName derives a unique tmux socket name from the full town path.
+// Uses the directory basename plus a short hash of the canonical path to ensure
+// uniqueness even when two towns share the same basename (e.g., ~/gt and ~/work/gt).
+// Format: "basename-hash6" (e.g., "gt-a1b2c3").
+func townSocketName(townRoot string) string {
+	base := sanitizeTownName(filepath.Base(townRoot))
+
+	// Resolve symlinks and get absolute path for a canonical representation.
+	canonical, err := filepath.EvalSymlinks(townRoot)
+	if err != nil {
+		canonical, err = filepath.Abs(townRoot)
+		if err != nil {
+			canonical = townRoot
+		}
+	}
+
+	h := sha256.Sum256([]byte(canonical))
+	suffix := hex.EncodeToString(h[:3]) // 6 hex chars = 3 bytes
+	return base + "-" + suffix
+}
+
+// LegacySocketName returns the old-format socket name (basename only, no hash)
+// used before path-based socket derivation was added. Used by gt down to clean
+// up sessions orphaned on the old socket during migration.
+func LegacySocketName(townRoot string) string {
+	return sanitizeTownName(filepath.Base(townRoot))
+}
+
 func sanitizeTownName(name string) string {
 	name = strings.ToLower(name)
 	name = sanitizeRe.ReplaceAllString(name, "-")
@@ -171,11 +197,34 @@ func PrefixFor(rigName string) string {
 	return DefaultRegistry().PrefixForRig(rigName)
 }
 
-// BuildPrefixRegistryFromTown reads rigs.json from a town root directory
-// and returns a populated PrefixRegistry.
+// BuildPrefixRegistryFromTown reads rigs.json and returns a populated PrefixRegistry.
+// Checks mayor/rigs.json first (canonical), then falls back to town-root rigs.json.
+// Warns to stderr if rigs.json is missing entirely — an empty registry causes
+// silent failures in session name parsing (crew cycling, nudge routing, etc.).
 func BuildPrefixRegistryFromTown(townRoot string) (*PrefixRegistry, error) {
+	// Canonical location: inside mayor worktree.
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
-	return BuildPrefixRegistryFromFile(rigsPath)
+	fallbackPath := filepath.Join(townRoot, "rigs.json")
+	if _, err := os.Stat(rigsPath); err == nil {
+		r, err := BuildPrefixRegistryFromFile(rigsPath)
+		if err == nil {
+			// Maintain fallback copy at town root (resilient to git ops in mayor/).
+			copyFileIfNewer(rigsPath, fallbackPath)
+		}
+		return r, err
+	}
+
+	// Fallback: town root (safe from git operations in mayor worktree).
+	if _, err := os.Stat(fallbackPath); err == nil {
+		style.PrintWarning("mayor/rigs.json missing, using fallback %s", fallbackPath)
+		return BuildPrefixRegistryFromFile(fallbackPath)
+	}
+
+	// No rigs.json found anywhere — warn loudly.
+	style.PrintWarning("rigs.json not found (checked mayor/rigs.json and town root). " +
+		"PrefixRegistry is empty — session parsing will fail. " +
+		"Run 'gt doctor' or restore rigs.json.")
+	return NewPrefixRegistry(), nil
 }
 
 // rigsJSON is the minimal structure for reading rigs.json prefix data.
@@ -288,4 +337,27 @@ func (r *PrefixRegistry) sortedPrefixes() []string {
 		return len(prefixes[i]) > len(prefixes[j])
 	})
 	return prefixes
+}
+
+// copyFileIfNewer copies src to dst if src is newer or dst doesn't exist.
+// Errors are silently ignored — this is a best-effort resilience mechanism.
+func copyFileIfNewer(src, dst string) {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return
+	}
+	if dstInfo, err := os.Stat(dst); err == nil {
+		if !srcInfo.ModTime().After(dstInfo.ModTime()) {
+			return // dst is up to date
+		}
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, dst)
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -104,9 +105,8 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	}
 
 	// Resolve the correct beads directory using prefix-based routing.
-	// This matches how updateAgentHookBead resolves the directory when setting
-	// the hook (via beads.ResolveHookDir). Town-level agents (mayor, deacon)
-	// fall back to townRoot since their beads use hq- prefix stored at town level.
+	// Town-level agents (mayor, deacon) fall back to townRoot since their
+	// beads use hq- prefix stored at town level.
 	rigName := strings.Split(agentID, "/")[0]
 	var fallbackPath string
 	if rigName == "mayor" || rigName == "deacon" {
@@ -118,36 +118,17 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 
 	b := beads.New(beadsPath)
 
-	// Get the agent bead to find current hook.
-	// The agent bead may not exist (e.g., crew members whose agent beads haven't
-	// been created yet). This is NOT a fatal error - we fall back to querying
-	// for hooked beads by status.
-	var agentBead *beads.Issue
-	agentBead, err = b.Show(agentBeadID)
-	if err != nil {
-		// Agent bead not found - this is OK, we'll fall back to status query
-		agentBead = nil
-	}
-
-	// Check if agent has work hooked (via hook_bead field on agent bead)
+	// Find hooked bead by querying status+assignee directly (hq-l6mm5).
+	// The work bead itself is the authoritative source — no need to read
+	// the agent bead's hook_bead slot.
 	hookedBeadID := ""
-	if agentBead != nil {
-		hookedBeadID = agentBead.HookBead
-	}
-
-	// Fallback: if hook_bead is empty (cleared or agent bead missing), query for
-	// beads that still have status=hooked assigned to this agent. This catches
-	// stale hooked beads where hook_bead was cleared but bead status wasn't reset.
-	// This matches the fallback behavior in runMoleculeStatus.
-	if hookedBeadID == "" {
-		hookedBeads, listErr := b.List(beads.ListOptions{
-			Status:   beads.StatusHooked,
-			Assignee: agentID,
-			Priority: -1,
-		})
-		if listErr == nil && len(hookedBeads) > 0 {
-			hookedBeadID = hookedBeads[0].ID
-		}
+	hookedBeads, listErr := b.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: agentID,
+		Priority: -1,
+	})
+	if listErr == nil && len(hookedBeads) > 0 {
+		hookedBeadID = hookedBeads[0].ID
 	}
 
 	// Town-level fallback: rig-level agents (polecats, crew) may have hooked
@@ -230,18 +211,11 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	}
 
 	if dryRun {
-		fmt.Printf("Would clear hook_bead from agent bead %s\n", agentBeadID)
+		fmt.Printf("Would unsling hooked bead from %s\n", agentID)
 		return nil
 	}
 
-	// Clear the hook from agent bead if it exists (gt-zecmc: removed agent_state update)
-	if agentBead != nil {
-		if err := b.ClearHookBead(agentBeadID); err != nil {
-			// Non-fatal: the hook_bead field may already be cleared.
-			// The bead status update below is the more important cleanup.
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: couldn't clear hook from agent bead %s: %v\n", agentBeadID, err)
-		}
-	}
+	// No ClearHookBead call needed — agent bead hook slot is no longer maintained (hq-l6mm5).
 
 	// Update hooked bead status from "hooked" back to "open".
 	// Previously, only the agent's hook slot was cleared but the bead itself stayed
@@ -263,6 +237,20 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 
 	// Log unhook event
 	_ = events.LogFeed(events.TypeUnhook, agentID, events.UnhookPayload(hookedBeadID))
+
+	// Emit a propulsion signal if the target is the mayor.
+	// This allows the ACP propeller to react to hook changes event-driven.
+	if agentID == "mayor/" {
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			session := "hq-mayor"
+			message := fmt.Sprintf("Hook updated: cleared bead %s", hookedBeadID)
+			_ = nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+				Sender:   "unsling",
+				Message:  message,
+				Priority: nudge.PriorityNormal,
+			})
+		}
+	}
 
 	fmt.Printf("%s Work removed from hook\n", style.Bold.Render("✓"))
 	fmt.Printf("  Agent %s hook cleared (was: %s)\n", agentID, hookedBeadID)
