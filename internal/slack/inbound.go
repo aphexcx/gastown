@@ -85,13 +85,15 @@ type InboundHandler struct {
 	// wires this to client.SetAssistantStatus.
 	SetThreadStatus func(chatID, threadTS, status string)
 
-	// CanAccessConversation returns true if the bot is a formal member of
-	// the given chat (can call conversations.info on it). Used as a
+	// CanAccessConversation returns (allowed, reason) for the given chat.
+	// allowed is true if the bot is a formal member (conversations.info
+	// returns success). reason is a short tag for log lines, e.g.
+	// "ok"/"cached_ok"/"channel_not_found"/"api_error: ...". Used as a
 	// membership gate to prevent routing of events the bot receives from
 	// DMs it shouldn't have visibility into — a privacy issue discovered
 	// when Slack's Agent/Assistant mode delivered events from unrelated
 	// user↔user DMs. If nil, membership is not checked (backward compat).
-	CanAccessConversation func(chatID string) bool
+	CanAccessConversation func(chatID string) (bool, string)
 
 	// DownloadAttachment is called once per file the handler decides to
 	// fetch eagerly. The daemon wires this to DownloadInboundAttachment
@@ -135,12 +137,14 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 	// which would leak private conversations. Drop if the bot can't see
 	// the conversation via conversations.info. Channels are protected by
 	// the explicit opt-in list (step 3), so we skip this roundtrip there.
-	if msg.Kind == ConversationDM && h.CanAccessConversation != nil &&
-		!h.CanAccessConversation(msg.ChatID) {
-		fmt.Fprintf(os.Stderr,
-			"slack: DROPPED DM event for %s — bot is not a member (privacy gate)\n",
-			msg.ChatID)
-		return
+	if msg.Kind == ConversationDM && h.CanAccessConversation != nil {
+		allowed, reason := h.CanAccessConversation(msg.ChatID)
+		if !allowed {
+			fmt.Fprintf(os.Stderr,
+				"slack: DROPPED DM event for %s — privacy gate (reason=%s)\n",
+				msg.ChatID, reason)
+			return
+		}
 	}
 
 	// 3. Conversation gate.

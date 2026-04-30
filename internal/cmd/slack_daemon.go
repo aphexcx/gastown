@@ -3,11 +3,13 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -92,8 +94,8 @@ func runSlackDaemonForeground(cmd *cobra.Command, _ []string) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
-		<-sigCh
-		fmt.Fprintln(cmd.OutOrStderr(), "slack: shutdown signal received")
+		sig := <-sigCh
+		logShutdownForensics(cmd.OutOrStderr(), sig)
 		cancel()
 	}()
 
@@ -197,6 +199,53 @@ func runSlackStop(cmd *cobra.Command, _ []string) error {
 	_ = proc.Signal(syscall.SIGKILL)
 	_ = slack.RemovePIDFile(pidPath)
 	return nil
+}
+
+// logShutdownForensics captures evidence about who/what asked the daemon to
+// stop. The cycling-SIGTERM bug (mayor 2026-04-30) was diagnosed blind because
+// the signal handler only logged "shutdown signal received" with no source
+// info. We now record:
+//   - timestamp + signal name
+//   - our pid + parent pid (launchd/1 means we were orphaned long ago)
+//   - a ps snapshot of current `gt slack stop|kill` invocations, to catch
+//     the sender if they're still alive
+func logShutdownForensics(w io.Writer, sig os.Signal) {
+	ppid := os.Getppid()
+	fmt.Fprintf(w, "slack: shutdown signal received sig=%v pid=%d ppid=%d t=%s\n",
+		sig, os.Getpid(), ppid, time.Now().Format(time.RFC3339Nano))
+
+	// Best-effort ppid identity. On macOS ppid==1 is launchd, meaning the
+	// original `gt slack start` parent exited long ago — expected after
+	// daemonization, not a smoking gun on its own.
+	if out, err := exec.Command("ps", "-o", "pid,user,command", "-p",
+		fmt.Sprint(ppid)).Output(); err == nil {
+		fmt.Fprintf(w, "slack: shutdown ppid info:\n%s", out)
+	}
+
+	// Snapshot any currently-running `gt slack stop`, `kill <pid>`, or `pkill`
+	// processes. The sender of a SIGTERM usually exits within milliseconds, so
+	// this is racy — but when it works it's the smoking gun.
+	out, err := exec.Command("ps", "-axo", "pid,ppid,start,command").Output()
+	if err != nil {
+		return
+	}
+	myPID := fmt.Sprint(os.Getpid())
+	flags := []string{"gt slack stop", "pkill", "killall", "slack daemon"}
+	for _, line := range strings.Split(string(out), "\n") {
+		flagged := false
+		for _, f := range flags {
+			if strings.Contains(line, f) {
+				flagged = true
+				break
+			}
+		}
+		if !flagged && strings.Contains(line, "kill") && strings.Contains(line, myPID) {
+			flagged = true
+		}
+		if flagged {
+			fmt.Fprintf(w, "slack: shutdown nearby proc: %s\n", line)
+		}
+	}
 }
 
 // ---- status ----

@@ -531,9 +531,9 @@ func LoadStatusSnapshot(path string) (*StatusSnapshot, error) {
 // quickly. On API errors we fail closed — returning no-access — but do not
 // cache the failure, so the next event retries.
 type membershipCache struct {
-	client     *Client
-	mu         sync.Mutex
-	entries    map[string]membershipEntry
+	client      *Client
+	mu          sync.Mutex
+	entries     map[string]membershipEntry
 	positiveTTL time.Duration
 	negativeTTL time.Duration
 }
@@ -552,11 +552,18 @@ func newMembershipCache(c *Client) *membershipCache {
 	}
 }
 
-func (m *membershipCache) check(chatID string) bool {
+// check returns whether the bot can access chatID and a human-readable reason
+// for the result. The reason is meant for log lines so operators can tell
+// "Slack confirmed not_a_member" from "API error, failing closed" without
+// digging into stderr context.
+func (m *membershipCache) check(chatID string) (bool, string) {
 	m.mu.Lock()
 	if e, ok := m.entries[chatID]; ok && time.Now().Before(e.expiry) {
 		m.mu.Unlock()
-		return e.ok
+		if e.ok {
+			return true, "cached_ok"
+		}
+		return false, "cached_not_a_member"
 	}
 	m.mu.Unlock()
 
@@ -567,15 +574,17 @@ func (m *membershipCache) check(chatID string) bool {
 		fmt.Fprintf(os.Stderr,
 			"slack: membership check failed for %s (failing closed, not caching): %v\n",
 			chatID, err)
-		return false
+		return false, fmt.Sprintf("api_error: %v", err)
 	}
 
 	ttl := m.positiveTTL
+	reason := "ok"
 	if !allowed {
 		ttl = m.negativeTTL
+		reason = "channel_not_found"
 	}
 	m.mu.Lock()
 	m.entries[chatID] = membershipEntry{ok: allowed, expiry: time.Now().Add(ttl)}
 	m.mu.Unlock()
-	return allowed
+	return allowed, reason
 }
