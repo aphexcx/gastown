@@ -13,13 +13,70 @@ import (
 	"testing"
 )
 
-// withChannelsEnabled swaps slackChannelsEnabledFromHome for a stub that
-// returns the given value, restoring the original on test cleanup.
+// withChannelsEnabled swaps slackChannelsLookup for a stub that returns
+// (enabled, devMode=false), restoring the original on test cleanup.
 func withChannelsEnabled(t *testing.T, enabled bool) {
 	t.Helper()
-	prev := slackChannelsEnabledFromHome
+	withChannelsLookup(t, enabled, false)
+}
+
+// withChannelsLookup swaps slackChannelsLookup for a stub returning the
+// given (enabled, devMode), restoring the original on test cleanup.
+func withChannelsLookup(t *testing.T, enabled, devMode bool) {
+	t.Helper()
+	prevLookup := slackChannelsLookup
+	prevHome := slackChannelsEnabledFromHome
+	slackChannelsLookup = func() (bool, bool) { return enabled, devMode }
 	slackChannelsEnabledFromHome = func() bool { return enabled }
-	t.Cleanup(func() { slackChannelsEnabledFromHome = prev })
+	t.Cleanup(func() {
+		slackChannelsLookup = prevLookup
+		slackChannelsEnabledFromHome = prevHome
+	})
+}
+
+func TestMaybeInjectClaudeChannels_DevModeUsesDangerouslyLoadFlag(t *testing.T) {
+	withChannelsLookup(t, true, true)
+	rc := &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--model", "sonnet[1m]"},
+	}
+	maybeInjectClaudeChannels(rc)
+	want := []string{"--model", "sonnet[1m]", "--dangerously-load-development-channels", "plugin:gt-slack@gastown"}
+	if len(rc.Args) != len(want) {
+		t.Fatalf("Args = %v, want %v", rc.Args, want)
+	}
+	for i := range want {
+		if rc.Args[i] != want[i] {
+			t.Fatalf("Args[%d] = %q, want %q", i, rc.Args[i], want[i])
+		}
+	}
+}
+
+func TestMaybeInjectClaudeChannels_DevModeIdempotent(t *testing.T) {
+	withChannelsLookup(t, true, true)
+	rc := &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--dangerously-load-development-channels", "plugin:gt-slack@gastown"},
+	}
+	maybeInjectClaudeChannels(rc)
+	if len(rc.Args) != 2 {
+		t.Fatalf("Args = %v, want unchanged (idempotent)", rc.Args)
+	}
+}
+
+func TestSlackChannelsLookupFromPath_ReadsDevMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "slack.json")
+	if err := os.WriteFile(path, []byte(`{"channels_enabled":true,"channels_dev_mode":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	enabled, devMode := slackChannelsLookupFromPath(path)
+	if !enabled {
+		t.Error("expected enabled=true")
+	}
+	if !devMode {
+		t.Error("expected devMode=true")
+	}
 }
 
 func TestMaybeInjectClaudeChannels_ClaudeAndEnabled(t *testing.T) {
