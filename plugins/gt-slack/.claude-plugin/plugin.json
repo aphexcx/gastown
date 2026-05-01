@@ -1,0 +1,6 @@
+{
+  "name": "gt-slack",
+  "description": "Gas Town Slack channel for Claude Code agents — receive routed Slack DMs/mentions as channel notifications and reply via MCP tools.",
+  "version": "0.1.0",
+  "keywords": ["gastown", "slack", "channel", "mcp"]
+}
