@@ -135,19 +135,38 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 		},
 		EnqueueNudge: func(address, body string) error {
 			// Resolve address → session name, then file-enqueue. The nudge
-			// drains via either the agent's Claude Code UserPromptSubmit
-			// hook (when the user types) or a background nudge-poller for
-			// that session.
+			// drains via the agent's Claude Code UserPromptSubmit hook on
+			// next user-typed turn — which never fires for an idle agent
+			// who isn't being typed at. So we ALSO ensure a nudge-poller is
+			// running for this session: it drains the queue + injects via
+			// tmux send-keys when the agent is idle, providing a path
+			// for inbound Slack DMs to reach idle Claude agents
+			// without waiting on an unrelated keystroke. (gt-zei3e)
+			//
+			// StartPoller is idempotent — it no-ops if a poller is already
+			// alive for this session.
 			sessionName, err := ResolveAddressToSession(address)
 			if err != nil {
 				return fmt.Errorf("resolve address %s: %w", address, err)
 			}
-			return nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
+			if err := nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
 				Sender:   "slack",
 				Message:  body,
 				Kind:     "slack",
 				Priority: nudge.PriorityUrgent,
-			})
+			}); err != nil {
+				return err
+			}
+			if _, perr := nudge.StartPoller(opts.TownRoot, sessionName); perr != nil {
+				fmt.Fprintf(os.Stderr,
+					"slack: enqueued for %s but failed to start poller "+
+						"(message will deliver on next keystroke): %v\n",
+					sessionName, perr)
+			}
+			fmt.Fprintf(os.Stderr,
+				"slack: enqueued nudge for %s (sender %s)\n",
+				sessionName, address)
+			return nil
 		},
 		ResolveSession: ResolveAddressToSession,
 		CheckSession:   tm.HasSession,
