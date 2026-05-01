@@ -487,7 +487,26 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 			} else {
 				cmd = "env -u CLAUDECODE NODE_OPTIONS='' " + cmd
 			}
-			return cmd
+			// Inline AgentEnv into the command, mirroring the polecat/crew
+			// paths below. Without this, daemon-restarted roles with custom
+			// Claude start_commands launch without BEADS_DOLT_PORT, GT_ROLE,
+			// GT_RIG, etc. propagated to subprocesses (gt-neycp followup).
+			// `env -u CLAUDECODE NODE_OPTIONS='' ...` inherits exported vars
+			// from the parent shell, so PrependEnv's "export K=V && exec env ..."
+			// shape is correct: env(1) does not wipe the environment.
+			var sessionIDEnv string
+			if rc != nil && rc.Session != nil {
+				sessionIDEnv = rc.Session.SessionIDEnv
+			}
+			envVars := config.AgentEnv(config.AgentEnvConfig{
+				Role:         parsed.RoleType,
+				Rig:          parsed.RigName,
+				AgentName:    parsed.AgentName,
+				TownRoot:     d.config.TownRoot,
+				SessionIDEnv: sessionIDEnv,
+			})
+			config.SanitizeAgentEnv(envVars, map[string]string{})
+			return config.PrependEnv(cmd, envVars)
 		}
 		// Claude agent with built-in start_command: fall through to
 		// BuildStartupCommandFromConfig for proper model flag resolution.

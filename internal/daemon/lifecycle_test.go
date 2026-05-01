@@ -574,3 +574,86 @@ func TestGetStartCommand_ClaudeAgentFallsThrough(t *testing.T) {
 		t.Errorf("getStartCommand returned literal TOML start_command verbatim — beacon injection was skipped: %q", startCmd)
 	}
 }
+
+// TestGetStartCommand_CustomClaudeStartCommandPrependsAgentEnv is the
+// regression for the gt-neycp follow-up (gt-5dqo7): when role TOML defines a
+// custom (non-builtin) Claude start_command, the command returned must have
+// AgentEnv prepended via export-style PrependEnv so daemon-restarted agents
+// propagate identity and Dolt env to bd subprocesses.
+//
+// Before this fix, the custom-Claude branch in getStartCommand returned the
+// expanded TOML pattern with the env-cleaning prefix injected but no AgentEnv
+// exports — the polecat/crew paths below had it, this branch silently didn't.
+// Subprocesses launched by the Claude pane (e.g. bd) ran without GT_ROLE /
+// GT_RIG / BEADS_DOLT_PORT.
+func TestGetStartCommand_CustomClaudeStartCommandPrependsAgentEnv(t *testing.T) {
+	townRoot := t.TempDir()
+
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	settingsJSON, err := json.Marshal(townSettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), settingsJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	// Custom (non-builtin) Claude start_command — anything that is NOT
+	// "exec claude --dangerously-skip-permissions" exercises this branch.
+	roleConfig := &beads.RoleConfig{
+		StartCommand: "exec claude --resume --dangerously-skip-permissions",
+	}
+	parsed := &ParsedIdentity{
+		RoleType:  "polecat",
+		RigName:   "myrig",
+		AgentName: "nux",
+	}
+
+	startCmd := d.getStartCommand(roleConfig, parsed)
+
+	// PrependEnv emits "export K=V ... && exec ..." on POSIX; the export
+	// prefix is the cheap canary that env injection ran at all.
+	if !strings.HasPrefix(startCmd, "export ") {
+		t.Fatalf("getStartCommand should prepend export-style env injection on custom Claude start_command, got: %q", startCmd)
+	}
+
+	// Identity vars from AgentEnv must appear so bd subprocesses see them.
+	// Values are shell-quoted; check key=value substrings, not exact matches.
+	wantSubstrings := []string{
+		"GT_ROLE=",
+		"GT_RIG=myrig",
+		"GT_POLECAT=nux",
+		"BD_ACTOR=",
+	}
+	for _, s := range wantSubstrings {
+		if !strings.Contains(startCmd, s) {
+			t.Errorf("getStartCommand should include %q in custom Claude start_command, got: %q", s, startCmd)
+		}
+	}
+
+	// The TOML pattern's command body must still be present after the
+	// env-cleaning prefix. We don't pin the exact string because future
+	// env-sanitization changes are allowed; we just verify the user's
+	// command body survived.
+	if !strings.Contains(startCmd, "claude --resume") {
+		t.Errorf("getStartCommand should preserve the custom start_command body, got: %q", startCmd)
+	}
+
+	// CLAUDECODE clearing (the existing behavior on this branch) must still apply.
+	if !strings.Contains(startCmd, "env -u CLAUDECODE") {
+		t.Errorf("getStartCommand should retain `env -u CLAUDECODE` on custom Claude start_command, got: %q", startCmd)
+	}
+}
