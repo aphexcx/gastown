@@ -188,12 +188,6 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 			continue
 		}
 		if err := json.Unmarshal(stdout, &msgs); err != nil {
-<<<<<<< HEAD
-			if len(stdout) == 0 || string(stdout) == "null" || !isJSON(stdout) {
-				continue
-			}
-=======
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 			return nil, err
 		}
 
@@ -237,12 +231,6 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 			continue
 		}
 		if err := json.Unmarshal(stdout, &msgs); err != nil {
-<<<<<<< HEAD
-			if len(stdout) == 0 || string(stdout) == "null" || !isJSON(stdout) {
-				continue
-			}
-=======
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 			continue // Non-fatal for CC
 		}
 

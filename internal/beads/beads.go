@@ -31,23 +31,6 @@ var (
 )
 
 // bdAllowStale caches whether the installed bd supports --allow-stale.
-<<<<<<< HEAD
-// Detected once at first use via `bd --allow-stale version`.
-var (
-	bdAllowStaleOnce   sync.Once
-	bdAllowStaleResult bool
-)
-
-// BdSupportsAllowStale returns true if the installed bd binary accepts --allow-stale.
-func BdSupportsAllowStale() bool {
-	bdAllowStaleOnce.Do(func() {
-		cmd := exec.Command("bd", "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
-		if err := cmd.Run(); err == nil {
-			bdAllowStaleResult = true
-		}
-	})
-	return bdAllowStaleResult
-=======
 // The cache is keyed by the resolved bd path so tests and subprocess stubs that
 // replace bd on PATH get re-probed instead of reusing stale capability state.
 var (
@@ -108,7 +91,6 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	result := bdAllowStaleResult
 	bdAllowStaleMu.Unlock()
 	return result
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 }
 
 // MaybePrependAllowStale prepends --allow-stale to args if bd supports it.
@@ -120,8 +102,6 @@ func MaybePrependAllowStale(args []string) []string {
 	return args
 }
 
-<<<<<<< HEAD
-=======
 // MaybePrependAllowStaleWithEnv prepends --allow-stale to args if bd supports it,
 // probing with the provided environment when supplied.
 func MaybePrependAllowStaleWithEnv(env []string, args []string) []string {
@@ -156,7 +136,6 @@ func InjectFlatForListJSON(args []string) []string {
 	return args
 }
 
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 // ExtractIssueID strips the external:prefix:id wrapper from bead IDs.
 // bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for display and lookups.
@@ -437,17 +416,11 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-<<<<<<< HEAD
-	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
-	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
-	fullArgs := MaybePrependAllowStale(args)
-=======
 	// bd v0.59+ requires --flat for --json to produce JSON output on "list" commands.
 	// Without --flat, bd list --json silently returns human-readable tree format,
 	// causing all JSON parsing to fail. Inject --flat before --allow-stale prepend
 	// (which changes args[0] from "list" to "--allow-stale").
 	args = InjectFlatForListJSON(args)
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
@@ -520,12 +493,8 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-<<<<<<< HEAD
-	fullArgs := MaybePrependAllowStale(args)
-=======
 	runEnv := b.buildRoutingEnv()
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
@@ -826,8 +795,6 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	return issues, nil
 }
 
-<<<<<<< HEAD
-=======
 // listEphemeral searches the wisps table using "bd query" with ephemeral=true.
 // This is necessary because "bd list" only searches the issues table and does
 // not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
@@ -906,7 +873,6 @@ func stripStdoutWarnings(data []byte) []byte {
 	return bytes.Join(cleaned, []byte("\n"))
 }
 
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 // isJSONBytes returns true if the byte slice starts with [ or { (after whitespace).
 // bd list --json may return plain text like "No issues found." instead of JSON
 // when there are no results.
@@ -924,8 +890,6 @@ func isJSONBytes(b []byte) bool {
 	return false
 }
 
-<<<<<<< HEAD
-=======
 // ListMergeRequests returns merge-request beads from both the issues table
 // and the wisps table. MRs are created as ephemeral (wisps) by gt mq submit,
 // but bd list only queries the issues table. This method queries the wisps
@@ -1011,7 +975,6 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 	return issueResults, nil
 }
 
->>>>>>> b1dc37c75dbd0404e81e024385d77115b908eafe
 // ListByAssignee returns all issues assigned to a specific assignee.
 // The assignee is typically in the format "rig/polecats/polecatName" (e.g., "gastown/polecats/Toast").
 func (b *Beads) ListByAssignee(assignee string) ([]*Issue, error) {
