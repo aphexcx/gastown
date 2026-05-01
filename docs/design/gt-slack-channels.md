@@ -16,6 +16,11 @@ Replace the tmux-send-keys / file-queue / nudge-poller delivery path for inbound
 - Removing `gt slack reply`. It stays as the permanent CLI for non-Claude agents and as a fallback.
 - Marketplace publishing of the plugin (in-repo only for now).
 - Multi-token / multi-bot / per-rig Slack instance support.
+- A new Slack-side authorization/access layer. The existing daemon-level privacy gate (`CanAccessConversation` + owner gate + conversation gate) remains the single source of access control. The plugin must not grow its own.
+- Network-filesystem support for `slack_inbox/`. flock semantics are assumed to be local POSIX. Sharing `~/gt/.runtime/` over NFS/SMB is out of scope.
+- Implementing `notifications/claude/channel/permission` (the permission-prompt mechanism Telegram exposes). The privacy gate already handles access decisions before any inbox write; per-message permission prompts are not part of this design.
+- v1 tools: only `reply`. `react` and `edit_message` are deferred — referenced in the design for completeness but explicitly out of scope for the first implementation pass. Add later if Gas Town's use case demands them.
+- Eager attachment download for the channels path. v1 carries attachment metadata in the inbox event but does not download files. The `DownloadInboundAttachment` path used by `gt slack reply` today still works for the legacy nudge_queue path; channels-side download parity is a follow-up.
 
 ## Why
 
@@ -87,16 +92,23 @@ New Go subcommand. Lifetime: one process per Claude Code session, launched by Cl
 
 Responsibilities:
 
-- **Startup**: open and `flock(LOCK_EX)` `<townRoot>/.runtime/slack_inbox/<safe-session>/.subscribed`. Hold the lock for the process's lifetime.
-- **Replay**: read all existing `*.json` files in `slack_inbox/<safe-session>/`, sorted by filename (FIFO via `<unixnano>-<random>.json`), emit `notifications/claude/channel` for each, delete the file.
-- **Steady state**: fsnotify-watch the inbox dir; on each new `*.json` file, emit notification, delete.
+- **Startup**:
+  1. Open and `flock(LOCK_EX)` `<townRoot>/.runtime/slack_inbox/<safe-session>/.subscribed`. Hold the lock for the process's lifetime. The lock fd is opened with `O_CLOEXEC` (or set `FD_CLOEXEC` after open) to prevent unintended fd inheritance by any child process the plugin might fork.
+  2. Start the fsnotify watch on the inbox directory **before** the replay scan. This eliminates the "gap" where files written between replay and watch-start could be missed. fsnotify events that fire for files the replay scan also picks up are deduplicated by the rename-then-process pattern (see below).
+  3. Replay: read all existing `*.json` files in the inbox dir, sorted by filename (FIFO via `<unixnano>-<random>.json`), and process each as a normal event.
+- **Per-event processing** (atomic, used by both replay and steady-state):
+  1. Atomically rename `slack_inbox/<sess>/<name>.json` → `<name>.claimed.<rand>` (same pattern `nudge.Drain` uses). If rename fails with ENOENT, another claim won — skip.
+  2. Read + parse the claimed file.
+  3. Emit `notifications/claude/channel` via the MCP transport, await success.
+  4. **Only on notification success**: delete the claimed file. On error, `os.Rename` it back to `.json` so a subsequent attempt can retry. Log the error to stderr.
 - **MCP tools** exposed to the Claude session:
-  - `reply(chat_id, text, thread_ts?)` — writes the JSON shape `gt slack reply` produces, into `slack_outbox/`.
-  - `react(chat_id, message_ts, emoji)` — same path. (Out of scope for v1 if `reply` alone is sufficient.)
-  - `edit_message(chat_id, message_ts, text)` — same path.
+  - `reply(chat_id, text, thread_ts?)` — v1. Writes the JSON shape `gt slack reply` produces, into `slack_outbox/`.
+  - `react`, `edit_message` — explicitly out of scope for v1; add in a follow-up.
 - **Shutdown**: SIGTERM → release flock → exit. The kernel auto-releases the lock on any other death.
 
 Robustness: panic recovery wrapped around every fsnotify event handler and tool handler. The plugin should run for the full lifetime of the Claude Code session under normal conditions.
+
+**Size estimate**: ~250–350 LOC (revised from earlier 150-LOC estimate after cross-referencing the Telegram plugin's comparable surface area).
 
 ### Plugin definition — `gastown/crew/cog/plugins/gt-slack/` (new)
 
@@ -130,17 +142,20 @@ Where `cfg.SlackChannelsEnabled` is derived from `slack.json`'s new `channels_en
   "chat_id": "D0AT8DU4R08",
   "kind": "dm",
   "message_ts": "1714510123.000200",
+  "ts_iso": "2026-04-30T14:48:43.000200Z",
   "thread_ts": "",
   "text": "hey mayor, can you check the deploy status?",
   "sender_user_id": "U0AN32RPBFT",
   "sender_label": "afik_cohen",
   "channel_name": "",
   "bot_mentioned": false,
-  "attachments": [
-    { "name": "screenshot.png", "path": "/Users/.../slack_inbox_files/...", "mime_type": "image/png", "size": 12345 }
-  ]
+  "attachments_summary": "1 file: screenshot.png (image/png, 12 KB)"
 }
 ```
+
+The `ts_iso` field is a human-readable mirror of `message_ts` so the rendered `<channel>` tag has a useful timestamp even if Slack's float TS is opaque.
+
+**Attachments**: in v1, the inbox JSON carries a flat string summary (`attachments_summary`) rather than a nested array, because Telegram's MCP `meta` consumer (the closest reference for what Claude renders) uses flat scalar fields. If Spike 1 confirms Claude's `meta` handler accepts arrays/objects cleanly, we can lift `attachments_summary` to a structured field in a follow-up. For v1 the assistant gets enough info to know "there's a screenshot attached" but cannot `Read` the file; that capability is part of the deferred attachment-parity follow-up.
 
 **Outbox reply** — `slack_outbox/<ts>.json`. Existing schema, unchanged. The plugin's `reply` tool writes the same JSON `gt slack reply` writes today.
 
@@ -219,9 +234,14 @@ If two `gt slack channel-server` processes start simultaneously for the same ses
 
 The plugin reads + drains existing files BEFORE starting fsnotify, in FIFO order. This handles the "predecessor died before consuming" scenario raised during the gt-zei3e investigation. Bounded by daemon-side TTL — daemon should optionally sweep `slack_inbox/<sess>/` for very old files (>2h) the same way `nudge_queue` Drain handles expiry.
 
-### Subscription beacon staleness — none
+### Subscription beacon staleness — none, given assumptions
 
-Because we use flock instead of PID files or heartbeats, there is no staleness window. The only state that can go wrong is a `.subscribed` file existing but unlocked — which is the correct "no plugin alive" signal. The daemon never has to "clean up" or "verify" beacons.
+Because we use flock instead of PID files or heartbeats, there is no staleness window — provided two cooperative assumptions hold:
+
+1. **Local POSIX filesystem.** flock is advisory and reliable on local POSIX FS (APFS, ext4, etc.). On NFS / SMB / FUSE filesystems, semantics may degrade. `~/gt/.runtime/` must live on a local disk. Documented in non-goals.
+2. **No fd inheritance.** The lock fd must not leak into a long-lived child process the plugin spawns, or the kernel will hold the lock until that child exits. `O_CLOEXEC` (or `FD_CLOEXEC` set immediately after open) ensures any subprocess the plugin runs (today: none) doesn't inadvertently extend the lock's lifetime.
+
+Given those, the only state that can go wrong is a `.subscribed` file existing but unlocked — which is the correct "no plugin alive" signal. The daemon never has to "clean up" or "verify" beacons.
 
 ### Mid-event daemon restart
 
@@ -247,12 +267,24 @@ Layered defense:
 
 Run before any meaningful implementation work. <1 hour each.
 
-### Spike 1: Go MCP support for `notifications/claude/channel`
+### Spike 1: Go MCP + plugin resolution + meta nesting
 
-- Hypothesis: a Go MCP library supports custom notification methods.
-- Test: minimal `gt slack channel-server` stub, launch via `claude --channels plugin:gt-slack@gastown`, send one fake notification, confirm Claude injects the `<channel>` tag.
-- Outcome A: works → Go subcommand as planned.
-- Outcome B: doesn't work → either write minimal MCP wire-protocol code by hand (~200 LOC), or pivot to a Bun/TS plugin (Telegram pattern).
+Three things to verify in one pass — a working stub answers all three.
+
+- Hypothesis A: a Go MCP library supports custom notification methods.
+- Hypothesis B: Claude Code resolves `plugin:gt-slack@gastown` from a local marketplace registered via `/plugin add-marketplace path/to/gastown/crew/cog/plugins/`.
+- Hypothesis C: Claude Code's `notifications/claude/channel` `meta` field renders nested arrays/objects (e.g., `attachments`) cleanly in the `<channel>` tag, OR confirms we should keep meta flat as the design currently specifies.
+
+Test: minimal `gt slack channel-server` stub. Build a plugin definition under `plugins/gt-slack/`. Launch `claude --channels plugin:gt-slack@gastown` after registering the local marketplace. Have the stub emit one notification with both flat fields and one nested array. Confirm:
+- Claude resolves the plugin without error (Hypothesis B).
+- The notification reaches the assistant context as a `<channel>` tag (Hypothesis A).
+- Inspect how meta nesting renders, decide on schema (Hypothesis C).
+
+Outcomes:
+- A fail → either patch the upstream Go MCP lib, write minimal MCP wire-protocol code by hand (~200 LOC, well-specified), or pivot to a Bun/TS plugin (Telegram pattern).
+- B fail → research alternative resolution (env var pointing at plugin dir, or absolute path in `--channels`), or publish the plugin to a marketplace.
+- C says "nested works fine" → consider lifting `attachments_summary` to structured `attachments` array.
+- C says "nested loses fidelity" → schema as designed is correct.
 
 ### Spike 2: Claude Code MCP supervision behavior
 
@@ -263,12 +295,12 @@ Run before any meaningful implementation work. <1 hour each.
 
 ## Build sequence
 
-1. Spikes resolved.
-2. Implement `gt slack channel-server` (per-session MCP plugin: flock, fsnotify, MCP notification emit, reply/react/edit_message tools).
-3. Implement daemon-side dispatch change in `EnqueueNudge` (flock check → either inbox or nudge_queue).
-4. Add `gastown/crew/cog/plugins/gt-slack/` plugin definition.
+1. **Spike 1** — minimal stub, plugin definition under `plugins/gt-slack/`, register local marketplace, launch with `--channels`, verify notification + meta rendering. Plugin definition gets written here, not in a later step, so the daemon dispatch change in step 3 already has a real referent.
+2. **Spike 2** — kill the stub plugin PID, observe whether Claude relaunches it. Decide whether to add a `channel-supervisor` wrapper.
+3. Implement `gt slack channel-server` proper: flock + O_CLOEXEC, fsnotify-then-replay, atomic claim/process/delete, MCP notification emission with delete-on-success semantics, `reply` MCP tool.
+4. Implement daemon-side dispatch change in `EnqueueNudge`: flock check → either `slack_inbox/<sess>/<ts>.json` or legacy `nudge.Enqueue + StartPoller`.
 5. Modify gt's session-spawn helper to auto-add `--channels plugin:gt-slack@gastown` for Claude agents when `channels_enabled: true`.
-6. End-to-end test: restart mayor's session with the new flag, DM the bot, verify the channel notification path. Use `reply` MCP tool to round-trip.
+6. End-to-end test: restart mayor's session with the new flag, DM the bot, verify the channel notification path. Use `reply` MCP tool to round-trip a response.
 7. Restart all Claude agents to pick up the new path.
 
 ## Testing
@@ -287,9 +319,7 @@ Run before any meaningful implementation work. <1 hour each.
 
 ## Open questions
 
-These are unresolved but not blocking — flag during implementation.
+Items previously listed as open are now resolved in the spec or moved to Spike 1 acceptance criteria. Remaining genuinely-open:
 
-1. **MCP marketplace mechanism for in-repo plugins.** How does Claude Code resolve `plugin:gt-slack@gastown`? Verify the local-marketplace add-marketplace flow during Spike 1.
-2. **`react` and `edit_message` priority.** Telegram has all three; for Gas Town's use case (mostly DMs from one human, replies from one agent), `reply` alone might be sufficient for v1. Defer if unclear.
-3. **Attachment handling parity.** Current daemon downloads small attachments and includes paths in the nudge body. The channel notification's `meta` dict should carry the same paths so the assistant can `Read` them. Verify the existing `DownloadInboundAttachment` is still wired.
-4. **Cleanup of orphaned `slack_inbox/` dirs** for sessions that no longer exist. Maybe a daemon-side periodic sweep — or just leave empty dirs alone.
+1. **Cleanup of orphaned `slack_inbox/` dirs** for sessions that no longer exist. Probably a daemon-side periodic sweep similar to `nudge_queue` TTL, but not blocking. Leaving empty dirs alone is harmless. Defer until we observe accumulation.
+2. **TTL for inbox files.** Daemon side should expire un-drained inbox events after some duration (matching the existing `nudge_queue` urgent TTL of 2h?). Not strictly required if Claude sessions are restarted often, but good hygiene. Defer to follow-up.
