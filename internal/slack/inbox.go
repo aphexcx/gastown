@@ -8,8 +8,14 @@
 package slack
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
 )
@@ -70,4 +76,50 @@ func InboxDir(townRoot, session string) string {
 // and the legacy nudge_queue fallback (unlocked or missing).
 func SubscribedBeaconPath(townRoot, session string) string {
 	return filepath.Join(InboxDir(townRoot, session), ".subscribed")
+}
+
+// writeInboxIfSubscribed writes ev to slack_inbox/<sess>/<ts>.json IF a
+// channel-server is alive (holds the subscription beacon flock).
+//
+// Returns:
+//   - (true, nil) if the event was written to the inbox.
+//   - (false, nil) if no plugin is alive — caller should fall back to
+//     the legacy nudge_queue path.
+//   - (false, err) on filesystem failure (caller should also fall back
+//     so an inbox-write hiccup doesn't lose the message).
+//
+// Uses atomic temp+rename so partial writes never appear to the
+// channel-server's fsnotify watcher.
+func writeInboxIfSubscribed(townRoot, session string, ev InboxEvent) (bool, error) {
+	if !IsSubscribed(townRoot, session) {
+		return false, nil
+	}
+	dir := InboxDir(townRoot, session)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, fmt.Errorf("create inbox dir: %w", err)
+	}
+	data, err := json.MarshalIndent(&ev, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), inboxRandSuffix())
+	tmp := filepath.Join(dir, name+".tmp")
+	final := filepath.Join(dir, name)
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	return true, nil
+}
+
+// inboxRandSuffix is a 4-byte hex helper, distinct name from
+// channel_server.go's channelRandSuffix and outbox.go's randomSuffix
+// to avoid same-package collision.
+func inboxRandSuffix() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }

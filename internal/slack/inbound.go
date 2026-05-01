@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // IncomingMessage is the router's internal form of a Slack message event.
@@ -63,11 +65,17 @@ type InboundHandler struct {
 	// the warning text.
 	Ephemeral func(chatID, userID, text string)
 
-	// EnqueueNudge delivers the inbound Slack message to the target agent.
-	// The daemon wires this to `gt nudge <address> --mode=wait-idle --stdin`
-	// so the message is pushed into the agent's tmux session promptly when
-	// the agent is idle, falling back to the file queue if the agent is busy.
-	EnqueueNudge func(address string, body string) error
+	// EnqueueNudge delivers an inbound message to the target agent. The
+	// daemon dispatches based on whether a channel-server holds the
+	// subscription beacon flock for the resolved session:
+	//
+	//   - subscribed → write ev as JSON to slack_inbox/<sess>/<ts>.json
+	//   - unsubscribed → enqueue fallbackBody to nudge_queue + spawn poller
+	//
+	// Both paths are durable. The fallbackBody is the formatted directive
+	// the legacy CLI/poller path expects (with the structured ev fields
+	// flattened into the human-readable nudge body).
+	EnqueueNudge func(address string, ev InboxEvent, fallbackBody string) error
 
 	// ResolveSession converts a gt address to a tmux session name. The
 	// daemon wires this to ResolveAddressToSession (routing.go).
@@ -295,7 +303,29 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 	}
 
 	// 9. Deliver.
-	if err := h.EnqueueNudge(address, body); err != nil {
+	//
+	// Build the structured InboxEvent for the channels path. Falls back
+	// to SenderUserID if SenderName is empty so the rendered <channel>
+	// tag still has a sender label (mirrors the legacy body's senderLabel
+	// fallback above).
+	displayUser := msg.SenderName
+	if displayUser == "" {
+		displayUser = msg.SenderUserID
+	}
+	ev := InboxEvent{
+		ChatID:             msg.ChatID,
+		Kind:               kindString(msg.Kind),
+		MessageTS:          msg.MessageTS,
+		TSISO:              isoFromSlackTS(msg.MessageTS),
+		ThreadTS:           msg.ThreadTS,
+		Text:               msg.Text,
+		SenderUserID:       msg.SenderUserID,
+		User:               displayUser,
+		ChannelName:        msg.ChannelName,
+		BotMentioned:       msg.BotMentioned,
+		AttachmentsSummary: summarizeAttachments(msg.Attachments),
+	}
+	if err := h.EnqueueNudge(address, ev, body); err != nil {
 		h.Ephemeral(msg.ChatID, msg.SenderUserID,
 			fmt.Sprintf("⚠️ Couldn't deliver to %q: %v", address, err))
 		return
@@ -305,4 +335,51 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 		// Async: Slack API latency must not backpressure Socket Mode intake.
 		go h.SetThreadStatus(msg.ChatID, threadKey, statusWorking)
 	}
+}
+
+// kindString maps the typed ConversationKind to the wire string Claude's
+// <channel> tag renderer expects ("dm" or "channel").
+func kindString(k ConversationKind) string {
+	if k == ConversationDM {
+		return "dm"
+	}
+	return "channel"
+}
+
+// isoFromSlackTS parses Slack's "1714510123.000200" float-string and
+// returns an ISO 8601 UTC timestamp. Returns empty string on parse
+// failure or empty input.
+func isoFromSlackTS(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	dot := strings.Index(ts, ".")
+	if dot < 0 {
+		return ""
+	}
+	secs, err := strconv.ParseInt(ts[:dot], 10, 64)
+	if err != nil {
+		return ""
+	}
+	micros, err := strconv.ParseInt(ts[dot+1:], 10, 64)
+	if err != nil {
+		return ""
+	}
+	t := time.Unix(secs, micros*1000).UTC()
+	return t.Format("2006-01-02T15:04:05.000000Z")
+}
+
+// summarizeAttachments returns a flat string for the InboxEvent
+// AttachmentsSummary field — Spike 1 confirmed nested arrays are
+// dropped by Claude's renderer, so we flatten ahead of the wire.
+// Empty input returns empty string.
+func summarizeAttachments(meta []AttachmentMeta) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	if len(meta) == 1 {
+		m := meta[0]
+		return fmt.Sprintf("1 file: %s (%s, %d B)", m.Name, m.MimeType, m.Size)
+	}
+	return fmt.Sprintf("%d files attached", len(meta))
 }

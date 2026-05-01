@@ -26,17 +26,18 @@ type fakeEphemeral struct {
 
 type fakeEnqueue struct {
 	address string
+	ev      InboxEvent
 	body    string
 }
 
 func (f *fakeDeps) ephemeral(chatID, userID, text string) {
 	f.sentToSlack = append(f.sentToSlack, fakeEphemeral{chatID: chatID, userID: userID, text: text})
 }
-func (f *fakeDeps) enqueue(address, body string) error {
+func (f *fakeDeps) enqueue(address string, ev InboxEvent, body string) error {
 	if f.enqueueErr != nil {
 		return f.enqueueErr
 	}
-	f.enqueued = append(f.enqueued, fakeEnqueue{address: address, body: body})
+	f.enqueued = append(f.enqueued, fakeEnqueue{address: address, ev: ev, body: body})
 	return nil
 }
 func (f *fakeDeps) resolveSession(address string) (string, error) {
@@ -327,4 +328,42 @@ func TestInbound_ConfigReRead(t *testing.T) {
 		Text:         "@cody help",
 	})
 	require.Len(t, deps.enqueued, 1)
+}
+
+// TestEnqueueNudge_UserFallsBackToSenderUserID confirms that when a Slack
+// inbound event arrives without a populated SenderName, the InboxEvent.User
+// passed to EnqueueNudge falls back to the SenderUserID. This mirrors the
+// senderLabel fallback in the legacy nudge body and keeps Claude's
+// <channel> tag from rendering an empty sender label.
+func TestEnqueueNudge_UserFallsBackToSenderUserID(t *testing.T) {
+	cfg := &Config{
+		OwnerUserID:   "UOWNER",
+		DefaultTarget: "mayor/",
+	}
+	rt := RoutingTable{"cody": "houmanoids/crew/cody"}
+
+	var got InboxEvent
+	h := &InboundHandler{
+		GetConfig: func() *Config { return cfg },
+		Routing:   rt,
+		BotUserID: "BOTID",
+		Ephemeral: func(string, string, string) {},
+		EnqueueNudge: func(_ string, ev InboxEvent, _ string) error {
+			got = ev
+			return nil
+		},
+		ResolveSession: func(addr string) (string, error) { return "session-" + addr, nil },
+		CheckSession:   func(string) (bool, error) { return true, nil },
+	}
+
+	h.Handle(context.Background(), IncomingMessage{
+		Kind:         ConversationDM,
+		ChatID:       "D1",
+		Text:         "hey",
+		SenderUserID: "UOWNER", // owner so the message clears the gate
+		SenderName:   "",       // intentionally empty
+	})
+	if got.User != "UOWNER" {
+		t.Fatalf("User = %q, want %q (UserID fallback)", got.User, "UOWNER")
+	}
 }

@@ -133,15 +133,12 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			// chat.postEphemeral (needs channel + user).
 			_ = client.PostEphemeral(context.Background(), chatID, userID, text)
 		},
-		EnqueueNudge: func(address, body string) error {
-			// Resolve address → session name, then file-enqueue. The nudge
-			// drains via the agent's Claude Code UserPromptSubmit hook on
-			// next user-typed turn — which never fires for an idle agent
-			// who isn't being typed at. So we ALSO ensure a nudge-poller is
-			// running for this session: it drains the queue + injects via
-			// tmux send-keys when the agent is idle, providing a path
-			// for inbound Slack DMs to reach idle Claude agents
-			// without waiting on an unrelated keystroke. (gt-zei3e)
+		EnqueueNudge: func(address string, ev InboxEvent, fallbackBody string) error {
+			// Resolve address → session name, then dispatch:
+			//   subscribed (channel-server alive) → write InboxEvent JSON
+			//     to slack_inbox/<sess>/<ts>.json
+			//   unsubscribed/error → fall back to legacy nudge_queue +
+			//     StartPoller (gt-zei3e fix path)
 			//
 			// StartPoller is idempotent — it no-ops if a poller is already
 			// alive for this session.
@@ -149,9 +146,30 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			if err != nil {
 				return fmt.Errorf("resolve address %s: %w", address, err)
 			}
+
+			// Channels path first. writeInboxIfSubscribed returns
+			// (true, nil) on channel write, (false, nil) if no plugin is
+			// alive, (false, err) on filesystem failure. On err we log
+			// and fall through to the legacy path — never lose a message.
+			written, werr := writeInboxIfSubscribed(opts.TownRoot, sessionName, ev)
+			if werr != nil {
+				fmt.Fprintf(os.Stderr,
+					"slack: inbox write failed for %s, falling back to nudge_queue: %v\n",
+					sessionName, werr)
+			} else if written {
+				fmt.Fprintf(os.Stderr,
+					"slack: routed via channels (slack_inbox) for %s (sender %s)\n",
+					sessionName, address)
+				return nil
+			}
+
+			// Legacy path (non-Claude agents, Claude without --channels
+			// enrolled, or Claude with the plugin currently dead).
+			// Existing gt-zei3e fix: also start a poller so the queue
+			// actually drains for idle agents.
 			if err := nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
 				Sender:   "slack",
-				Message:  body,
+				Message:  fallbackBody,
 				Kind:     "slack",
 				Priority: nudge.PriorityUrgent,
 			}); err != nil {
@@ -164,7 +182,7 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 					sessionName, perr)
 			}
 			fmt.Fprintf(os.Stderr,
-				"slack: enqueued nudge for %s (sender %s)\n",
+				"slack: routed via legacy nudge_queue for %s (sender %s)\n",
 				sessionName, address)
 			return nil
 		},
