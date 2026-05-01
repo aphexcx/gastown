@@ -359,6 +359,18 @@ Confirmed render in assistant context:
 
 Plugin install requires `/plugin marketplace add <dir>` then `/plugin install <name>@<market>`. The marketplace name is taken from the directory name (or an explicit `marketplace.json` if present). Spec needs a one-time setup step: register `~/gt/gastown/crew/cog/plugins/` as a marketplace via `/plugin marketplace add`.
 
+## Spike 2 results (2026-04-30)
+
+Test: launched `claude --dangerously-load-development-channels plugin:gt-slack@spike-gt-slack`, confirmed stub running (PID 43353), `kill -9 43353`, observed for 20s.
+
+**Result: NO AUTO-RESTART.** No new stub process spawned, no new lines in `/tmp/spike-server.log`. Claude Code does not supervise / auto-restart MCP servers when they die.
+
+**Implication for the plan**: Layer 3 supervisor wrapper IS required. The auto-restart strategy in this spec's "Lifecycle & failure modes" section reduces to:
+
+- **Layer 1 (always)**: panic-recovery in plugin code so it doesn't die under normal conditions.
+- **Layer 2 (DOES NOT EXIST)**: Claude Code does not auto-restart. Skip this layer entirely.
+- **Layer 3 (required)**: ship a `gt slack channel-supervisor` outer process. The plugin's `.mcp.json` runs the supervisor; the supervisor `exec`s `gt slack channel-server` in a backoff loop. The supervisor is a tiny outer wrapper (~30-50 LOC) — its only jobs are: launch the server, restart on non-zero exit with exponential backoff (250ms → 1s → 5s → 30s, cap at 30s), and exit cleanly when stdin closes (i.e., Claude Code shutting down the plugin).
+
 ## Open questions
 
 Items previously listed as open are now resolved in the spec or moved to Spike 1 acceptance criteria. Remaining genuinely-open:

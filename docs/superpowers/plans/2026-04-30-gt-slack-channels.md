@@ -1914,6 +1914,234 @@ git commit -m "slack: reply MCP tool (reuses WriteOutboxMessage, isError on fail
 
 ---
 
+### Task 9b: `gt slack channel-supervisor` (auto-restart wrapper)
+
+Spike 2 confirmed Claude Code does NOT auto-restart MCP servers on death. The plugin's `.mcp.json` therefore points at this supervisor wrapper, not at `channel-server` directly. The supervisor `exec`s the real server in a backoff loop and exits cleanly when stdin closes (Claude unloading the plugin).
+
+**Files:**
+- Create: `internal/cmd/slack_channel_supervisor.go`
+- Create: `internal/cmd/slack_channel_supervisor_test.go`
+
+- [ ] **Step 1: Write a test for the backoff schedule.**
+
+```go
+// internal/cmd/slack_channel_supervisor_test.go
+package cmd
+
+import "testing"
+
+func TestSupervisorBackoffSchedule(t *testing.T) {
+	// First crash should retry quickly; subsequent crashes back off,
+	// capped at 30s so a chronically-failing server doesn't burn CPU
+	// or fill logs.
+	cases := []struct {
+		attempt int
+		want    string // duration string for readability
+	}{
+		{1, "250ms"},
+		{2, "1s"},
+		{3, "5s"},
+		{4, "30s"},
+		{5, "30s"},
+		{20, "30s"},
+	}
+	for _, tt := range cases {
+		got := supervisorBackoff(tt.attempt).String()
+		if got != tt.want {
+			t.Fatalf("supervisorBackoff(%d) = %s, want %s", tt.attempt, got, tt.want)
+		}
+	}
+}
+```
+
+- [ ] **Step 2: Run, verify fail.**
+
+```bash
+cd ~/gt/gastown/crew/cog
+go test ./internal/cmd/ -run TestSupervisorBackoffSchedule -v
+```
+
+Expected: FAIL with "undefined: supervisorBackoff".
+
+- [ ] **Step 3: Implement the supervisor.**
+
+```go
+// internal/cmd/slack_channel_supervisor.go
+//
+// channel-supervisor is the outer process Claude Code launches via the
+// plugin's .mcp.json. It exec's `gt slack channel-server` in a backoff
+// loop and exits cleanly when stdin closes (i.e., Claude is unloading
+// the plugin).
+//
+// Why it exists: Claude Code does NOT auto-restart MCP servers when
+// they die (verified in Spike 2 on 2026-04-30, Claude Code v2.1.123).
+// Without this wrapper, a single crash means inbound Slack DMs stop
+// reaching this session permanently.
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+var slackChannelSupervisorCmd = &cobra.Command{
+	Use:    "channel-supervisor",
+	Short:  "Auto-restart wrapper for channel-server (internal)",
+	Hidden: true,
+	Args:   cobra.NoArgs,
+	RunE:   runSlackChannelSupervisor,
+}
+
+func init() {
+	slackCmd.AddCommand(slackChannelSupervisorCmd)
+}
+
+// supervisorBackoff returns the wait duration before retrying after the
+// Nth consecutive crash (attempt is 1-indexed). Capped at 30s so a
+// chronically-broken server doesn't spam logs or burn CPU.
+func supervisorBackoff(attempt int) time.Duration {
+	switch {
+	case attempt <= 1:
+		return 250 * time.Millisecond
+	case attempt == 2:
+		return 1 * time.Second
+	case attempt == 3:
+		return 5 * time.Second
+	default:
+		return 30 * time.Second
+	}
+}
+
+func runSlackChannelSupervisor(cmd *cobra.Command, _ []string) error {
+	gtBin, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find gt binary: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	// Claude Code closes our stdin when unloading the plugin. Watch for
+	// that as the canonical "shut down cleanly" signal.
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		fmt.Fprintln(os.Stderr, "channel-supervisor: stdin closed, exiting")
+		cancel()
+	}()
+
+	// Also handle SIGTERM (defensive; in practice we exit via stdin EOF).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	attempt := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		attempt++
+		fmt.Fprintf(os.Stderr,
+			"channel-supervisor: launching channel-server (attempt %d)\n", attempt)
+
+		c := exec.CommandContext(ctx, gtBin, "slack", "channel-server")
+		c.Stdin = os.Stdin
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+		// Inherit env (GT_SESSION, etc.).
+
+		err := c.Run()
+		if ctx.Err() != nil {
+			// We're shutting down; child likely died because we cancelled.
+			return nil
+		}
+		if err == nil {
+			// Clean exit. Treat as a graceful end and stop.
+			fmt.Fprintln(os.Stderr,
+				"channel-supervisor: channel-server exited cleanly, stopping")
+			return nil
+		}
+
+		wait := supervisorBackoff(attempt)
+		fmt.Fprintf(os.Stderr,
+			"channel-supervisor: channel-server exited with %v; restarting in %s\n",
+			err, wait)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Run, verify pass.**
+
+```bash
+go test ./internal/cmd/ -run TestSupervisorBackoffSchedule -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Update the plugin definition to point at the supervisor (NOT directly at channel-server).**
+
+Modify `plugins/gt-slack/.mcp.json` (created in Task 11) — but since Task 11 is later, just make a note here:
+
+```
+NOTE for Task 11: the .mcp.json must reference channel-supervisor, not channel-server:
+  "args": ["slack", "channel-supervisor"]
+```
+
+Reference this note when writing Task 11.
+
+- [ ] **Step 6: Manual smoke test of the supervisor.**
+
+```bash
+make build install
+mkdir -p ~/gt/.runtime/slack_inbox/manual_smoke
+GT_SESSION=manual/smoke ./gt slack channel-supervisor &
+SUPER_PID=$!
+sleep 1
+# The supervisor should have spawned a channel-server child. Find it:
+SERVER_PID=$(pgrep -P $SUPER_PID -f "slack channel-server")
+echo "supervisor=$SUPER_PID server=$SERVER_PID"
+# Kill the child:
+kill -9 $SERVER_PID
+sleep 2
+# Supervisor should respawn:
+NEW_SERVER_PID=$(pgrep -P $SUPER_PID -f "slack channel-server")
+echo "after-kill server=$NEW_SERVER_PID"
+[ -n "$NEW_SERVER_PID" ] && [ "$NEW_SERVER_PID" != "$SERVER_PID" ] && echo "RESTART CONFIRMED" || echo "RESTART FAILED"
+# Clean shutdown:
+kill -TERM $SUPER_PID
+wait $SUPER_PID 2>/dev/null
+rm -rf ~/gt/.runtime/slack_inbox/manual_smoke
+```
+
+Expected: prints "RESTART CONFIRMED".
+
+- [ ] **Step 7: Commit.**
+
+```bash
+git add internal/cmd/slack_channel_supervisor.go internal/cmd/slack_channel_supervisor_test.go
+git commit -m "slack: channel-supervisor auto-restarts channel-server on crash"
+```
+
+---
+
 ## Phase 4: Daemon dispatch
 
 ### Task 10: Daemon EnqueueNudge — flock check + inbox write
