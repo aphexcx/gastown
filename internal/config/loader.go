@@ -2245,6 +2245,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 		rc.ExecWrapper = resolveExecWrapper(rigPath)
 	}
 
+	// Auto-inject --channels plugin:gt-slack@gastown for Claude agents when
+	// slack.json's channels_enabled is true. No-op for non-Claude agents and
+	// when slack is not configured. See slack_channels.go.
+	maybeInjectClaudeChannels(rc)
+
 	// Copy env vars to avoid mutating caller map
 	resolvedEnv := make(map[string]string, len(envVars)+2)
 	for k, v := range envVars {
@@ -2497,6 +2502,11 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	if len(rc.ExecWrapper) == 0 {
 		rc.ExecWrapper = resolveExecWrapper(rigPath)
 	}
+
+	// Auto-inject --channels plugin:gt-slack@gastown for Claude agents when
+	// slack.json's channels_enabled is true. No-op for non-Claude agents and
+	// when slack is not configured. See slack_channels.go.
+	maybeInjectClaudeChannels(rc)
 
 	// Copy env vars to avoid mutating caller map
 	resolvedEnv := make(map[string]string, len(envVars)+2)
