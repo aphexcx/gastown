@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "gastown",
+  "description": "Gas Town local plugin marketplace — currently ships gt-slack for Claude channels delivery.",
+  "owner": {
+    "name": "Gas Town"
+  },
+  "plugins": [
+    {
+      "name": "gt-slack",
+      "description": "Gas Town Slack channel for Claude Code agents — receive routed Slack DMs/mentions as channel notifications and reply via MCP tools.",
+      "source": "./gt-slack"
+    }
+  ]
+}
