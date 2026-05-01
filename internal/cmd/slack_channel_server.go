@@ -13,16 +13,18 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
+	sessionpkg "github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/slack"
 )
 
 // slackChannelServerCmd is the per-session MCP server Claude Code launches
 // via the gt-slack plugin's .mcp.json. Reads GT_SESSION from env, watches
 // the per-session inbox dir for events written by gt slack daemon, and
-// emits notifications/claude/channel via MCP. Task 9 will register the
-// reply MCP tool. Task 9b adds a supervisor wrapper that exec's this in a
-// backoff loop because Spike 2 confirmed Claude Code does not auto-restart
-// MCP servers.
+// emits notifications/claude/channel via MCP. Registers the reply MCP
+// tool so Claude can post replies via the existing slack_outbox
+// publisher pipeline. Task 9b adds a supervisor wrapper that exec's this
+// in a backoff loop because Spike 2 confirmed Claude Code does not
+// auto-restart MCP servers.
 //
 // Hidden because it's only invoked by Claude Code (when an agent's session
 // is launched with --channels plugin:gt-slack@gastown) — never by humans.
@@ -90,7 +92,54 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 			"claude/channel": map[string]any{},
 		}),
 		server.WithInstructions(channelServerInstructions),
-		server.WithToolCapabilities(true), // for the reply tool in Task 9
+		server.WithToolCapabilities(true), // for the reply tool registered below
+	)
+
+	// Resolve the sender's gt address once. Used as OutboxMessage.From for
+	// every reply call. Fall back to the raw session name if parse fails
+	// (rare; mostly happens for non-standard session names during dev).
+	senderAddress := session
+	if id, perr := sessionpkg.ParseSessionName(session); perr == nil {
+		if addr := id.Address(); addr != "" {
+			senderAddress = addr
+		}
+	}
+
+	// Register the reply tool. Claude calls this to post replies to the
+	// chat that triggered a <channel> notification. The handler delegates
+	// to slack.HandleReply, which validates inputs and writes a JSON file
+	// into <townRoot>/.runtime/slack_outbox/ — drained by the daemon's
+	// existing publisher.
+	mcpSrv.AddTool(
+		mcp.NewTool("reply",
+			mcp.WithDescription(
+				"Send a Slack reply to the chat that triggered a <channel> notification. "+
+					"Required: chat_id (from notification meta), text. "+
+					"Optional: thread_ts (from notification meta) to keep the reply threaded under the original message.",
+			),
+			mcp.WithString("chat_id", mcp.Required(),
+				mcp.Description("Slack channel/DM ID. Use chat_id from the channel notification meta.")),
+			mcp.WithString("text", mcp.Required(),
+				mcp.Description("Reply text. Plain text or Slack mrkdwn formatting.")),
+			mcp.WithString("thread_ts",
+				mcp.Description("Thread timestamp from meta.thread_ts (preferred) or meta.message_ts. Optional but recommended for replies; omit only for top-level DM messages.")),
+		),
+		func(rctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			result, herr := slack.HandleReply(rctx, townRoot, senderAddress, slack.ReplyArgs{
+				ChatID:   req.GetString("chat_id", ""),
+				Text:     req.GetString("text", ""),
+				ThreadTS: req.GetString("thread_ts", ""),
+			})
+			if herr != nil {
+				// Internal error — surface as tool error.
+				return mcp.NewToolResultError(herr.Error()), nil
+			}
+			if !result.OK {
+				// Validation/write failure — model-visible isError=true.
+				return mcp.NewToolResultError(result.Error), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("queued: %s", result.Path)), nil
+		},
 	)
 
 	// Per Spike 1: SendNotificationToAllClients filters out non-Initialized
