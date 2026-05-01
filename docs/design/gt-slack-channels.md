@@ -317,6 +317,48 @@ Outcomes:
 - One end-to-end test that exercises the full daemon → inbox → plugin → MCP notification path with a stub Slack client and a stub MCP transport (no real Socket Mode, no real Claude). Regression net for the architectural shape.
 - Manual test plan documented separately for the dogfood phase: DM bot, verify notification arrives without tmux activity, reply via MCP tool, verify Slack receives it.
 
+## Spike 1 results (2026-04-30)
+
+Run on Claude Code v2.1.123/2.1.126, Go stub using `github.com/mark3labs/mcp-go` v0.50.0. Findings:
+
+- **Hypothesis A (Go MCP emits `notifications/claude/channel`)**: PASS. `srv.SendNotificationToAllClients(method, paramsMap)` produces correct wire-format JSON-RPC. Notifications render in the assistant context as `<channel ...>...</channel>` tags.
+
+- **Hypothesis B (plugin path resolution)**: PASS, with two delivery paths:
+  - **Dev / spike**: launch with `claude --dangerously-load-development-channels plugin:<name>@<marketplace>` — bypasses the curated allowlist. Plugin must already be installed via `/plugin marketplace add` + `/plugin install`. **This is the only path that works on Pro/Max accounts.**
+  - **Production**: `allowedChannelPlugins` in managed-settings.json, **but only honored on team/enterprise tier** (the runtime gate `nL8` returns the org allowlist only when tier ∈ {team, enterprise}). Pro/Max accounts always fall through to Anthropic's curated ledger regardless of managed-settings. Implication: shipping `gt-slack` for non-team users requires either Anthropic-side allowlist inclusion OR users running with the dev flag.
+
+- **Hypothesis C (meta nesting)**: **NESTED DROPPED, FLAT RENDERS.** The nested-attachments-array notification was silently dropped by Claude's renderer; only flat-scalar meta survived. Confirms the v1 schema decision: keep `attachments_summary` as a flat string. Nested arrays/objects in `meta` are not viable.
+
+### Required server capability
+
+Claude Code's runtime gate `YJ_` requires the MCP server to declare `experimental.claude/channel: {}` during initialize, otherwise notifications are silently dropped with `reason="server did not declare claude/channel capability"`. In mcp-go: `server.WithExperimental(map[string]any{"claude/channel": map[string]any{}})`.
+
+### Rendered tag format
+
+Confirmed render in assistant context:
+```xml
+<channel source="plugin:<marketplace>:<plugin>"
+         <flat-meta-key>="<value>"
+         ...>
+<content body>
+</channel>
+```
+
+- `source` is auto-populated as `plugin:<marketplace>:<plugin>` (separator `:`, not `@`).
+- All flat scalar `meta` keys become XML attributes verbatim (including snake_case).
+- The `content` field becomes the tag body.
+- Claude appears to use `meta.user` as the sender label in the user-visible TUI (`← gt-slack · spike: ...`).
+
+### Schema implications
+
+- Use `user` (not `sender_label`) as the canonical sender key in `meta`. Single field, matches Telegram.
+- All other inbox-event fields (`chat_id`, `kind`, `message_ts`, `ts_iso`, `thread_ts`, `channel_name`, `bot_mentioned`, `attachments_summary`) keep their flat string/scalar shape and become tag attributes.
+- The `text` field of `InboxEvent` becomes the notification's `content` (tag body), not a meta attribute.
+
+### Plugin lookup in launch flag
+
+Plugin install requires `/plugin marketplace add <dir>` then `/plugin install <name>@<market>`. The marketplace name is taken from the directory name (or an explicit `marketplace.json` if present). Spec needs a one-time setup step: register `~/gt/gastown/crew/cog/plugins/` as a marketplace via `/plugin marketplace add`.
+
 ## Open questions
 
 Items previously listed as open are now resolved in the spec or moved to Spike 1 acceptance criteria. Remaining genuinely-open:
