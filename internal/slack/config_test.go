@@ -1,8 +1,10 @@
 package slack
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -82,6 +84,54 @@ func TestValidate(t *testing.T) {
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tc.wantErr)
 		})
+	}
+}
+
+func TestConfigChannelsEnabledDefault(t *testing.T) {
+	cfg := Config{}
+	if cfg.ChannelsEnabled != false {
+		t.Fatalf("default ChannelsEnabled = %v, want false (zero value)", cfg.ChannelsEnabled)
+	}
+}
+
+func TestConfigChannelsEnabledRoundTrip(t *testing.T) {
+	in := Config{
+		BotToken:        "xoxb-test",
+		AppToken:        "xapp-test",
+		OwnerUserID:     "U0",
+		ChannelsEnabled: true,
+	}
+	data, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Config
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.ChannelsEnabled {
+		t.Fatalf("round trip lost ChannelsEnabled")
+	}
+	js := string(data)
+	if !strings.Contains(js, `"channels_enabled":true`) {
+		t.Fatalf("JSON missing channels_enabled tag: %s", js)
+	}
+}
+
+func TestConfigChannelsEnabledOmitemptyWhenFalse(t *testing.T) {
+	cfg := Config{
+		BotToken:    "xoxb-test",
+		AppToken:    "xapp-test",
+		OwnerUserID: "U0",
+		// ChannelsEnabled defaults false; with omitempty it should be omitted.
+	}
+	data, err := json.Marshal(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(data)
+	if strings.Contains(js, `"channels_enabled":`) {
+		t.Fatalf("channels_enabled present in JSON when false (omitempty broken): %s", js)
 	}
 }
 

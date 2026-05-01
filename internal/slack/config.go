@@ -22,6 +22,17 @@ type Config struct {
 	OwnerUserID   string                   `json:"owner_user_id"`
 	DefaultTarget string                   `json:"default_target,omitempty"`
 	Channels      map[string]ChannelConfig `json:"channels,omitempty"`
+
+	// ChannelsEnabled, when true, opts Claude Code agents in this town
+	// into receiving inbound Slack messages via Claude's
+	// notifications/claude/channel mechanism instead of the legacy
+	// nudge_queue + tmux-send-keys path. Non-Claude agents (Codex,
+	// Gemini, Cursor) always use the legacy path regardless of this
+	// flag. Defaults to false during development; turning it on
+	// requires the gt slack channel-server plugin to be installed and
+	// the agent's session to be launched with the --channels flag
+	// (Task 12 wires the auto-inject for Claude crew sessions).
+	ChannelsEnabled bool `json:"channels_enabled,omitempty"`
 }
 
 // LoadConfig reads and parses the config file at path. It returns
