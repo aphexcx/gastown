@@ -95,7 +95,9 @@ func writeInboxIfSubscribed(townRoot, session string, ev InboxEvent) (bool, erro
 		return false, nil
 	}
 	dir := InboxDir(townRoot, session)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700: inbox dirs hold Slack message bodies which can be sensitive.
+	// Matches slack_outbox/ permissions (publisher uses 0700/0600 too).
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, fmt.Errorf("create inbox dir: %w", err)
 	}
 	data, err := json.MarshalIndent(&ev, "", "  ")
@@ -105,7 +107,8 @@ func writeInboxIfSubscribed(townRoot, session string, ev InboxEvent) (bool, erro
 	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), inboxRandSuffix())
 	tmp := filepath.Join(dir, name+".tmp")
 	final := filepath.Join(dir, name)
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// 0600: same rationale — Slack message bodies are sensitive.
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return false, err
 	}
 	if err := os.Rename(tmp, final); err != nil {

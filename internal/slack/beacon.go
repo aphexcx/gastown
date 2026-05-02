@@ -53,7 +53,9 @@ func (h *SubscriptionHolder) Release() {
 // process death so a forgotten Release is bounded by the process lifecycle.
 func AcquireSubscribed(townRoot, session string) (*SubscriptionHolder, error) {
 	dir := InboxDir(townRoot, session)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700: inbox dirs hold Slack message bodies which can be sensitive.
+	// Matches slack_outbox/ permissions (publisher uses 0700/0600 too).
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create inbox dir: %w", err)
 	}
 	path := SubscribedBeaconPath(townRoot, session)

@@ -110,44 +110,52 @@ func runSlackChannelSupervisor(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	attempt := 0
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
+	// Single-shot launch: exec channel-server once, plumb stdio, exit
+	// when the child exits.
+	//
+	// CRITICAL: do NOT restart the child over the same stdio. Claude's
+	// MCP `initialize` request has already been consumed by the dead
+	// first instance — a fresh child would never see initialize, would
+	// never mark its mcp-go session Initialized, and would silently
+	// drop every notifications/claude/channel emit (mcp-go filters by
+	// Initialized()). Daemon-side dispatch would still see the beacon
+	// as held and route inbox events there, where they'd be deleted
+	// after a ghost emit. Net result: every Slack DM after a crash
+	// would be silently lost.
+	//
+	// Instead, we exit when the child exits. Claude Code's MCP
+	// transport closes; the plugin is gone for the rest of the session.
+	// Spike 2 confirmed Claude does not auto-restart MCP servers, so
+	// the user must restart their `claude --channels ...` invocation
+	// to recover. This trades transparent recovery for the durability
+	// guarantee that no inbound Slack message is silently lost.
+	//
+	// During the dead-channel window, the daemon's flock probe sees
+	// the beacon as unowned (channel-server's process exit released
+	// the lock) and falls back to the legacy nudge_queue path —
+	// durable, non-lossy.
+	fmt.Fprintln(cmd.OutOrStderr(), "channel-supervisor: launching channel-server")
+	c := exec.CommandContext(ctx, gtBin, "slack", "channel-server")
+	c.Stdin = os.Stdin   // MCP transport read side
+	c.Stdout = os.Stdout // MCP transport write side
+	c.Stderr = os.Stderr
+	// Inherit env (GT_SESSION, etc.).
 
-		attempt++
-		fmt.Fprintf(cmd.OutOrStderr(),
-			"channel-supervisor: launching channel-server (attempt %d)\n", attempt)
-
-		c := exec.CommandContext(ctx, gtBin, "slack", "channel-server")
-		c.Stdin = os.Stdin   // MCP transport read side
-		c.Stdout = os.Stdout // MCP transport write side
-		c.Stderr = os.Stderr
-		// Inherit env (GT_SESSION, etc.).
-
-		runErr := c.Run()
-		if ctx.Err() != nil {
-			// We were cancelled (SIGTERM/SIGINT or parent ctx done);
-			// child likely died because of that.
-			return nil
-		}
-		if runErr == nil {
-			// Clean exit (e.g., child saw stdin EOF and shut down).
-			// Treat as graceful end and stop supervising.
-			fmt.Fprintln(cmd.OutOrStderr(),
-				"channel-supervisor: channel-server exited cleanly, stopping")
-			return nil
-		}
-
-		wait := supervisorBackoff(attempt)
-		fmt.Fprintf(cmd.OutOrStderr(),
-			"channel-supervisor: channel-server exited with %v; restarting in %s\n",
-			runErr, wait)
-		select {
-		case <-time.After(wait):
-		case <-ctx.Done():
-			return nil
-		}
+	runErr := c.Run()
+	if ctx.Err() != nil {
+		// We were cancelled (SIGTERM/SIGINT or parent ctx done).
+		return nil
 	}
+	if runErr == nil {
+		fmt.Fprintln(cmd.OutOrStderr(),
+			"channel-supervisor: channel-server exited cleanly, stopping")
+		return nil
+	}
+	// Crashed. Don't restart — surface the error and exit.
+	fmt.Fprintf(cmd.OutOrStderr(),
+		"channel-supervisor: channel-server exited with %v; NOT restarting "+
+			"(would silently lose messages; see comment in channel-supervisor source). "+
+			"Restart your claude --channels session to recover.\n",
+		runErr)
+	return runErr
 }

@@ -31,8 +31,17 @@ type Config struct {
 	// flag. Defaults to false during development; turning it on
 	// requires the gt slack channel-server plugin to be installed and
 	// the agent's session to be launched with the --channels flag
-	// (Task 12 wires the auto-inject for Claude crew sessions).
+	// (auto-injected by config/slack_channels.go).
 	ChannelsEnabled bool `json:"channels_enabled,omitempty"`
+
+	// ChannelsDevMode, when true, makes the auto-inject use Claude Code's
+	// --dangerously-load-development-channels flag instead of --channels.
+	// Required on Pro/Max accounts where managed-settings allowlist
+	// overrides only apply to team/enterprise tier — individual-tier
+	// users running an in-repo plugin (gt-slack@gastown) must use the
+	// dev flag. Default false (production deployment via allowlisted
+	// --channels).
+	ChannelsDevMode bool `json:"channels_dev_mode,omitempty"`
 }
 
 // LoadConfig reads and parses the config file at path. It returns

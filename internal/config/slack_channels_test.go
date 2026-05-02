@@ -37,7 +37,8 @@ func withChannelsLookup(t *testing.T, enabled, devMode bool) {
 func TestMaybeInjectClaudeChannels_DevModeUsesDangerouslyLoadFlag(t *testing.T) {
 	withChannelsLookup(t, true, true)
 	rc := &RuntimeConfig{
-		Command: "claude",
+		Provider: string(AgentClaude),
+		Command:  "claude",
 		Args:    []string{"--model", "sonnet[1m]"},
 	}
 	maybeInjectClaudeChannels(rc)
@@ -55,7 +56,8 @@ func TestMaybeInjectClaudeChannels_DevModeUsesDangerouslyLoadFlag(t *testing.T) 
 func TestMaybeInjectClaudeChannels_DevModeIdempotent(t *testing.T) {
 	withChannelsLookup(t, true, true)
 	rc := &RuntimeConfig{
-		Command: "claude",
+		Provider: string(AgentClaude),
+		Command:  "claude",
 		Args:    []string{"--dangerously-load-development-channels", "plugin:gt-slack@gastown"},
 	}
 	maybeInjectClaudeChannels(rc)
@@ -82,7 +84,8 @@ func TestSlackChannelsLookupFromPath_ReadsDevMode(t *testing.T) {
 func TestMaybeInjectClaudeChannels_ClaudeAndEnabled(t *testing.T) {
 	withChannelsEnabled(t, true)
 	rc := &RuntimeConfig{
-		Command: "claude",
+		Provider: string(AgentClaude),
+		Command:  "claude",
 		Args:    []string{"--model", "sonnet[1m]"},
 	}
 	maybeInjectClaudeChannels(rc)
@@ -100,7 +103,8 @@ func TestMaybeInjectClaudeChannels_ClaudeAndEnabled(t *testing.T) {
 func TestMaybeInjectClaudeChannels_ChannelsDisabled(t *testing.T) {
 	withChannelsEnabled(t, false)
 	rc := &RuntimeConfig{
-		Command: "claude",
+		Provider: string(AgentClaude),
+		Command:  "claude",
 		Args:    []string{"--model", "sonnet[1m]"},
 	}
 	maybeInjectClaudeChannels(rc)
@@ -112,12 +116,36 @@ func TestMaybeInjectClaudeChannels_ChannelsDisabled(t *testing.T) {
 func TestMaybeInjectClaudeChannels_NonClaudeAgent(t *testing.T) {
 	withChannelsEnabled(t, true)
 	rc := &RuntimeConfig{
-		Command: "codex",
-		Args:    []string{"--config", "x"},
+		Provider: string(AgentCodex),
+		Command:  "codex",
+		Args:     []string{"--config", "x"},
 	}
 	maybeInjectClaudeChannels(rc)
 	if len(rc.Args) != 2 || rc.Args[0] != "--config" || rc.Args[1] != "x" {
 		t.Fatalf("Args = %v, want unchanged for non-Claude command", rc.Args)
+	}
+}
+
+// Regression: Provider check (not Command check). Claude's Command is
+// rewritten from "claude" to a resolved path like ~/.claude/local/claude
+// in agents.go's resolveClaudePath flow. Make sure the injection still
+// fires when Command is a path but Provider is AgentClaude.
+func TestMaybeInjectClaudeChannels_ResolvedClaudeBinaryPath(t *testing.T) {
+	withChannelsEnabled(t, true)
+	rc := &RuntimeConfig{
+		Provider: string(AgentClaude),
+		Command:  "/Users/dev/.claude/local/claude", // path, not literal "claude"
+		Args:     []string{"--model", "sonnet[1m]"},
+	}
+	maybeInjectClaudeChannels(rc)
+	want := []string{"--model", "sonnet[1m]", "--channels", "plugin:gt-slack@gastown"}
+	if len(rc.Args) != len(want) {
+		t.Fatalf("Args = %v, want %v (Provider check should fire even when Command is a resolved path)", rc.Args, want)
+	}
+	for i := range want {
+		if rc.Args[i] != want[i] {
+			t.Fatalf("Args[%d] = %q, want %q", i, rc.Args[i], want[i])
+		}
 	}
 }
 
@@ -129,7 +157,8 @@ func TestMaybeInjectClaudeChannels_NilSafe(t *testing.T) {
 func TestMaybeInjectClaudeChannels_Idempotent(t *testing.T) {
 	withChannelsEnabled(t, true)
 	rc := &RuntimeConfig{
-		Command: "claude",
+		Provider: string(AgentClaude),
+		Command:  "claude",
 		Args:    []string{"--channels", "plugin:gt-slack@gastown"},
 	}
 	maybeInjectClaudeChannels(rc)

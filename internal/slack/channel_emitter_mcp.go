@@ -99,9 +99,12 @@ func (e *MCPEmitter) Emit(ev InboxEvent) error {
 		"content": ev.Text,
 		"meta":    meta,
 	}
+	// Log only chat+message identifiers + length, never message body.
+	// Slack DMs can be sensitive; the daemon's stderr could end up in
+	// shared logs (e.g., supervisor tee, third-party log aggregators).
 	fmt.Fprintf(os.Stderr,
-		"channel-server: emitting notifications/claude/channel chat=%s text=%q\n",
-		ev.ChatID, ev.Text)
+		"channel-server: emitting notifications/claude/channel chat=%s message_ts=%s len=%d\n",
+		ev.ChatID, ev.MessageTS, len(ev.Text))
 	e.srv.SendNotificationToAllClients("notifications/claude/channel", params)
 	return nil
 }

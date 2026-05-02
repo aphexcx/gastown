@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -198,9 +197,22 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 
 	// Per Spike 1: SendNotificationToAllClients filters out non-Initialized
 	// sessions, so we MUST wait for notifications/initialized before
-	// starting the channel-server's loop. Register a handler that closes a
-	// ready channel; backstop with a 750ms grace delay in case the client's
-	// initialized notification doesn't arrive (some MCP transports delay it).
+	// starting the channel-server's loop. The handler closes a ready
+	// channel that gates beacon acquisition + the inbox watch loop.
+	//
+	// CRITICAL: there is no grace-delay backstop. An earlier version had
+	// a 750ms timer that closed `ready` if notifications/initialized
+	// hadn't fired — but mcp-go silently drops notifications until
+	// session.Initialized() flips true (which only happens via the real
+	// MCP initialize request). Opening the loop on the timer would let
+	// the channel-server claim+delete inbox files while the notifications
+	// it emits go nowhere, silently losing inbound Slack messages.
+	//
+	// If notifications/initialized never fires (e.g., supervisor-restart
+	// path where Claude already consumed the initialize for the dead
+	// child), the inbox loop simply never starts. The daemon's flock
+	// probe sees the beacon as unowned and falls back to the legacy
+	// nudge_queue path — durable, non-lossy.
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	mcpSrv.AddNotificationHandler("notifications/initialized",
@@ -211,25 +223,14 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 				close(ready)
 			})
 		})
-	go func() {
-		select {
-		case <-time.After(750 * time.Millisecond):
-			readyOnce.Do(func() {
-				fmt.Fprintln(cmd.OutOrStderr(),
-					"channel-server: notifications/initialized not seen in 750ms — proceeding via grace-delay backstop")
-				close(ready)
-			})
-		case <-ctx.Done():
-			return
-		}
-	}()
 
 	emitter := slack.NewMCPEmitter(mcpSrv)
 	chanSrv := slack.NewChannelServer(townRoot, session, emitter)
 
 	// Run the inbox loop in a goroutine, gated on the ready signal. Serve
 	// MCP on the main goroutine because it owns stdin/stdout (the MCP
-	// transport).
+	// transport). If ServeStdio shuts down before init fires, the loop
+	// goroutine exits via ctx.Done() without ever touching the inbox.
 	loopErr := make(chan error, 1)
 	go func() {
 		select {

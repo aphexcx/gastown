@@ -92,13 +92,17 @@ func channelsFlagFor(devMode bool) string {
 // channels launch flag (--channels or --dangerously-load-development-channels)
 // followed by plugin:gt-slack@gastown when:
 //   - slack channels are enabled (channels_enabled: true in slack.json), AND
-//   - rc.Command is "claude" (Claude Code only — non-Claude agents are
-//     never affected).
+//   - the runtime is Claude (Provider equals AgentClaude).
+//
+// We check Provider rather than Command because Claude's command can be
+// rewritten from the literal "claude" to a resolved path like
+// ~/.claude/local/claude (see resolveClaudePath in agents.go). Provider
+// is set from the preset name and doesn't get rewritten.
 //
 // Idempotent: if the chosen flag is already paired with our plugin ref,
 // it is not appended again. Safe to call when rc is nil (no-op).
 func maybeInjectClaudeChannels(rc *RuntimeConfig) {
-	if rc == nil || rc.Command != "claude" {
+	if rc == nil || rc.Provider != string(AgentClaude) {
 		return
 	}
 	enabled, devMode := slackChannelsLookup()
