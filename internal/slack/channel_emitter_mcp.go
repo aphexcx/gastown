@@ -17,6 +17,9 @@
 package slack
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -62,22 +65,43 @@ func NewMCPEmitter(srv *server.MCPServer) *MCPEmitter {
 // the "fire and forget" semantics of MCP notifications (no per-message
 // ack from the client).
 func (e *MCPEmitter) Emit(ev InboxEvent) error {
+	// Only send non-empty/non-zero meta fields. Spike 1 confirmed Claude
+	// renders all meta keys as <channel> tag attributes; omit empty values
+	// to keep the rendered tag clean and match the schema's omitempty
+	// JSON tags. Booleans are sent only when true (omitempty parity).
 	meta := map[string]any{
-		"chat_id":             ev.ChatID,
-		"kind":                ev.Kind,
-		"message_ts":          ev.MessageTS,
-		"ts_iso":              ev.TSISO,
-		"thread_ts":           ev.ThreadTS,
-		"sender_user_id":      ev.SenderUserID,
-		"user":                ev.User,
-		"channel_name":        ev.ChannelName,
-		"bot_mentioned":       ev.BotMentioned,
-		"attachments_summary": ev.AttachmentsSummary,
+		"chat_id":    ev.ChatID,
+		"kind":       ev.Kind,
+		"message_ts": ev.MessageTS,
+	}
+	if ev.TSISO != "" {
+		meta["ts_iso"] = ev.TSISO
+	}
+	if ev.ThreadTS != "" {
+		meta["thread_ts"] = ev.ThreadTS
+	}
+	if ev.SenderUserID != "" {
+		meta["sender_user_id"] = ev.SenderUserID
+	}
+	if ev.User != "" {
+		meta["user"] = ev.User
+	}
+	if ev.ChannelName != "" {
+		meta["channel_name"] = ev.ChannelName
+	}
+	if ev.BotMentioned {
+		meta["bot_mentioned"] = true
+	}
+	if ev.AttachmentsSummary != "" {
+		meta["attachments_summary"] = ev.AttachmentsSummary
 	}
 	params := map[string]any{
 		"content": ev.Text,
 		"meta":    meta,
 	}
+	fmt.Fprintf(os.Stderr,
+		"channel-server: emitting notifications/claude/channel chat=%s text=%q\n",
+		ev.ChatID, ev.Text)
 	e.srv.SendNotificationToAllClients("notifications/claude/channel", params)
 	return nil
 }

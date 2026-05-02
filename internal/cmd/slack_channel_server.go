@@ -151,7 +151,11 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 	var readyOnce sync.Once
 	mcpSrv.AddNotificationHandler("notifications/initialized",
 		func(_ context.Context, _ mcp.JSONRPCNotification) {
-			readyOnce.Do(func() { close(ready) })
+			readyOnce.Do(func() {
+				fmt.Fprintln(cmd.OutOrStderr(),
+					"channel-server: notifications/initialized received — opening inbox loop")
+				close(ready)
+			})
 		})
 	go func() {
 		select {
