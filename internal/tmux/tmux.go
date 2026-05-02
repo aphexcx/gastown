@@ -1803,22 +1803,22 @@ func (t *Tmux) NudgePane(pane, message string) error {
 }
 
 // AcceptStartupDialogs dismisses startup dialogs that can block automated
-// sessions. Currently handles (in order):
-//  1. Dev-channels warning ("WARNING: Loading development channels") — Enter
+// sessions. Empirically claude renders dialogs in this order:
+//  1. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
+//  2. Dev-channels warning ("WARNING: Loading development channels") — Enter
 //     accepts. Fires when claude is launched with
 //     --dangerously-load-development-channels (gt-slack channels delivery
-//     in dev mode).
-//  2. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
+//     in dev mode). Only renders after trust is dismissed.
 //  3. Bypass permissions warning ("Bypass Permissions mode") — requires Down+Enter
 //
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
-	if err := t.AcceptDevChannelsDialog(session); err != nil {
-		return fmt.Errorf("dev-channels dialog: %w", err)
-	}
 	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
 		return fmt.Errorf("workspace trust dialog: %w", err)
+	}
+	if err := t.AcceptDevChannelsDialog(session); err != nil {
+		return fmt.Errorf("dev-channels dialog: %w", err)
 	}
 	if err := t.AcceptBypassPermissionsWarning(session); err != nil {
 		return fmt.Errorf("bypass permissions warning: %w", err)
@@ -1831,24 +1831,41 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 // Option 1 ("I am using this for local development") is pre-selected, so Enter
 // accepts.
 //
-// Single capture-and-check (not a poll loop): the dev-channels dialog
-// renders synchronously during claude startup, so by the time our caller
-// runs (after WaitForCommand has confirmed claude is the pane command),
-// the dialog is already on screen. A poll loop would add latency for the
-// common case of "no dev flag, no dialog" with no benefit.
+// Polls because the dev-channels dialog renders only AFTER the workspace trust
+// dialog is dismissed (verified by capturing pane state during a real launch).
+// Single capture-and-check would race the trust dismissal and miss the dialog.
+// Exits early if the agent prompt or bypass-permissions dialog is visible —
+// signals the dev-channels dialog is gone (already accepted) or never appeared
+// (no --dangerously-load-development-channels flag).
 func (t *Tmux) AcceptDevChannelsDialog(session string) error {
-	content, err := t.CapturePane(session, 30)
-	if err != nil {
-		return nil // best effort — let downstream handlers try
+	deadline := time.Now().Add(constants.DialogPollTimeout)
+	for time.Now().Before(deadline) {
+		content, err := t.CapturePane(session, 30)
+		if err != nil {
+			time.Sleep(constants.DialogPollInterval)
+			continue
+		}
+
+		if strings.Contains(content, "Loading development channels") {
+			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+				return err
+			}
+			// Wait for dialog to dismiss before proceeding so the next handler
+			// sees post-dismissal state.
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		}
+
+		// Early exit: prompt visible (dialog already accepted or never shown),
+		// or bypass-permissions dialog up next (handled by the next handler).
+		if containsPromptIndicator(content) || strings.Contains(content, "Bypass Permissions mode") {
+			return nil
+		}
+
+		time.Sleep(constants.DialogPollInterval)
 	}
-	if !strings.Contains(content, "Loading development channels") {
-		return nil
-	}
-	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-		return err
-	}
-	// Brief settle so subsequent dialog handlers see the post-dismissal state.
-	time.Sleep(300 * time.Millisecond)
+
+	// Timeout — no dialog detected, safe to proceed
 	return nil
 }
 
@@ -1884,8 +1901,11 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 
 		// Early exit: if agent prompt or shell prompt is visible, no trust dialog will appear.
 		// Claude prompt is ">", shell prompts are "$", "%", "#".
-		// Also exit if bypass permissions dialog is next (handled by AcceptBypassPermissionsWarning).
-		if containsPromptIndicator(content) || strings.Contains(content, "Bypass Permissions mode") {
+		// Also exit if a downstream dialog is visible — trust must have been
+		// dismissed already.
+		if containsPromptIndicator(content) ||
+			strings.Contains(content, "Bypass Permissions mode") ||
+			strings.Contains(content, "Loading development channels") {
 			return nil
 		}
 
