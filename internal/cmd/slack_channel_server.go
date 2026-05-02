@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -65,6 +66,29 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 	if session == "" {
 		return fmt.Errorf("GT_SESSION env var not set; channel-server must be launched by gt session-spawn (use --channels plugin:gt-slack@gastown)")
 	}
+
+	// Normalize: GT_SESSION may be set to a gt address ("mayor/",
+	// "gastown/crew/cog") OR a tmux session name ("hq-mayor",
+	// "gt-crew-cog"). The daemon's dispatch resolves addresses to tmux
+	// session names via ResolveAddressToSession, then probes
+	// slack_inbox/<sessionName>/.subscribed. The channel-server must
+	// therefore use the same tmux session name as the beacon path key.
+	//
+	// If GT_SESSION contains "/", treat it as an address and resolve.
+	// Otherwise use it as-is (already a tmux session name).
+	if strings.Contains(session, "/") {
+		if normalized, rerr := slack.ResolveAddressToSession(session); rerr == nil {
+			fmt.Fprintf(cmd.OutOrStderr(),
+				"channel-server: GT_SESSION=%q is an address; normalized to session=%q\n",
+				session, normalized)
+			session = normalized
+		} else {
+			fmt.Fprintf(cmd.OutOrStderr(),
+				"channel-server: WARNING: GT_SESSION=%q looks like an address but resolution failed: %v (using as-is — daemon dispatch may not match)\n",
+				session, rerr)
+		}
+	}
+
 	townRoot, err := findMailWorkDir()
 	if err != nil {
 		return fmt.Errorf("find town root: %w", err)
