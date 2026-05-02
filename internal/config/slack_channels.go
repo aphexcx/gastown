@@ -19,8 +19,9 @@ import (
 	"path/filepath"
 )
 
-// slackChannelsPluginRef mirrors session.SlackChannelsPluginRef. Duplicated
-// here to keep this file dependency-light (config does not import session).
+// slackChannelsPluginRef is the plugin reference passed to Claude Code's
+// --channels flag for in-repo gt-slack delivery. The "@gastown" suffix
+// matches the marketplace name in plugins/.claude-plugin/marketplace.json.
 const slackChannelsPluginRef = "plugin:gt-slack@gastown"
 
 // slackChannelsConfigShape is the minimal subset of slack.json that this

@@ -822,8 +822,8 @@ func DefaultRuntimeConfig() *RuntimeConfig {
 // Note: BuildCommand does NOT auto-inject Slack --channels — that
 // happens at the BuildStartupCommand* layer (loader.go) by mutating
 // rc.Args before calling here. Direct callers of BuildCommand who need
-// channel injection (e.g., exec helpers) should call BuildArgsWithPrompt
-// or invoke session.BuildAgentArgv themselves.
+// channel injection should call BuildArgsWithPrompt (which auto-injects)
+// or call maybeInjectClaudeChannels on the RuntimeConfig before BuildCommand.
 func (rc *RuntimeConfig) BuildCommand() string {
 	resolved := normalizeRuntimeConfig(rc)
 
