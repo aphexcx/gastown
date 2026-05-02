@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
@@ -15,8 +16,9 @@ import (
 // Client is a minimal Slack client facade used by the router. Keep the
 // surface small so the rest of the package doesn't import slack-go directly.
 type Client struct {
-	api      *slackgo.Client
-	botToken string
+	api              *slackgo.Client
+	botToken         string
+	userDisplayCache *userDisplayCache
 }
 
 // NewClient constructs a Client using the bot token from cfg. Socket Mode
@@ -24,8 +26,9 @@ type Client struct {
 // Web API side: posting, uploading, fetching.
 func NewClient(cfg *Config) *Client {
 	return &Client{
-		api:      slackgo.New(cfg.BotToken),
-		botToken: cfg.BotToken,
+		api:              slackgo.New(cfg.BotToken),
+		botToken:         cfg.BotToken,
+		userDisplayCache: newUserDisplayCache(30 * time.Minute),
 	}
 }
 
@@ -218,4 +221,112 @@ func fileBaseName(path string) string {
 		}
 	}
 	return path
+}
+
+// userDisplayCache is a TTL'd in-memory cache of Slack user-ID → display
+// name. We lazy-resolve on first use because most inbound events don't
+// include the sender's name; calling users.info once per unique user
+// per cache window keeps the rendered <channel> tag's user attribute
+// human-readable without hammering the API.
+//
+// On lookup error (auth issue, rate limit, transient), the caller treats
+// the failure as "no friendly name available" and falls back to the raw
+// user ID. We don't cache failures — the next event for the same user
+// retries.
+type userDisplayCache struct {
+	mu    sync.Mutex
+	ttl   time.Duration
+	cache map[string]userDisplayEntry
+}
+
+type userDisplayEntry struct {
+	displayName string
+	expiresAt   time.Time
+}
+
+func newUserDisplayCache(ttl time.Duration) *userDisplayCache {
+	return &userDisplayCache{
+		ttl:   ttl,
+		cache: make(map[string]userDisplayEntry),
+	}
+}
+
+// get returns the cached display name and whether it's still fresh.
+func (c *userDisplayCache) get(userID string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.cache[userID]
+	if !ok {
+		return "", false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(c.cache, userID)
+		return "", false
+	}
+	return entry.displayName, true
+}
+
+// put stores a successful lookup with the cache TTL.
+func (c *userDisplayCache) put(userID, displayName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[userID] = userDisplayEntry{
+		displayName: displayName,
+		expiresAt:   time.Now().Add(c.ttl),
+	}
+}
+
+// LookupUserDisplayName returns a human-readable display name for a Slack
+// user ID, resolving via users.info on cache miss. The selection order
+// for the returned name mirrors Slack's UI hint priority:
+//
+//  1. profile.display_name (the user-set @-handle)
+//  2. profile.real_name
+//  3. user.name (the legacy login name)
+//  4. raw userID (fallback if all above are empty)
+//
+// On API error or any other failure, returns userID and the error so the
+// caller can decide whether to fall back gracefully (the channel-server
+// path falls back unconditionally — a missing display name is not worth
+// failing inbound delivery over).
+//
+// The cache is initialized in NewClient with a 30-minute TTL; if the
+// cache is nil (e.g., a manually-constructed Client in tests), lookups
+// always hit the API.
+func (c *Client) LookupUserDisplayName(ctx context.Context, userID string) (string, error) {
+	if userID == "" {
+		return "", fmt.Errorf("empty userID")
+	}
+	if c.userDisplayCache != nil {
+		if name, ok := c.userDisplayCache.get(userID); ok {
+			return name, nil
+		}
+	}
+	user, err := c.api.GetUserInfoContext(ctx, userID)
+	if err != nil {
+		return userID, classifySlackError(err)
+	}
+	name := pickDisplayName(user, userID)
+	if c.userDisplayCache != nil {
+		c.userDisplayCache.put(userID, name)
+	}
+	return name, nil
+}
+
+// pickDisplayName implements the lookup priority documented on
+// LookupUserDisplayName.
+func pickDisplayName(user *slackgo.User, userID string) string {
+	if user == nil {
+		return userID
+	}
+	if user.Profile.DisplayName != "" {
+		return user.Profile.DisplayName
+	}
+	if user.Profile.RealName != "" {
+		return user.Profile.RealName
+	}
+	if user.Name != "" {
+		return user.Name
+	}
+	return userID
 }

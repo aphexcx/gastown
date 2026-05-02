@@ -108,6 +108,13 @@ type InboundHandler struct {
 	// with a real Client; tests pass a fake. A nil hook means the handler
 	// only reports attachments as metadata and never downloads.
 	DownloadAttachment func(ctx context.Context, m AttachmentMeta) (string, error)
+
+	// LookupUserDisplayName resolves a Slack user ID to a human-readable
+	// display name (e.g., "U0AN32RPBFT" → "afik_cohen"). Returns the user
+	// ID itself on lookup failure or empty input. Production wires this
+	// to client.LookupUserDisplayName; tests pass a fake (or nil to skip
+	// the lookup and fall back to the raw user ID).
+	LookupUserDisplayName func(userID string) string
 }
 
 // Handle runs one inbound message through the pipeline. It never returns
@@ -304,11 +311,18 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 
 	// 9. Deliver.
 	//
-	// Build the structured InboxEvent for the channels path. Falls back
-	// to SenderUserID if SenderName is empty so the rendered <channel>
-	// tag still has a sender label (mirrors the legacy body's senderLabel
-	// fallback above).
+	// Build the structured InboxEvent for the channels path. Resolution
+	// order for the rendered <channel> tag's user attribute:
+	//   1. SenderName from the event itself (rare — most events omit it)
+	//   2. LookupUserDisplayName via users.info (cached; daemon-wired)
+	//   3. SenderUserID raw (last-resort fallback so the tag is never empty)
+	//
+	// The lookup callback returns "" on failure, so we re-check for empty
+	// after step 2 and fall through to the userID.
 	displayUser := msg.SenderName
+	if displayUser == "" && h.LookupUserDisplayName != nil && msg.SenderUserID != "" {
+		displayUser = h.LookupUserDisplayName(msg.SenderUserID)
+	}
 	if displayUser == "" {
 		displayUser = msg.SenderUserID
 	}

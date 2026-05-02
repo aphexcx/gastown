@@ -197,6 +197,23 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			}
 		},
 		CanAccessConversation: newMembershipCache(client).check,
+		LookupUserDisplayName: func(userID string) string {
+			if userID == "" {
+				return ""
+			}
+			// Bound users.info on the inbound hot path — most calls
+			// hit the in-memory cache (instant), but a cache miss
+			// must not stall message delivery if Slack is slow.
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			name, err := client.LookupUserDisplayName(ctx, userID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr,
+					"slack: user-display lookup for %s failed: %v\n", userID, err)
+				return userID
+			}
+			return name
+		},
 	}
 
 	return &Daemon{

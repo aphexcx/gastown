@@ -367,3 +367,92 @@ func TestEnqueueNudge_UserFallsBackToSenderUserID(t *testing.T) {
 		t.Fatalf("User = %q, want %q (UserID fallback)", got.User, "UOWNER")
 	}
 }
+
+// TestEnqueueNudge_UsesLookupWhenSenderNameEmpty asserts that when the
+// inbound event omits SenderName (the common case for Slack message events),
+// the handler calls LookupUserDisplayName with the SenderUserID and uses
+// the friendly name returned by the lookup as the InboxEvent.User.
+func TestEnqueueNudge_UsesLookupWhenSenderNameEmpty(t *testing.T) {
+	cfg := &Config{
+		OwnerUserID:   "UOWNER",
+		DefaultTarget: "mayor/",
+	}
+	rt := RoutingTable{"cody": "houmanoids/crew/cody"}
+
+	var got InboxEvent
+	looked := ""
+	h := &InboundHandler{
+		GetConfig: func() *Config { return cfg },
+		Routing:   rt,
+		BotUserID: "BOTID",
+		Ephemeral: func(string, string, string) {},
+		EnqueueNudge: func(_ string, ev InboxEvent, _ string) error {
+			got = ev
+			return nil
+		},
+		ResolveSession: func(addr string) (string, error) { return "session-" + addr, nil },
+		CheckSession:   func(string) (bool, error) { return true, nil },
+		LookupUserDisplayName: func(userID string) string {
+			looked = userID
+			return "afik_cohen"
+		},
+	}
+
+	h.Handle(context.Background(), IncomingMessage{
+		Kind:         ConversationDM,
+		ChatID:       "D1",
+		Text:         "hey",
+		SenderUserID: "UOWNER", // owner so the message clears the gate
+		SenderName:   "",       // empty — lookup should fire
+	})
+	if looked != "UOWNER" {
+		t.Fatalf("LookupUserDisplayName called with %q, want %q", looked, "UOWNER")
+	}
+	if got.User != "afik_cohen" {
+		t.Fatalf("User = %q, want %q (from lookup)", got.User, "afik_cohen")
+	}
+}
+
+// TestEnqueueNudge_SenderNamePreferredOverLookup asserts that when the
+// event already carries a SenderName, the lookup callback is NOT invoked —
+// the event-supplied name wins to avoid an unnecessary API roundtrip.
+func TestEnqueueNudge_SenderNamePreferredOverLookup(t *testing.T) {
+	cfg := &Config{
+		OwnerUserID:   "UOWNER",
+		DefaultTarget: "mayor/",
+	}
+	rt := RoutingTable{"cody": "houmanoids/crew/cody"}
+
+	var got InboxEvent
+	lookupCalls := 0
+	h := &InboundHandler{
+		GetConfig: func() *Config { return cfg },
+		Routing:   rt,
+		BotUserID: "BOTID",
+		Ephemeral: func(string, string, string) {},
+		EnqueueNudge: func(_ string, ev InboxEvent, _ string) error {
+			got = ev
+			return nil
+		},
+		ResolveSession: func(addr string) (string, error) { return "session-" + addr, nil },
+		CheckSession:   func(string) (bool, error) { return true, nil },
+		LookupUserDisplayName: func(string) string {
+			lookupCalls++
+			return "wrong"
+		},
+	}
+
+	h.Handle(context.Background(), IncomingMessage{
+		Kind:         ConversationDM,
+		ChatID:       "D1",
+		Text:         "hey",
+		SenderUserID: "UOWNER",
+		SenderName:   "afik_event", // present — lookup should be skipped
+	})
+	if lookupCalls != 0 {
+		t.Fatalf("LookupUserDisplayName called %d times, want 0", lookupCalls)
+	}
+	if got.User != "afik_event" {
+		t.Fatalf("User = %q, want %q (from event SenderName)", got.User, "afik_event")
+	}
+}
