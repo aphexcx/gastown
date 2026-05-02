@@ -120,12 +120,24 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 	)
 
 	// Resolve the sender's gt address once. Used as OutboxMessage.From for
-	// every reply call. Fall back to the raw session name if parse fails
-	// (rare; mostly happens for non-standard session names during dev).
-	senderAddress := session
-	if id, perr := sessionpkg.ParseSessionName(session); perr == nil {
-		if addr := id.Address(); addr != "" {
-			senderAddress = addr
+	// every reply call.
+	//
+	// Prefer detectSender() — same path `gt slack reply` uses
+	// (mail_identity.go) — so MCP-tool replies and CLI replies attribute
+	// to the same identity. detectSender() reads GT_ROLE +
+	// GT_RIG/GT_CREW/GT_POLECAT/GT_DOG_NAME with cwd and .agent fallbacks.
+	//
+	// Fall back to ParseSessionName(GT_SESSION) when detectSender returns
+	// "overseer" (i.e., not running as an agent — extremely unusual for
+	// channel-server but possible during dev/test). Final fallback is the
+	// raw session string.
+	senderAddress := detectSender()
+	if senderAddress == "overseer" {
+		senderAddress = session
+		if id, perr := sessionpkg.ParseSessionName(session); perr == nil {
+			if addr := id.Address(); addr != "" {
+				senderAddress = addr
+			}
 		}
 	}
 
@@ -139,7 +151,8 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 			mcp.WithDescription(
 				"Send a Slack reply to the chat that triggered a <channel> notification. "+
 					"Required: chat_id (from notification meta), text. "+
-					"Optional: thread_ts (from notification meta) to keep the reply threaded under the original message.",
+					"Optional: thread_ts (from notification meta) to keep the reply threaded under the original message; "+
+					"files to upload local images/files alongside the reply.",
 			),
 			mcp.WithString("chat_id", mcp.Required(),
 				mcp.Description("Slack channel/DM ID. Use chat_id from the channel notification meta.")),
@@ -147,12 +160,17 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 				mcp.Description("Reply text. Plain text or Slack mrkdwn formatting.")),
 			mcp.WithString("thread_ts",
 				mcp.Description("Thread timestamp from meta.thread_ts (preferred) or meta.message_ts. Optional but recommended for replies; omit only for top-level DM messages.")),
+			mcp.WithArray("files",
+				mcp.Description("Optional list of absolute paths to local files to upload alongside the reply (e.g., screenshots). Files must already exist on disk; the daemon's publisher uploads them via Slack's files.upload API."),
+				mcp.Items(map[string]any{"type": "string"}),
+			),
 		),
 		func(rctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			result, herr := slack.HandleReply(rctx, townRoot, senderAddress, slack.ReplyArgs{
 				ChatID:   req.GetString("chat_id", ""),
 				Text:     req.GetString("text", ""),
 				ThreadTS: req.GetString("thread_ts", ""),
+				Files:    req.GetStringSlice("files", nil),
 			})
 			if herr != nil {
 				// Internal error — surface as tool error.

@@ -126,6 +126,77 @@ func TestHandleReply_ValidatesEmptySender(t *testing.T) {
 	}
 }
 
+func TestHandleReply_FilesRoundTrip(t *testing.T) {
+	town := t.TempDir()
+	dir := filepath.Join(town, constants.DirRuntime, "slack_outbox")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	args := ReplyArgs{
+		ChatID: "D1",
+		Text:   "see attached",
+		Files:  []string{"/tmp/foo.png", "/tmp/bar.jpg"},
+	}
+	out, err := HandleReply(context.Background(), town, "gastown/crew/cog", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK {
+		t.Fatalf("OK=false; result=%+v", out)
+	}
+
+	// Read the written file and verify Files round-trips.
+	entries, _ := os.ReadDir(dir)
+	var written string
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".json" {
+			written = filepath.Join(dir, e.Name())
+		}
+	}
+	data, _ := os.ReadFile(written)
+	var parsed OutboxMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Files) != 2 || parsed.Files[0] != "/tmp/foo.png" || parsed.Files[1] != "/tmp/bar.jpg" {
+		t.Fatalf("Files = %v, want [/tmp/foo.png /tmp/bar.jpg]", parsed.Files)
+	}
+}
+
+func TestHandleReply_EmptyFilesIsNotPersisted(t *testing.T) {
+	// OutboxMessage.Files has json:"files,omitempty" — confirm that an
+	// empty Files slice doesn't pollute the JSON.
+	town := t.TempDir()
+	dir := filepath.Join(town, constants.DirRuntime, "slack_outbox")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	args := ReplyArgs{
+		ChatID: "D1",
+		Text:   "no files here",
+		// Files: nil
+	}
+	out, err := HandleReply(context.Background(), town, "gastown/crew/cog", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK {
+		t.Fatalf("OK=false; result=%+v", out)
+	}
+	entries, _ := os.ReadDir(dir)
+	var written string
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".json" {
+			written = filepath.Join(dir, e.Name())
+		}
+	}
+	data, _ := os.ReadFile(written)
+	if strings.Contains(string(data), `"files"`) {
+		t.Fatalf("files key present in JSON when empty: %s", string(data))
+	}
+}
+
 func TestHandleReply_TrimsWhitespace(t *testing.T) {
 	town := t.TempDir()
 	dir := filepath.Join(town, constants.DirRuntime, "slack_outbox")

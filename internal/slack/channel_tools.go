@@ -22,7 +22,8 @@ import (
 type ReplyArgs struct {
 	ChatID   string
 	Text     string
-	ThreadTS string // optional; omit for top-level DM replies
+	ThreadTS string   // optional; omit for top-level DM replies
+	Files    []string // optional; absolute paths passed through to OutboxMessage.Files
 }
 
 // ReplyResult is what the tool reports back to the model.
@@ -72,11 +73,16 @@ func HandleReply(_ context.Context, townRoot, senderAddress string, args ReplyAr
 	}
 
 	dir := filepath.Join(townRoot, constants.DirRuntime, "slack_outbox")
+	// Don't validate that Files exist on disk — the publisher already
+	// handles missing-file cases (logs and continues), and stat'ing the
+	// paths here would duplicate that work and could time out on slow
+	// filesystems. Copy the slice to avoid aliasing the caller's input.
 	msg := &OutboxMessage{
 		From:      senderAddress,
 		ChatID:    args.ChatID,
 		Text:      args.Text,
 		ThreadTS:  args.ThreadTS,
+		Files:     append([]string(nil), args.Files...),
 		Timestamp: time.Now(),
 	}
 	path, err := WriteOutboxMessage(dir, msg)
