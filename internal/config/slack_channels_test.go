@@ -42,7 +42,7 @@ func TestMaybeInjectClaudeChannels_DevModeUsesDangerouslyLoadFlag(t *testing.T) 
 		Args:    []string{"--model", "sonnet[1m]"},
 	}
 	maybeInjectClaudeChannels(rc)
-	want := []string{"--model", "sonnet[1m]", "--dangerously-load-development-channels", "plugin:gt-slack@gastown"}
+	want := []string{"--model", "sonnet[1m]", "--dangerously-load-development-channels=plugin:gt-slack@gastown"}
 	if len(rc.Args) != len(want) {
 		t.Fatalf("Args = %v, want %v", rc.Args, want)
 	}
@@ -58,10 +58,10 @@ func TestMaybeInjectClaudeChannels_DevModeIdempotent(t *testing.T) {
 	rc := &RuntimeConfig{
 		Provider: string(AgentClaude),
 		Command:  "claude",
-		Args:    []string{"--dangerously-load-development-channels", "plugin:gt-slack@gastown"},
+		Args:    []string{"--dangerously-load-development-channels=plugin:gt-slack@gastown"},
 	}
 	maybeInjectClaudeChannels(rc)
-	if len(rc.Args) != 2 {
+	if len(rc.Args) != 1 {
 		t.Fatalf("Args = %v, want unchanged (idempotent)", rc.Args)
 	}
 }
@@ -89,7 +89,7 @@ func TestMaybeInjectClaudeChannels_ClaudeAndEnabled(t *testing.T) {
 		Args:    []string{"--model", "sonnet[1m]"},
 	}
 	maybeInjectClaudeChannels(rc)
-	want := []string{"--model", "sonnet[1m]", "--channels", "plugin:gt-slack@gastown"}
+	want := []string{"--model", "sonnet[1m]", "--channels=plugin:gt-slack@gastown"}
 	if len(rc.Args) != len(want) {
 		t.Fatalf("Args = %v, want %v", rc.Args, want)
 	}
@@ -138,7 +138,7 @@ func TestMaybeInjectClaudeChannels_ResolvedClaudeBinaryPath(t *testing.T) {
 		Args:     []string{"--model", "sonnet[1m]"},
 	}
 	maybeInjectClaudeChannels(rc)
-	want := []string{"--model", "sonnet[1m]", "--channels", "plugin:gt-slack@gastown"}
+	want := []string{"--model", "sonnet[1m]", "--channels=plugin:gt-slack@gastown"}
 	if len(rc.Args) != len(want) {
 		t.Fatalf("Args = %v, want %v (Provider check should fire even when Command is a resolved path)", rc.Args, want)
 	}
@@ -159,11 +159,45 @@ func TestMaybeInjectClaudeChannels_Idempotent(t *testing.T) {
 	rc := &RuntimeConfig{
 		Provider: string(AgentClaude),
 		Command:  "claude",
-		Args:    []string{"--channels", "plugin:gt-slack@gastown"},
+		Args:    []string{"--channels=plugin:gt-slack@gastown"},
 	}
 	maybeInjectClaudeChannels(rc)
-	if len(rc.Args) != 2 {
+	if len(rc.Args) != 1 {
 		t.Fatalf("Args = %v, want unchanged (idempotent)", rc.Args)
+	}
+}
+
+// Regression: prompt arg must not be eaten by the variadic --channels flag.
+// Claude's parser treats `--channels` and
+// `--dangerously-load-development-channels` as variadic; a space-separated
+// `--channels plugin:gt-slack@gastown <prompt>` makes the prompt land in
+// the channels list and claude exits with "entries must be tagged: ...".
+// The `--flag=value` form binds the value to the flag as one argv token.
+func TestMaybeInjectClaudeChannels_DoesNotConsumeFollowingPositional(t *testing.T) {
+	withChannelsLookup(t, true, true)
+	rc := &RuntimeConfig{
+		Provider: string(AgentClaude),
+		Command:  "claude",
+		Args:     []string{"--dangerously-skip-permissions"},
+	}
+	maybeInjectClaudeChannels(rc)
+	// Caller appends a prompt as a positional; the channels flag must be
+	// `--flag=value`-form so the prompt isn't slurped as a second value.
+	rc.Args = append(rc.Args, "[GAS TOWN] mayor <- human")
+	for _, a := range rc.Args {
+		if a == "plugin:gt-slack@gastown" {
+			t.Fatalf("plugin ref appears as a standalone token in %v — claude will eat the prompt", rc.Args)
+		}
+	}
+	found := false
+	for _, a := range rc.Args {
+		if a == "--dangerously-load-development-channels=plugin:gt-slack@gastown" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected --flag=value token in %v", rc.Args)
 	}
 }
 

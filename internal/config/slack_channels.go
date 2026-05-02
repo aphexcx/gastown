@@ -90,7 +90,7 @@ func channelsFlagFor(devMode bool) string {
 
 // maybeInjectClaudeChannels mutates rc.Args in-place by appending the
 // channels launch flag (--channels or --dangerously-load-development-channels)
-// followed by plugin:gt-slack@gastown when:
+// in the `--flag=value` form when:
 //   - slack channels are enabled (channels_enabled: true in slack.json), AND
 //   - the runtime is Claude (Provider equals AgentClaude).
 //
@@ -99,8 +99,19 @@ func channelsFlagFor(devMode bool) string {
 // ~/.claude/local/claude (see resolveClaudePath in agents.go). Provider
 // is set from the preset name and doesn't get rewritten.
 //
-// Idempotent: if the chosen flag is already paired with our plugin ref,
-// it is not appended again. Safe to call when rc is nil (no-op).
+// **Why the `--flag=value` form (not space-separated):** Claude Code parses
+// `--channels` and `--dangerously-load-development-channels` as variadic
+// flags that consume positional tokens until the next `-`-prefixed argument.
+// Argv from BuildCommandWithPrompt ends with the startup-prompt positional
+// arg, so a space-separated form like `--channels plugin:gt-slack@gastown
+// "<prompt>"` makes the parser eat the prompt as a second channel value and
+// claude exits with `--dangerously-load-development-channels entries must
+// be tagged: plugin:<name>@<marketplace>`. The `--flag=value` form binds
+// the value to the flag as a single argv token, leaving the prompt arg
+// unambiguous. (Verified empirically against the shipped claude binary.)
+//
+// Idempotent: if the chosen flag-with-value token is already present, it
+// is not appended again. Safe to call when rc is nil (no-op).
 func maybeInjectClaudeChannels(rc *RuntimeConfig) {
 	if rc == nil || rc.Provider != string(AgentClaude) {
 		return
@@ -109,12 +120,11 @@ func maybeInjectClaudeChannels(rc *RuntimeConfig) {
 	if !enabled {
 		return
 	}
-	flag := channelsFlagFor(devMode)
-	// Idempotency: skip if our flag with the gt-slack ref is already present.
-	for i, a := range rc.Args {
-		if a == flag && i+1 < len(rc.Args) && rc.Args[i+1] == slackChannelsPluginRef {
+	token := channelsFlagFor(devMode) + "=" + slackChannelsPluginRef
+	for _, a := range rc.Args {
+		if a == token {
 			return
 		}
 	}
-	rc.Args = append(rc.Args, flag, slackChannelsPluginRef)
+	rc.Args = append(rc.Args, token)
 }
