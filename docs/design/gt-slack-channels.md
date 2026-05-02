@@ -1,9 +1,14 @@
 # gt slack: Claude channels delivery
 
-**Status**: design
-**Date**: 2026-04-30
+**Status**: implemented + dogfooded; awaiting upstream PR
+**Date**: 2026-04-30 (designed) / 2026-05-01 (e2e verified)
 **Author**: cog (gastown/crew/cog)
 **Related**: gt-zei3e (immediate fix), feat/gt-slack-router
+
+> Note: this doc was written design-first and has been updated post-implementation
+> to reflect what we actually shipped (e2e session on 2026-05-01). The "Spike"
+> sections below remain accurate. Sections marked **[e2e finding]** capture
+> production discoveries that weren't in the original design.
 
 ## Goal
 
@@ -371,9 +376,87 @@ Test: launched `claude --dangerously-load-development-channels plugin:gt-slack@s
 - **Layer 2 (DOES NOT EXIST)**: Claude Code does not auto-restart. Skip this layer entirely.
 - **Layer 3 (required)**: ship a `gt slack channel-supervisor` outer process. The plugin's `.mcp.json` runs the supervisor; the supervisor `exec`s `gt slack channel-server` in a backoff loop. The supervisor is a tiny outer wrapper (~30-50 LOC) — its only jobs are: launch the server, restart on non-zero exit with exponential backoff (250ms → 1s → 5s → 30s, cap at 30s), and exit cleanly when stdin closes (i.e., Claude Code shutting down the plugin).
 
+## E2E findings (2026-05-01)
+
+Live verification with mayor's tmux session, gt slack daemon, and a real Slack app surfaced four issues that weren't in the original design. All fixed in `feat/gt-slack-router` between commits `8a179096` and `23515fa5`.
+
+### 1. `--channels` allowlist gate is tier-conditional, not a simple opt-in
+
+Spike 1's analysis of the binary's `nL8` function correctly identified that `allowedChannelPlugins` in managed-settings only applies on team/enterprise tier — but we initially recorded that as "fall through to Anthropic's curated ledger for everyone else". The dogfood reality on a Claude Max account: trying `claude --channels plugin:gt-slack@gastown` produces `not on the approved channels allowlist`. The escape hatch is `--dangerously-load-development-channels plugin:gt-slack@gastown`.
+
+**Plus**: the dev-channels flag is itself gated by an org-policy check that requires `channelsEnabled: true` in **system-level managed settings** at `/Library/Application Support/ClaudeCode/managed-settings.json` (NOT user-level `~/Library/...`). Earlier we tried user-level — it's silently ignored. The system path requires sudo to write but is the only path that satisfies the policy gate.
+
+**Fix landed**: added `channels_dev_mode: true|false` to slack.json (commit `8a179096`). When true, the auto-inject in `internal/config/slack_channels.go::maybeInjectClaudeChannels` uses `--dangerously-load-development-channels` instead of `--channels`. Production deployments (team/enterprise with allowlisted plugin) keep the flag false; individual-tier dogfood sets it true.
+
+### 2. Empty/zero meta fields drop the entire notification
+
+Spike 1's stub successfully rendered a `<channel>` tag from a flat-meta notification with 5 string scalar fields, all populated. The production channel-server's emitter populates 10 fields, including `attachments_summary: ""` (empty when no files), `channel_name: ""` (empty for DMs), and `bot_mentioned: false` (zero-value bool). Claude Code silently drops the entire `notifications/claude/channel` whenever any meta value is empty-string or false-bool.
+
+**Fix landed** (commit `3976fd71`): `MCPEmitter.Emit` builds the meta map conditionally, only including non-empty/non-zero fields. This matches the InboxEvent struct's `omitempty` tags semantically. The Telegram plugin uses the same conditional-add pattern.
+
+### 3. GT_SESSION normalization
+
+The channel-server originally used `GT_SESSION` verbatim as the beacon-path key. The daemon's dispatch resolves the slack address ("mayor/") to a tmux session name ("hq-mayor") via `ResolveAddressToSession`, then probes `slack_inbox/<sessionName>/.subscribed`. When `GT_SESSION` was set to an address form ("mayor/", which `safeSession()` converts to `mayor_`), the channel-server's beacon landed at `slack_inbox/mayor_/.subscribed` — daemon's lookup never found it, fell back to nudge_queue.
+
+**Fix landed** (commit `9841d8e7`): channel-server checks if `GT_SESSION` contains `/` and, if so, normalizes via `slack.ResolveAddressToSession` before computing the beacon path. Both forms produce the same canonical session name.
+
+### 4. Friendly user labels via users.info
+
+Most inbound `message.im` events from Slack don't include the sender's display name — only the user ID (e.g., `U0AN32RPBFT`). With nothing else, the rendered `<channel>` tag's user attribute showed the cryptic ID:
+
+```
+← gt-slack · U0AN32RPBFT: hi
+```
+
+**Fix landed** (commit `ee6e1adc`): added `Client.LookupUserDisplayName(ctx, userID)` backed by a 30-minute TTL in-memory cache. Resolution priority mirrors Slack's UI hint: `profile.display_name → profile.real_name → user.name → raw ID`. Wired into `InboundHandler.LookupUserDisplayName` callback; daemon-side handler (3-second timeout) falls back to user ID on lookup error so a transient `users.info` failure never drops an inbound message.
+
+### Other refinements (smaller)
+
+- **`reply` MCP tool sender attribution** (`fc8ff86e`): now uses the same `cmd.detectSender()` path as `gt slack reply`. Previously diverged by using only `ParseSessionName(GT_SESSION)`, which produced different `From` values when only `GT_ROLE` was set.
+- **`reply` tool gains `files` array param** (`fc8ff86e`): matches CLI's `--files`. Plumbs into `OutboxMessage.Files`; existing publisher uploads via `files.upload` API.
+- **mcp-go `OnError` hook wired** (`23515fa5`): surfaces per-session send failures (e.g., notification channel blocked) to stderr. Without this, mcp-go silently dropped notifications when its per-session buffer was full.
+
+## Setup checklist (one-time, per machine)
+
+For non-team/enterprise Claude accounts (Pro/Max), running this locally:
+
+1. **Build + install**: `cd cog && make install` — drops `gt` into `~/.local/bin/`.
+2. **Slack config** at `~/gt/config/slack.json`:
+   ```json
+   {
+     "bot_token": "xoxb-...",
+     "app_token": "xapp-...",
+     "owner_user_id": "U...",
+     "default_target": "mayor/",
+     "channels_enabled": true,
+     "channels_dev_mode": true,
+     "channels": { ... }
+   }
+   ```
+3. **Plugin marketplace + install** (one-time per Claude Code config):
+   ```
+   /plugin marketplace add ~/gt/gastown/crew/cog/plugins
+   /plugin install gt-slack@gastown
+   ```
+4. **System-level managed settings** (sudo, one-time per machine):
+   ```json
+   // /Library/Application Support/ClaudeCode/managed-settings.json
+   {
+     "channelsEnabled": true,
+     "allowedChannelPlugins": [
+       { "marketplace": "gastown", "plugin": "gt-slack" }
+     ]
+   }
+   ```
+5. **Daemon**: `gt slack start`. Each Claude crew agent restart will auto-inject the channels flag via the config-layer mutation in `BuildStartupCommand`.
+
+For team/enterprise accounts deploying the plugin to allowlisted users, `channels_dev_mode` stays false and the regular `--channels` flag works.
+
 ## Open questions
 
 Items previously listed as open are now resolved in the spec or moved to Spike 1 acceptance criteria. Remaining genuinely-open:
 
 1. **Cleanup of orphaned `slack_inbox/` dirs** for sessions that no longer exist. Probably a daemon-side periodic sweep similar to `nudge_queue` TTL, but not blocking. Leaving empty dirs alone is harmless. Defer until we observe accumulation.
 2. **TTL for inbox files.** Daemon side should expire un-drained inbox events after some duration (matching the existing `nudge_queue` urgent TTL of 2h?). Not strictly required if Claude sessions are restarted often, but good hygiene. Defer to follow-up.
+3. **Hot-loop retry persistence.** `ChannelServer`'s per-path failure tracker (Task 7) is in-memory only. A supervisor-driven restart resets the counter, so a chronically-failing path retries from scratch each launch. Acceptable but worth flagging — if observed in practice, persist counters or move to a daemon-side dead-letter dir similar to `slack_outbox/failed/`.
+4. **Anthropic-side allowlist for upstream**. Once gastown is upstream, ideally `gt-slack@gastown` (or whatever the canonical name is) gets onto Anthropic's curated channel-plugin allowlist so users on individual tiers can use plain `--channels` without the dev flag. Until then, `channels_dev_mode: true` is the path on Pro/Max.
