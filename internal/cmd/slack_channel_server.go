@@ -110,6 +110,17 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 	//      Claude silently drops every notification.
 	//   2. WithInstructions(...) — tells Claude how to render and reply.
 	//   3. WithLogging() — surfaces server-side errors back to the client.
+	//   4. WithHooks + AddOnError — surface per-session send failures
+	//      (e.g., notification channel blocked) to stderr. Without this,
+	//      mcp-go silently drops notifications when the per-session
+	//      buffer is full and we have no way to know inbound messages
+	//      aren't reaching the assistant.
+	mcpHooks := &server.Hooks{}
+	mcpHooks.AddOnError(func(_ context.Context, _ any, method mcp.MCPMethod, _ any, err error) {
+		fmt.Fprintf(cmd.OutOrStderr(),
+			"channel-server: mcp-go OnError method=%s err=%v\n", method, err)
+	})
+
 	mcpSrv := server.NewMCPServer("gt-slack", "0.1.0",
 		server.WithLogging(),
 		server.WithExperimental(map[string]any{
@@ -117,6 +128,7 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 		}),
 		server.WithInstructions(channelServerInstructions),
 		server.WithToolCapabilities(true), // for the reply tool registered below
+		server.WithHooks(mcpHooks),
 	)
 
 	// Resolve the sender's gt address once. Used as OutboxMessage.From for
