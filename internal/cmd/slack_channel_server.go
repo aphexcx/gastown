@@ -18,13 +18,11 @@ import (
 )
 
 // slackChannelServerCmd is the per-session MCP server Claude Code launches
-// via the gt-slack plugin's .mcp.json. Reads GT_SESSION from env, watches
-// the per-session inbox dir for events written by gt slack daemon, and
-// emits notifications/claude/channel via MCP. Registers the reply MCP
-// tool so Claude can post replies via the existing slack_outbox
-// publisher pipeline. Task 9b adds a supervisor wrapper that exec's this
-// in a backoff loop because Spike 2 confirmed Claude Code does not
-// auto-restart MCP servers.
+// via the gt-slack plugin's .mcp.json (through channel-supervisor). Reads
+// GT_SESSION from env, watches the per-session inbox dir for events
+// written by gt slack daemon, emits notifications/claude/channel via MCP,
+// and registers the reply MCP tool so Claude can post replies via the
+// slack_outbox publisher pipeline.
 //
 // Hidden because it's only invoked by Claude Code (when an agent's session
 // is launched with --channels plugin:gt-slack@gastown) — never by humans.
@@ -39,7 +37,7 @@ the gt slack daemon and emits notifications/claude/channel for each.
 
 Not for direct invocation. Launched automatically when a Gas Town session
 starts with --channels plugin:gt-slack@gastown (gated by slack.json's
-channels_enabled flag — Task 12 wires the auto-injection).`,
+channels_enabled flag).`,
 	Hidden: true,
 	Args:   cobra.NoArgs,
 	RunE:   runSlackChannelServer,
@@ -51,7 +49,7 @@ func init() {
 
 // channelServerInstructions is the instructions field the MCP server
 // declares during init, telling Claude how to interpret <channel> tags
-// and that replies must use the reply tool (Task 9).
+// and that replies must use the reply tool.
 const channelServerInstructions = `Messages from Slack arrive as <channel source="plugin:gt-slack:gt-slack" chat_id="..." kind="dm|channel" message_ts="..." thread_ts="..." sender_user_id="..." user="..." channel_name="..." bot_mentioned="..." attachments_summary="...">CONTENT</channel>.
 
 To respond to the user via Slack, call the 'reply' tool with chat_id from the channel tag's attributes. Pass thread_ts when present to keep the reply threaded under the original message; omit it for top-level DM replies.
@@ -63,7 +61,7 @@ Access control is enforced by the central gt slack daemon (privacy gate / owner 
 func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 	session := os.Getenv("GT_SESSION")
 	if session == "" {
-		return fmt.Errorf("GT_SESSION env var not set; channel-server must be launched by gt session-spawn (use --channels plugin:gt-slack@gastown)")
+		return fmt.Errorf("GT_SESSION env var not set; channel-server must be launched by gt session-spawn (via --channels or --dangerously-load-development-channels for plugin:gt-slack@gastown)")
 	}
 
 	// Normalize: GT_SESSION may be set to a gt address ("mayor/",
@@ -104,16 +102,14 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 		cancel()
 	}()
 
-	// Build the MCP server. Critical bits per Spike 1:
-	//   1. WithExperimental({"claude/channel": {}}) — without this,
-	//      Claude silently drops every notification.
-	//   2. WithInstructions(...) — tells Claude how to render and reply.
-	//   3. WithLogging() — surfaces server-side errors back to the client.
-	//   4. WithHooks + AddOnError — surface per-session send failures
-	//      (e.g., notification channel blocked) to stderr. Without this,
-	//      mcp-go silently drops notifications when the per-session
-	//      buffer is full and we have no way to know inbound messages
-	//      aren't reaching the assistant.
+	// WithExperimental({"claude/channel": {}}) is REQUIRED — without it
+	// Claude Code silently drops every notification with reason="server
+	// did not declare claude/channel capability".
+	//
+	// AddOnError surfaces per-session send failures (e.g., notification
+	// buffer full) to stderr; otherwise mcp-go drops notifications
+	// silently and we have no way to know inbound messages aren't
+	// reaching the assistant.
 	mcpHooks := &server.Hooks{}
 	mcpHooks.AddOnError(func(_ context.Context, _ any, method mcp.MCPMethod, _ any, err error) {
 		fmt.Fprintf(cmd.OutOrStderr(),
@@ -195,24 +191,13 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 		},
 	)
 
-	// Per Spike 1: SendNotificationToAllClients filters out non-Initialized
-	// sessions, so we MUST wait for notifications/initialized before
-	// starting the channel-server's loop. The handler closes a ready
-	// channel that gates beacon acquisition + the inbox watch loop.
-	//
-	// CRITICAL: there is no grace-delay backstop. An earlier version had
-	// a 750ms timer that closed `ready` if notifications/initialized
-	// hadn't fired — but mcp-go silently drops notifications until
-	// session.Initialized() flips true (which only happens via the real
-	// MCP initialize request). Opening the loop on the timer would let
-	// the channel-server claim+delete inbox files while the notifications
-	// it emits go nowhere, silently losing inbound Slack messages.
-	//
-	// If notifications/initialized never fires (e.g., supervisor-restart
-	// path where Claude already consumed the initialize for the dead
-	// child), the inbox loop simply never starts. The daemon's flock
-	// probe sees the beacon as unowned and falls back to the legacy
-	// nudge_queue path — durable, non-lossy.
+	// SendNotificationToAllClients filters out non-Initialized sessions,
+	// so we MUST wait for notifications/initialized before starting the
+	// inbox loop. NO grace-delay backstop: opening the loop before init
+	// fires would let channel-server claim+delete inbox files while the
+	// notifications go nowhere, silently losing messages. If init never
+	// fires the daemon's flock probe sees the beacon as unowned and
+	// falls back to the legacy nudge_queue path.
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	mcpSrv.AddNotificationHandler("notifications/initialized",

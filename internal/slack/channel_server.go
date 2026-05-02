@@ -4,15 +4,13 @@
 // delete on success or restore on failure for a future retry.
 //
 // The Emitter interface is the seam between this package and the MCP
-// transport. Production code passes an Emitter that calls
-// notifications/claude/channel via the MCP server (Task 8). Tests pass
-// a fake Emitter that records into a slice.
+// transport. Production passes an MCPEmitter that calls
+// notifications/claude/channel via the MCP server; tests pass a fake
+// Emitter that records into a slice.
 package slack
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -241,7 +239,7 @@ func (s *ChannelServer) processOne(ctx context.Context, path string) {
 	}
 	s.failuresMu.Unlock()
 
-	claimed := path + ".claimed." + channelRandSuffix()
+	claimed := path + ".claimed." + randomSuffix()
 	if err := os.Rename(path, claimed); err != nil {
 		// Lost the race or file already gone — fine.
 		return
@@ -337,10 +335,3 @@ func (s *ChannelServer) scheduleRetry(ctx context.Context, path string, wait tim
 	}()
 }
 
-// channelRandSuffix returns a 4-byte hex string. Distinct name from the
-// outbox.go randomSuffix to avoid same-package collision.
-func channelRandSuffix() string {
-	var b [4]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}

@@ -31,7 +31,7 @@ type slackChannelsConfigShape struct {
 	ChannelsEnabled bool `json:"channels_enabled"`
 	// ChannelsDevMode, when true, makes the auto-inject use Claude Code's
 	// --dangerously-load-development-channels flag instead of --channels.
-	// Required on Pro/Max accounts: per Spike 1, the curated allowlist gate
+	// Required on Pro/Max accounts: Claude Code's curated allowlist gate
 	// only honors managed-settings overrides on team/enterprise tier, so
 	// individual-tier users running an in-repo plugin (gt-slack@gastown)
 	// must use the dev flag. Default false (production deployment via

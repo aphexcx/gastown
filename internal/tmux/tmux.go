@@ -1826,94 +1826,83 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 	return nil
 }
 
+// pollForDialog repeatedly captures the pane and runs match against its
+// content. On match, it invokes dismiss and waits postDismissDelay so the
+// next handler sees post-dismissal state. Returns early (nil) if earlyExit
+// returns true — used to bail when the prompt is visible or a downstream
+// dialog has already taken over.
+//
+// Used by AcceptDevChannelsDialog / AcceptWorkspaceTrustDialog /
+// AcceptBypassPermissionsWarning. Capture errors are tolerated (just retry
+// after PollInterval) — pane scrape is best-effort and errors usually mean
+// the session is in transition.
+func (t *Tmux) pollForDialog(
+	session string,
+	match func(string) bool,
+	earlyExit func(string) bool,
+	dismiss func() error,
+	postDismissDelay time.Duration,
+) error {
+	deadline := time.Now().Add(constants.DialogPollTimeout)
+	for time.Now().Before(deadline) {
+		content, err := t.CapturePane(session, 30)
+		if err != nil {
+			time.Sleep(constants.DialogPollInterval)
+			continue
+		}
+		if match(content) {
+			if err := dismiss(); err != nil {
+				return err
+			}
+			time.Sleep(postDismissDelay)
+			return nil
+		}
+		if earlyExit(content) {
+			return nil
+		}
+		time.Sleep(constants.DialogPollInterval)
+	}
+	return nil
+}
+
 // AcceptDevChannelsDialog dismisses the "WARNING: Loading development channels"
 // confirmation Claude shows when launched with --dangerously-load-development-channels.
 // Option 1 ("I am using this for local development") is pre-selected, so Enter
 // accepts.
 //
 // Polls because the dev-channels dialog renders only AFTER the workspace trust
-// dialog is dismissed (verified by capturing pane state during a real launch).
-// Single capture-and-check would race the trust dismissal and miss the dialog.
-// Exits early if the agent prompt or bypass-permissions dialog is visible —
-// signals the dev-channels dialog is gone (already accepted) or never appeared
-// (no --dangerously-load-development-channels flag).
+// dialog is dismissed; a single capture-and-check would race the trust
+// dismissal and miss the dialog.
 func (t *Tmux) AcceptDevChannelsDialog(session string) error {
-	deadline := time.Now().Add(constants.DialogPollTimeout)
-	for time.Now().Before(deadline) {
-		content, err := t.CapturePane(session, 30)
-		if err != nil {
-			time.Sleep(constants.DialogPollInterval)
-			continue
-		}
-
-		if strings.Contains(content, "Loading development channels") {
-			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-				return err
-			}
-			// Wait for dialog to dismiss before proceeding so the next handler
-			// sees post-dismissal state.
-			time.Sleep(500 * time.Millisecond)
-			return nil
-		}
-
-		// Early exit: prompt visible (dialog already accepted or never shown),
-		// or bypass-permissions dialog up next (handled by the next handler).
-		if containsPromptIndicator(content) || strings.Contains(content, "Bypass Permissions mode") {
-			return nil
-		}
-
-		time.Sleep(constants.DialogPollInterval)
-	}
-
-	// Timeout — no dialog detected, safe to proceed
-	return nil
+	return t.pollForDialog(session,
+		func(c string) bool { return strings.Contains(c, "Loading development channels") },
+		func(c string) bool {
+			return containsPromptIndicator(c) || strings.Contains(c, "Bypass Permissions mode")
+		},
+		func() error { _, err := t.run("send-keys", "-t", session, "Enter"); return err },
+		500*time.Millisecond,
+	)
 }
 
 // AcceptWorkspaceTrustDialog dismisses workspace trust dialogs for supported
 // agents. Claude shows "Quick safety check"; Codex shows
 // "Do you trust the contents of this directory?". In both cases the safe
 // continue option is pre-selected, so Enter accepts the dialog.
-//
-// Uses a polling loop instead of a single check to handle the race condition where
-// the agent hasn't rendered the dialog yet when we first check. Exits early if the
-// agent prompt appears (indicating no dialog will be shown).
 func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
-	deadline := time.Now().Add(constants.DialogPollTimeout)
-	for time.Now().Before(deadline) {
-		content, err := t.CapturePane(session, 30)
-		if err != nil {
-			time.Sleep(constants.DialogPollInterval)
-			continue
-		}
-
-		// Look for characteristic trust dialog text before prompt detection.
-		// Codex trust screens include a leading ">" banner line, so prompt
-		// detection alone would exit too early.
-		if containsWorkspaceTrustDialog(content) {
-			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
-			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-				return err
-			}
-			// Wait for dialog to dismiss before proceeding
-			time.Sleep(500 * time.Millisecond)
-			return nil
-		}
-
-		// Early exit: if agent prompt or shell prompt is visible, no trust dialog will appear.
-		// Claude prompt is ">", shell prompts are "$", "%", "#".
-		// Also exit if a downstream dialog is visible — trust must have been
-		// dismissed already.
-		if containsPromptIndicator(content) ||
-			strings.Contains(content, "Bypass Permissions mode") ||
-			strings.Contains(content, "Loading development channels") {
-			return nil
-		}
-
-		time.Sleep(constants.DialogPollInterval)
-	}
-
-	// Timeout — no dialog detected, safe to proceed
-	return nil
+	return t.pollForDialog(session,
+		containsWorkspaceTrustDialog,
+		// Codex trust screens include a leading ">" banner, so check the
+		// dialog text BEFORE prompt detection (handled by ordering: match
+		// runs first). Bail if a downstream dialog is up — trust must
+		// already be gone.
+		func(c string) bool {
+			return containsPromptIndicator(c) ||
+				strings.Contains(c, "Bypass Permissions mode") ||
+				strings.Contains(c, "Loading development channels")
+		},
+		func() error { _, err := t.run("send-keys", "-t", session, "Enter"); return err },
+		500*time.Millisecond,
+	)
 }
 
 func containsWorkspaceTrustDialog(content string) bool {
@@ -1922,12 +1911,8 @@ func containsWorkspaceTrustDialog(content string) bool {
 		strings.Contains(content, "Do you trust the contents of this directory?")
 }
 
-// promptSuffixes are strings that indicate a shell or agent prompt is visible.
-// Claude prompt ends with ">", shell prompts end with "$", "%", "#", or "❯".
 var promptSuffixes = []string{">", "$", "%", "#", "❯"}
 
-// containsPromptIndicator checks if pane content contains a prompt indicator
-// that signals a shell or agent is ready (no dialog blocking it).
 func containsPromptIndicator(content string) bool {
 	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -1943,50 +1928,23 @@ func containsPromptIndicator(content string) bool {
 	return false
 }
 
-// AcceptBypassPermissionsWarning dismisses the Claude Code bypass permissions warning dialog.
-// When Claude starts with --dangerously-skip-permissions, it shows a warning dialog that
-// requires pressing Down arrow to select "Yes, I accept" and then Enter to confirm.
-// This function checks if the warning is present before sending keys to avoid interfering
-// with sessions that don't show the warning (e.g., already accepted or different config).
-//
-// Uses a polling loop instead of a single check to handle the race condition where
-// Claude hasn't rendered the dialog yet when we first check. Exits early if the
-// agent prompt appears (indicating no dialog will be shown).
-//
-// Call this after starting Claude and waiting for it to initialize (WaitForCommand),
-// but before sending any prompts.
+// AcceptBypassPermissionsWarning dismisses the bypass-permissions warning
+// Claude shows under --dangerously-skip-permissions. Down selects
+// "Yes, I accept", then Enter confirms.
 func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
-	deadline := time.Now().Add(constants.DialogPollTimeout)
-	for time.Now().Before(deadline) {
-		content, err := t.CapturePane(session, 30)
-		if err != nil {
-			time.Sleep(constants.DialogPollInterval)
-			continue
-		}
-
-		// Look for the characteristic warning text
-		if strings.Contains(content, "Bypass Permissions mode") {
-			// Dialog found — press Down to select "Yes, I accept" then Enter
+	return t.pollForDialog(session,
+		func(c string) bool { return strings.Contains(c, "Bypass Permissions mode") },
+		containsPromptIndicator,
+		func() error {
 			if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
 				return err
 			}
 			time.Sleep(200 * time.Millisecond)
-			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		// Early exit: if agent prompt or shell prompt is visible, no dialog will appear
-		if containsPromptIndicator(content) {
-			return nil
-		}
-
-		time.Sleep(constants.DialogPollInterval)
-	}
-
-	// Timeout — no dialog detected, safe to proceed
-	return nil
+			_, err := t.run("send-keys", "-t", session, "Enter")
+			return err
+		},
+		0,
+	)
 }
 
 // DismissStartupDialogsBlind sends the key sequences needed to dismiss all

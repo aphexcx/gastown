@@ -137,8 +137,7 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			// Resolve address → session name, then dispatch:
 			//   subscribed (channel-server alive) → write InboxEvent JSON
 			//     to slack_inbox/<sess>/<ts>.json
-			//   unsubscribed/error → fall back to legacy nudge_queue +
-			//     StartPoller (gt-zei3e fix path)
+			//   unsubscribed/error → fall back to nudge_queue + StartPoller
 			//
 			// StartPoller is idempotent — it no-ops if a poller is already
 			// alive for this session.
@@ -164,9 +163,9 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 			}
 
 			// Legacy path (non-Claude agents, Claude without --channels
-			// enrolled, or Claude with the plugin currently dead).
-			// Existing gt-zei3e fix: also start a poller so the queue
-			// actually drains for idle agents.
+			// enrolled, or Claude with the plugin currently dead). Also
+			// start a nudge poller so the queue drains for idle agents
+			// (UserPromptSubmit hook only fires on user input).
 			if err := nudge.Enqueue(opts.TownRoot, sessionName, nudge.QueuedNudge{
 				Sender:   "slack",
 				Message:  fallbackBody,

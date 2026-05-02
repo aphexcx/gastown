@@ -1,7 +1,7 @@
 // MCPEmitter implements Emitter by sending notifications/claude/channel
-// via an mcp-go MCPServer's notification facility. Spike 1 verified this
-// reaches the assistant context as a <channel source="..." flat-meta-key="...">
-// content body</channel> tag.
+// via an mcp-go MCPServer's notification facility. Claude Code renders
+// the notification as a <channel source="..." meta-key="..."> content
+// </channel> tag injected into the assistant context.
 //
 // MUST be paired with a server constructed via:
 //
@@ -49,7 +49,7 @@ func NewMCPEmitter(srv *server.MCPServer) *MCPEmitter {
 //	    "user":                "<display name; rendered as channel sender label>",
 //	    "channel_name":        "<channel name>",
 //	    "bot_mentioned":       <bool>,
-//	    "attachments_summary": "<flat string; nested arrays are silently dropped per Spike 1>",
+//	    "attachments_summary": "<flat string; nested arrays are silently dropped by the renderer>",
 //	  }
 //	}
 //
@@ -65,10 +65,10 @@ func NewMCPEmitter(srv *server.MCPServer) *MCPEmitter {
 // the "fire and forget" semantics of MCP notifications (no per-message
 // ack from the client).
 func (e *MCPEmitter) Emit(ev InboxEvent) error {
-	// Only send non-empty/non-zero meta fields. Spike 1 confirmed Claude
-	// renders all meta keys as <channel> tag attributes; omit empty values
-	// to keep the rendered tag clean and match the schema's omitempty
-	// JSON tags. Booleans are sent only when true (omitempty parity).
+	// Only send non-empty/non-zero meta fields. Claude Code's renderer
+	// silently drops the entire notification when ANY meta value is an
+	// empty string or false bool, so we must omit them rather than send
+	// "" or false. Matches the InboxEvent struct's omitempty JSON tags.
 	meta := map[string]any{
 		"chat_id":    ev.ChatID,
 		"kind":       ev.Kind,

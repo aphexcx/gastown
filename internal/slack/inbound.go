@@ -351,13 +351,19 @@ func (h *InboundHandler) Handle(ctx context.Context, msg IncomingMessage) {
 	}
 }
 
-// kindString maps the typed ConversationKind to the wire string Claude's
-// <channel> tag renderer expects ("dm" or "channel").
+// Kind* are the wire strings that go into InboxEvent.Kind and the
+// rendered <channel> tag's kind="..." attribute. Stable contract with
+// Claude Code's renderer.
+const (
+	KindDM      = "dm"
+	KindChannel = "channel"
+)
+
 func kindString(k ConversationKind) string {
 	if k == ConversationDM {
-		return "dm"
+		return KindDM
 	}
-	return "channel"
+	return KindChannel
 }
 
 // isoFromSlackTS parses Slack's "1714510123.000200" float-string and
@@ -384,9 +390,8 @@ func isoFromSlackTS(ts string) string {
 }
 
 // summarizeAttachments returns a flat string for the InboxEvent
-// AttachmentsSummary field — Spike 1 confirmed nested arrays are
-// dropped by Claude's renderer, so we flatten ahead of the wire.
-// Empty input returns empty string.
+// AttachmentsSummary field — nested arrays are dropped by Claude's
+// renderer, so we flatten ahead of the wire. Empty input returns "".
 func summarizeAttachments(meta []AttachmentMeta) string {
 	if len(meta) == 0 {
 		return ""

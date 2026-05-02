@@ -8,29 +8,24 @@
 package slack
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // InboxEvent is the JSON shape the daemon writes to a per-session inbox
-// directory. Field names match what Claude Code renders as <channel>
-// attributes (Spike 1 confirmed: flat scalars only — no nested arrays
-// or objects in meta).
+// directory. Field names map to <channel> tag attributes Claude renders.
 //
-// HARD REQUIREMENT: this struct must stay flat-scalar-only. Adding any
-// non-scalar field (slice, map, nested struct) would break Claude's
-// <channel> rendering — Spike 1 showed Claude silently drops nested
-// objects/arrays from MCP notification meta, so a nested field would
-// vanish at the renderer with no error. If you need richer payloads,
-// flatten them into scalar summary fields (see AttachmentsSummary).
+// HARD REQUIREMENT: this struct must stay flat-scalar-only. Claude
+// Code's renderer silently drops nested objects/arrays from MCP
+// notification meta, so any new non-scalar field would vanish with no
+// error. Flatten richer payloads into scalar summary fields instead
+// (see AttachmentsSummary).
 //
 // The "user" field (not "sender_label") is the sender display name —
 // Claude uses it in the rendered tag's user-visible label
@@ -97,32 +92,14 @@ func writeInboxIfSubscribed(townRoot, session string, ev InboxEvent) (bool, erro
 	dir := InboxDir(townRoot, session)
 	// 0700: inbox dirs hold Slack message bodies which can be sensitive.
 	// Matches slack_outbox/ permissions (publisher uses 0700/0600 too).
+	// 0700 to keep Slack message bodies private; matches slack_outbox/.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, fmt.Errorf("create inbox dir: %w", err)
 	}
-	data, err := json.MarshalIndent(&ev, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), inboxRandSuffix())
-	tmp := filepath.Join(dir, name+".tmp")
+	name := fmt.Sprintf("%d-%s.json", time.Now().UnixNano(), randomSuffix())
 	final := filepath.Join(dir, name)
-	// 0600: same rationale — Slack message bodies are sensitive.
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
+	if err := atomicfile.WriteJSONWithPerm(final, &ev, 0o600); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-// inboxRandSuffix is a 4-byte hex helper, distinct name from
-// channel_server.go's channelRandSuffix and outbox.go's randomSuffix
-// to avoid same-package collision.
-func inboxRandSuffix() string {
-	var b [4]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }
