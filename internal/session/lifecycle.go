@@ -188,13 +188,21 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		})
 	}
 
-	// Prepend GT_RUN (GASTA run ID) and any extra env vars into the command so
-	// that they are inherited by the initial shell before tmux SetEnvironment runs.
-	extraWithRun := make(map[string]string, len(cfg.ExtraEnv)+1)
+	// Prepend GT_RUN (GASTA run ID), GT_SESSION (tmux session name), and any
+	// extra env vars into the command so that they are inherited by the initial
+	// shell before tmux SetEnvironment runs.
+	//
+	// GT_SESSION must be on the inline-env (not just `tmux set-environment`)
+	// because MCP server children spawned by the agent (e.g., gt-slack
+	// channel-supervisor → channel-server) inherit the agent's process env,
+	// not the tmux session env. Without it on the inline-env, channel-server
+	// exits immediately with "GT_SESSION env var not set".
+	extraWithRun := make(map[string]string, len(cfg.ExtraEnv)+2)
 	for k, v := range cfg.ExtraEnv {
 		extraWithRun[k] = v
 	}
 	extraWithRun["GT_RUN"] = runID
+	extraWithRun["GT_SESSION"] = cfg.SessionID
 	command = config.PrependEnv(command, extraWithRun)
 
 	// 4. Create tmux session with command.
