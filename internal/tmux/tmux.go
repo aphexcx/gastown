@@ -1804,18 +1804,51 @@ func (t *Tmux) NudgePane(pane, message string) error {
 
 // AcceptStartupDialogs dismisses startup dialogs that can block automated
 // sessions. Currently handles (in order):
-//  1. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
-//  2. Bypass permissions warning ("Bypass Permissions mode") — requires Down+Enter
+//  1. Dev-channels warning ("WARNING: Loading development channels") — Enter
+//     accepts. Fires when claude is launched with
+//     --dangerously-load-development-channels (gt-slack channels delivery
+//     in dev mode).
+//  2. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
+//  3. Bypass permissions warning ("Bypass Permissions mode") — requires Down+Enter
 //
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
+	if err := t.AcceptDevChannelsDialog(session); err != nil {
+		return fmt.Errorf("dev-channels dialog: %w", err)
+	}
 	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
 		return fmt.Errorf("workspace trust dialog: %w", err)
 	}
 	if err := t.AcceptBypassPermissionsWarning(session); err != nil {
 		return fmt.Errorf("bypass permissions warning: %w", err)
 	}
+	return nil
+}
+
+// AcceptDevChannelsDialog dismisses the "WARNING: Loading development channels"
+// confirmation Claude shows when launched with --dangerously-load-development-channels.
+// Option 1 ("I am using this for local development") is pre-selected, so Enter
+// accepts.
+//
+// Single capture-and-check (not a poll loop): the dev-channels dialog
+// renders synchronously during claude startup, so by the time our caller
+// runs (after WaitForCommand has confirmed claude is the pane command),
+// the dialog is already on screen. A poll loop would add latency for the
+// common case of "no dev flag, no dialog" with no benefit.
+func (t *Tmux) AcceptDevChannelsDialog(session string) error {
+	content, err := t.CapturePane(session, 30)
+	if err != nil {
+		return nil // best effort — let downstream handlers try
+	}
+	if !strings.Contains(content, "Loading development channels") {
+		return nil
+	}
+	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+		return err
+	}
+	// Brief settle so subsequent dialog handlers see the post-dismissal state.
+	time.Sleep(300 * time.Millisecond)
 	return nil
 }
 
