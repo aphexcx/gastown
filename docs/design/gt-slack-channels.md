@@ -24,7 +24,7 @@ Replace the tmux-send-keys / file-queue / nudge-poller delivery path for inbound
 - A new Slack-side authorization/access layer. The existing daemon-level privacy gate (`CanAccessConversation` + owner gate + conversation gate) remains the single source of access control. The plugin must not grow its own.
 - Network-filesystem support for `slack_inbox/`. flock semantics are assumed to be local POSIX. Sharing `~/gt/.runtime/` over NFS/SMB is out of scope.
 - Implementing `notifications/claude/channel/permission` (the permission-prompt mechanism Telegram exposes). The privacy gate already handles access decisions before any inbox write; per-message permission prompts are not part of this design.
-- v1 tools: only `reply`. `react` and `edit_message` are deferred — referenced in the design for completeness but explicitly out of scope for the first implementation pass. Add later if Gas Town's use case demands them.
+- v1 tools: only `reply` (with `files` array for attachments). `react` and `edit_message` are deferred — referenced earlier drafts of this design for completeness but explicitly out of scope for the first implementation pass. Add later if Gas Town's use case demands them.
 - Eager attachment download for the channels path. v1 carries attachment metadata in the inbox event but does not download files. The `DownloadInboundAttachment` path used by `gt slack reply` today still works for the legacy nudge_queue path; channels-side download parity is a follow-up.
 
 ## Why
@@ -53,10 +53,11 @@ This design adopts that mechanism for gt slack delivery to Claude agents.
                      │
                      │ fsnotify
                      ▼
-        gt slack channel-server <sess>  (new)
-        • emits notifications/claude/channel
-        • exposes reply / react / edit_message MCP tools
-        • holds flock on .subscribed
+        gt slack channel-supervisor (new, exec's the channel-server)
+          └─ gt slack channel-server <sess>  (new)
+              • emits notifications/claude/channel
+              • exposes reply MCP tool (with files array)
+              • holds flock on .subscribed
                      │
                      ▼
         Claude Code session (<channel> tag in context)
@@ -73,7 +74,7 @@ One delivery per session, no dedup. The flock is the only behavioral switch. Rou
 
 | Agent runtime | Inbound path | Outbound path |
 |---|---|---|
-| Claude Code + plugin alive (flock held) | `slack_inbox/<sess>/` → `notifications/claude/channel` | MCP tools (`reply`, `react`, `edit_message`) writing to `slack_outbox/` |
+| Claude Code + plugin alive (flock held) | `slack_inbox/<sess>/` → `notifications/claude/channel` | `reply` MCP tool writing to `slack_outbox/` |
 | Claude Code, plugin not running | `nudge_queue/<sess>/` → `UserPromptSubmit` hook (or poller) | `gt slack reply` CLI |
 | Codex / Gemini / Cursor | `nudge_queue/<sess>/` → poller + tmux send-keys | `gt slack reply` CLI |
 
@@ -107,7 +108,7 @@ Responsibilities:
   3. Emit `notifications/claude/channel` via the MCP transport, await success.
   4. **Only on notification success**: delete the claimed file. On error, `os.Rename` it back to `.json` so a subsequent attempt can retry. Log the error to stderr.
 - **MCP tools** exposed to the Claude session:
-  - `reply(chat_id, text, thread_ts?)` — v1. Writes the JSON shape `gt slack reply` produces, into `slack_outbox/`.
+  - `reply(chat_id, text, thread_ts?, files?)` — v1. Writes the JSON shape `gt slack reply` produces, into `slack_outbox/`. The `files` array is optional and matches the publisher's existing attachment shape.
   - `react`, `edit_message` — explicitly out of scope for v1; add in a follow-up.
 - **Shutdown**: SIGTERM → release flock → exit. The kernel auto-releases the lock on any other death.
 
@@ -121,7 +122,7 @@ Robustness: panic recovery wrapped around every fsnotify event handler and tool 
 plugins/gt-slack/
   .claude-plugin/
     plugin.json     # name, version, description
-  .mcp.json         # { "mcpServers": { "gt-slack": { "command": "gt", "args": ["slack", "channel-server"] } } }
+  .mcp.json         # { "mcpServers": { "gt-slack": { "command": "gt", "args": ["slack", "channel-supervisor"] } } }
 ```
 
 The plugin is referenced as `plugin:gt-slack@gastown` after the user registers the local marketplace once via `/plugin add-marketplace path/to/gastown/crew/cog/plugins/`.
@@ -374,7 +375,9 @@ Test: launched `claude --dangerously-load-development-channels plugin:gt-slack@s
 
 - **Layer 1 (always)**: panic-recovery in plugin code so it doesn't die under normal conditions.
 - **Layer 2 (DOES NOT EXIST)**: Claude Code does not auto-restart. Skip this layer entirely.
-- **Layer 3 (required)**: ship a `gt slack channel-supervisor` outer process. The plugin's `.mcp.json` runs the supervisor; the supervisor `exec`s `gt slack channel-server` in a backoff loop. The supervisor is a tiny outer wrapper (~30-50 LOC) — its only jobs are: launch the server, restart on non-zero exit with exponential backoff (250ms → 1s → 5s → 30s, cap at 30s), and exit cleanly when stdin closes (i.e., Claude Code shutting down the plugin).
+- **Layer 3 (required)**: ship a `gt slack channel-supervisor` outer process. The plugin's `.mcp.json` runs the supervisor; the supervisor `exec`s `gt slack channel-server` exactly once and propagates its exit code. The supervisor is a tiny outer wrapper (~30 LOC) whose only job is to be the process the plugin spec points at, decoupling the plugin command from the server binary so future supervisor logic (health probes, structured stderr capture) can land without churning the plugin definition.
+
+  **Why single-shot, not a backoff restart loop**: an earlier draft of this design (and an earlier shipped iteration of the supervisor) restarted the server on non-zero exit. That broke MCP delivery silently. Claude Code drives the lifecycle by sending `initialize` once over the plugin's stdio at launch; if the supervisor restarts the server over the same stdio, the new child never sees `initialize`, never reaches `Initialized`, and `mcp-go`'s `SendNotificationToAllClients` filters it out. The whole channels path goes quiet with no error to the user. Single-shot exec means a crash terminates the plugin; the next session relaunches it cleanly. If we need restart later, it has to be coordinated with Claude Code (e.g., the supervisor exiting and Claude Code re-spawning the plugin), not internal to the supervisor.
 
 ## E2E findings (2026-05-01)
 
