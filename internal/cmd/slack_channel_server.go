@@ -6,14 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
-	sessionpkg "github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/slack"
 )
 
@@ -64,27 +62,7 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("GT_SESSION env var not set; channel-server must be launched by gt session-spawn (via --channels or --dangerously-load-development-channels for plugin:gt-slack@gastown)")
 	}
 
-	// Normalize: GT_SESSION may be set to a gt address ("mayor/",
-	// "gastown/crew/cog") OR a tmux session name ("hq-mayor",
-	// "gt-crew-cog"). The daemon's dispatch resolves addresses to tmux
-	// session names via ResolveAddressToSession, then probes
-	// slack_inbox/<sessionName>/.subscribed. The channel-server must
-	// therefore use the same tmux session name as the beacon path key.
-	//
-	// If GT_SESSION contains "/", treat it as an address and resolve.
-	// Otherwise use it as-is (already a tmux session name).
-	if strings.Contains(session, "/") {
-		if normalized, rerr := slack.ResolveAddressToSession(session); rerr == nil {
-			fmt.Fprintf(cmd.OutOrStderr(),
-				"channel-server: GT_SESSION=%q is an address; normalized to session=%q\n",
-				session, normalized)
-			session = normalized
-		} else {
-			fmt.Fprintf(cmd.OutOrStderr(),
-				"channel-server: WARNING: GT_SESSION=%q looks like an address but resolution failed: %v (using as-is — daemon dispatch may not match)\n",
-				session, rerr)
-		}
-	}
+	session = normalizeGTSession(session, cmd.OutOrStderr())
 
 	townRoot, err := findMailWorkDir()
 	if err != nil {
@@ -126,27 +104,7 @@ func runSlackChannelServer(cmd *cobra.Command, _ []string) error {
 		server.WithHooks(mcpHooks),
 	)
 
-	// Resolve the sender's gt address once. Used as OutboxMessage.From for
-	// every reply call.
-	//
-	// Prefer detectSender() — same path `gt slack reply` uses
-	// (mail_identity.go) — so MCP-tool replies and CLI replies attribute
-	// to the same identity. detectSender() reads GT_ROLE +
-	// GT_RIG/GT_CREW/GT_POLECAT/GT_DOG_NAME with cwd and .agent fallbacks.
-	//
-	// Fall back to ParseSessionName(GT_SESSION) when detectSender returns
-	// "overseer" (i.e., not running as an agent — extremely unusual for
-	// channel-server but possible during dev/test). Final fallback is the
-	// raw session string.
-	senderAddress := detectSender()
-	if senderAddress == "overseer" {
-		senderAddress = session
-		if id, perr := sessionpkg.ParseSessionName(session); perr == nil {
-			if addr := id.Address(); addr != "" {
-				senderAddress = addr
-			}
-		}
-	}
+	senderAddress := resolveSenderAddress(detectSender(), session)
 
 	// Register the reply tool. Claude calls this to post replies to the
 	// chat that triggered a <channel> notification. The handler delegates
