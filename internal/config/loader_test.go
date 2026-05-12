@@ -1138,6 +1138,14 @@ func TestRuntimeConfigBuildCommandWithPrompt(t *testing.T) {
 func TestBuildAgentStartupCommand(t *testing.T) {
 	// BuildAgentStartupCommand auto-detects town root from cwd when rigPath is empty.
 	// Use a temp directory to ensure we exercise the fallback default config path.
+	// Stub slackChannelsLookup so the test doesn't depend on the user's live
+	// ~/gt/config/slack.json (channels_enabled: true would tack
+	// --channels=plugin:gt-slack@gastown onto the end of the argv and break
+	// the positional-arg assertion below).
+	prevLookup := slackChannelsLookup
+	slackChannelsLookup = func() (bool, bool) { return false, false }
+	t.Cleanup(func() { slackChannelsLookup = prevLookup })
+
 	origWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)

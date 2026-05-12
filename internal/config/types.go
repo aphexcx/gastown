@@ -818,6 +818,12 @@ func DefaultRuntimeConfig() *RuntimeConfig {
 // interpreted by the user's shell. Args containing shell-special
 // characters (e.g., brackets in "sonnet[1m]") are quoted to prevent
 // glob expansion.
+//
+// Note: BuildCommand does NOT auto-inject Slack --channels — that
+// happens at the BuildStartupCommand* layer (loader.go) by mutating
+// rc.Args before calling here. Direct callers of BuildCommand who need
+// channel injection should call BuildArgsWithPrompt (which auto-injects)
+// or call maybeInjectClaudeChannels on the RuntimeConfig before BuildCommand.
 func (rc *RuntimeConfig) BuildCommand() string {
 	resolved := normalizeRuntimeConfig(rc)
 
@@ -877,8 +883,14 @@ func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 }
 
 // BuildArgsWithPrompt returns the runtime command and args suitable for exec.
+//
+// Auto-injects --channels plugin:gt-slack@gastown for Claude commands when
+// slack.json's channels_enabled flag is true (see slack_channels.go). The
+// injection happens on a normalized copy, so the caller's RuntimeConfig is
+// not mutated.
 func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	resolved := normalizeRuntimeConfig(rc)
+	maybeInjectClaudeChannels(resolved)
 	args := append([]string{resolved.Command}, resolved.Args...)
 
 	p := prompt

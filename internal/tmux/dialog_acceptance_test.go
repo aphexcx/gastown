@@ -132,6 +132,53 @@ func TestAcceptBypassPermissionsWarning_DetectsDialog(t *testing.T) {
 	}
 }
 
+// TestAcceptDevChannelsDialog_NoDialog verifies that when no dev-channels
+// dialog is present (agent prompt visible), the function returns quickly.
+func TestAcceptDevChannelsDialog_NoDialog(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-devch-nodlg-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	start := time.Now()
+	err := tm.AcceptDevChannelsDialog(sessionName)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("AcceptDevChannelsDialog: %v", err)
+	}
+
+	if elapsed > 6*time.Second {
+		t.Errorf("took %v, expected early exit (< 6s)", elapsed)
+	}
+}
+
+// TestAcceptDevChannelsDialog_DetectsDialog verifies that when dev-channels
+// warning text appears in the pane, it is detected and accepted.
+func TestAcceptDevChannelsDialog_DetectsDialog(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-devch-dlg-" + t.Name()
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.SendKeys(sessionName, "echo 'WARNING: Loading development channels for testing'"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.AcceptDevChannelsDialog(sessionName); err != nil {
+		t.Fatalf("AcceptDevChannelsDialog: %v", err)
+	}
+}
+
 // TestAcceptStartupDialogs_NoDialogs verifies the combined function returns
 // quickly when no dialogs are present.
 func TestAcceptStartupDialogs_NoDialogs(t *testing.T) {
