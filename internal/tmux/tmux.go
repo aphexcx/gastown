@@ -3102,6 +3102,23 @@ func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	return info, nil
 }
 
+// GetSessionCreatedTime returns the creation time of a tmux session.
+// Uses #{session_created} (Unix timestamp) from tmux list-sessions.
+func (t *Tmux) GetSessionCreatedTime(name string) (time.Time, error) {
+	out, err := t.run("list-sessions", "-F", "#{session_created}", "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
+	if err != nil {
+		return time.Time{}, err
+	}
+	if out == "" {
+		return time.Time{}, ErrSessionNotFound
+	}
+	var unix int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(out), "%d", &unix); err != nil {
+		return time.Time{}, fmt.Errorf("parsing session created time %q: %w", out, err)
+	}
+	return time.Unix(unix, 0), nil
+}
+
 // ApplyTheme sets the status bar style for a session.
 func (t *Tmux) ApplyTheme(session string, theme Theme) error {
 	_, err := t.run("set-option", "-t", session, "status-style", theme.Style())
