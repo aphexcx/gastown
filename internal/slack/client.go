@@ -168,7 +168,7 @@ func (c *Client) DownloadFile(ctx context.Context, url, destPath string) error {
 	if err != nil {
 		return fmt.Errorf("%w: http get: %v", ErrTransient, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("%w: slack file download status %d", ErrTransient, resp.StatusCode)

@@ -78,7 +78,7 @@ func runSlackDaemonForeground(cmd *cobra.Command, _ []string) error {
 	if err := slack.WritePIDFile(pidPath); err != nil {
 		return err
 	}
-	defer slack.RemovePIDFile(pidPath)
+	defer func() { _ = slack.RemovePIDFile(pidPath) }()
 
 	d, err := slack.NewDaemon(slack.DaemonOptions{
 		ConfigPath: cfgPath,
@@ -143,7 +143,7 @@ func runSlackStart(cmd *cobra.Command, _ []string) error {
 	fg := exec.Command(exe, "slack", "daemon")
 	fg.Stdout = logFile
 	fg.Stderr = logFile
-	fg.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	detachFromTerminal(fg) // platform-specific (no-op on Windows)
 	if err := fg.Start(); err != nil {
 		return fmt.Errorf("fork daemon: %w", err)
 	}

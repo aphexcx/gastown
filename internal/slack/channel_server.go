@@ -38,7 +38,7 @@ type Emitter interface {
 
 // ChannelServer runs the inbox watch + claim + emit loop for one session.
 // One ChannelServer per Claude Code session; Run blocks until ctx is
-// cancelled or a fatal error occurs.
+// canceled or a fatal error occurs.
 type ChannelServer struct {
 	townRoot string
 	session  string
@@ -76,13 +76,13 @@ func backoffForAttempt(attempt int) time.Duration {
 		5 * time.Second,
 		10 * time.Second,
 	}
-	if attempt <= 0 {
-		return table[0]
+	idx := attempt - 1
+	if idx < 0 {
+		idx = 0
+	} else if idx >= len(table) {
+		idx = len(table) - 1
 	}
-	if attempt-1 >= len(table) {
-		return table[len(table)-1]
-	}
-	return table[attempt-1]
+	return table[idx]
 }
 
 // NewChannelServer constructs a server. Acquisition of the subscription
@@ -97,7 +97,7 @@ func NewChannelServer(townRoot, session string, emitter Emitter) *ChannelServer 
 	}
 }
 
-// Run blocks until ctx is cancelled or a fatal error occurs.
+// Run blocks until ctx is canceled or a fatal error occurs.
 //
 // Order:
 //  1. Acquire flock on the subscription beacon.
@@ -121,7 +121,7 @@ func (s *ChannelServer) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fsnotify new: %w", err)
 	}
-	defer watcher.Close()
+	defer func() { _ = watcher.Close() }()
 	if err := watcher.Add(dir); err != nil {
 		return fmt.Errorf("fsnotify watch %s: %w", dir, err)
 	}

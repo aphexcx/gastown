@@ -28,7 +28,7 @@ type DaemonOptions struct {
 	TownRoot   string
 }
 
-// Daemon is the top-level router process. Run blocks until ctx is cancelled.
+// Daemon is the top-level router process. Run blocks until ctx is canceled.
 type Daemon struct {
 	opts      DaemonOptions
 	client    *Client
@@ -225,7 +225,7 @@ func NewDaemon(opts DaemonOptions) (*Daemon, error) {
 	}, nil
 }
 
-// Run starts Socket Mode and the publisher and blocks until ctx is cancelled
+// Run starts Socket Mode and the publisher and blocks until ctx is canceled
 // or a fatal error occurs.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.mu.Lock()
@@ -267,8 +267,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Event dispatch loop (also panic-recovering).
 	dispDone := make(chan error, 1)
 	go d.runGoroutine("dispatcher", dispDone, func() error {
-		d.dispatchSocketModeEvents(ctx, smClient)
-		return nil
+		return d.dispatchSocketModeEvents(ctx, smClient)
 	})
 
 	// Periodic status snapshot writer.
@@ -312,14 +311,17 @@ func (d *Daemon) runGoroutine(name string, done chan<- error, fn func() error) {
 	done <- fn()
 }
 
-func (d *Daemon) dispatchSocketModeEvents(ctx context.Context, sm *socketmode.Client) {
+// dispatchSocketModeEvents pumps events from sm.Events until ctx is canceled
+// (clean shutdown → nil) or the events channel closes unexpectedly (treated
+// as an error so the daemon's main loop surfaces it as "dispatcher exited").
+func (d *Daemon) dispatchSocketModeEvents(ctx context.Context, sm *socketmode.Client) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case ev, ok := <-sm.Events:
 			if !ok {
-				return
+				return fmt.Errorf("socketmode events channel closed unexpectedly")
 			}
 			fmt.Fprintf(os.Stderr, "slack: event type=%s\n", ev.Type)
 			switch ev.Type {
@@ -329,7 +331,9 @@ func (d *Daemon) dispatchSocketModeEvents(ctx context.Context, sm *socketmode.Cl
 					fmt.Fprintf(os.Stderr, "slack: EventsAPI data assertion failed: %T\n", ev.Data)
 					continue
 				}
-				sm.Ack(*ev.Request)
+				if ackErr := sm.Ack(*ev.Request); ackErr != nil {
+					fmt.Fprintf(os.Stderr, "slack: Ack failed: %v\n", ackErr)
+				}
 				fmt.Fprintf(os.Stderr, "slack: EventsAPI callback=%s inner=%s\n",
 					payload.Type, payload.InnerEvent.Type)
 				d.onEventsAPI(ctx, payload)

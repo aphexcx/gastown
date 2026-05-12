@@ -76,7 +76,7 @@ func (p *Publisher) FailedCount() int64 { return p.failed.Load() }
 // PendingCount returns the current pending outbox count (last observed).
 func (p *Publisher) PendingCount() int64 { return p.pending.Load() }
 
-// Run drains the outbox until ctx is cancelled. Uses fsnotify as a latency
+// Run drains the outbox until ctx is canceled. Uses fsnotify as a latency
 // hint and a periodic rescan as the source of truth.
 func (p *Publisher) Run(ctx context.Context) error {
 	if err := os.MkdirAll(p.OutboxDir, 0o700); err != nil {
@@ -94,7 +94,7 @@ func (p *Publisher) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fsnotify watcher: %w", err)
 	}
-	defer watcher.Close()
+	defer func() { _ = watcher.Close() }()
 
 	if err := watcher.Add(p.OutboxDir); err != nil {
 		return fmt.Errorf("watch outbox: %w", err)
