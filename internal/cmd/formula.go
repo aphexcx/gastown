@@ -801,7 +801,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	for _, step := range f.Steps {
 		stepBeadID := fmt.Sprintf("%s-wfs-%s", rigPrefix, generateFormulaShortID())
-		stepDescription := substituteFormulaVars(step.Description, setVars)
+		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
 		// Use --body-file=- (stdin) for the description to avoid CLI arg
 		// length limits and quoting issues with large markdown descriptions.
@@ -904,7 +904,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			stepAgent = f.Agent
 		}
 		stepTarget := workflowStepTarget(step, targetRig)
-		stepDescription := substituteFormulaVars(step.Description, setVars)
+		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
 		slingArgs := []string{
 			"sling", stepBeadID, stepTarget,
@@ -948,6 +948,16 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 	fmt.Printf("\n  Track progress: gt convoy status %s\n", workflowID)
 
 	return nil
+}
+
+const workflowTargetField = "workflow_target"
+
+func workflowStepDescription(step formula.Step, description string) string {
+	target := strings.TrimSpace(step.Target)
+	if target == "" {
+		return description
+	}
+	return fmt.Sprintf("%s: %s\n\n%s", workflowTargetField, target, description)
 }
 
 func workflowStepTarget(step formula.Step, targetRig string) string {

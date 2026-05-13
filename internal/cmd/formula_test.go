@@ -89,6 +89,41 @@ func TestWorkflowStepTarget(t *testing.T) {
 	}
 }
 
+func TestWorkflowStepDescriptionAddsTargetMetadata(t *testing.T) {
+	t.Parallel()
+
+	description := "Line one\n\nLine two"
+	got := workflowStepDescription(formula.Step{Target: "mayor"}, description)
+	want := "workflow_target: mayor\n\nLine one\n\nLine two"
+	if got != want {
+		t.Fatalf("workflowStepDescription() = %q, want %q", got, want)
+	}
+}
+
+func TestWorkflowStepTargetFromDescription(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		description string
+		want        string
+	}{
+		{name: "no metadata", description: "Body only", want: ""},
+		{name: "mayor", description: "workflow_target: mayor\n\nBody", want: "mayor"},
+		{name: "rig alias", description: "workflow_target: rig\n\nBody", want: "gastown"},
+		{name: "path target", description: "workflow_target: gastown/crew/alex\n\nBody", want: "gastown/crew/alex"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := workflowStepTargetFromDescription(tt.description, "gastown"); got != tt.want {
+				t.Fatalf("workflowStepTargetFromDescription() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAttachmentFormulaVarsPrefersAttachedVars(t *testing.T) {
 	t.Parallel()
 
