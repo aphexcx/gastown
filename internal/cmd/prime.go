@@ -553,7 +553,7 @@ var memoryTypeLabels = map[string]string{
 	"feedback":  "Behavioral Rules (from user feedback)",
 	"user":      "User Context",
 	"project":   "Project Context",
-	"reference":  "Reference Links",
+	"reference": "Reference Links",
 	"general":   "General",
 }
 
@@ -1188,10 +1188,16 @@ func ensureBeadsRedirect(ctx RoleContext) {
 		return
 	}
 
-	// Check if redirect already exists
 	redirectPath := filepath.Join(ctx.WorkDir, ".beads", "redirect")
-	if _, err := os.Stat(redirectPath); err == nil {
-		return // Redirect exists, nothing to do
+	expected, err := beads.ComputeRedirectTarget(ctx.TownRoot, ctx.WorkDir)
+	if err != nil {
+		// Preserve the old best-effort behavior: if target computation fails but
+		// a redirect exists, do not disturb the worktree during prime.
+		if _, statErr := os.Stat(redirectPath); statErr == nil {
+			return
+		}
+	} else if data, readErr := os.ReadFile(redirectPath); readErr == nil && strings.TrimSpace(string(data)) == expected {
+		return
 	}
 
 	// Use shared helper - silently ignore errors during prime
