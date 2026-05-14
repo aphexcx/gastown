@@ -326,6 +326,40 @@ func TestAddRig_RejectsInvalidNames(t *testing.T) {
 	}
 }
 
+func TestAddRig_EmptyRepositoryReturnsFriendlyError(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	remoteDir := filepath.Join(t.TempDir(), "empty-remote")
+	if err := os.MkdirAll(remoteDir, 0755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	cmd := exec.Command("git", "init")
+	cmd.Dir = remoteDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "emptyrepo",
+		GitURL:        remoteDir,
+		BeadsPrefix:   "er",
+		SkipDoltCheck: true,
+	})
+	if err == nil {
+		t.Fatal("AddRig succeeded, want empty repository error")
+	}
+	want := fmt.Sprintf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", remoteDir)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("AddRig error = %q, want containing %q", err.Error(), want)
+	}
+	if strings.Contains(err.Error(), "couldn't find remote ref") {
+		t.Fatalf("AddRig surfaced low-level fetch error: %q", err.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "emptyrepo")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected failed rig directory to be removed, stat err = %v", statErr)
+	}
+}
+
 func TestListRigNames(t *testing.T) {
 	root, rigsConfig := setupTestTown(t)
 	rigsConfig.Rigs["rig1"] = config.RigEntry{}
