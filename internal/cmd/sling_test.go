@@ -150,7 +150,7 @@ func TestSlingFormulaOnBeadRoutesBDCommandsToTargetRig(t *testing.T) {
 	logPath := filepath.Join(townRoot, "bd.log")
 	bdScript := `#!/bin/sh
 set -e
-echo "$(pwd)|$*" >> "${BD_LOG}"
+echo "$(pwd)|${BEADS_DIR:-}|$*" >> "${BD_LOG}"
 cmd="$1"
 shift || true
 case "$cmd" in
@@ -182,7 +182,7 @@ exit 0
 `
 	bdScriptWindows := `@echo off
 setlocal enableextensions
-echo %CD%^|%*>>"%BD_LOG%"
+echo %CD%^|%BEADS_DIR%^|%*>>"%BD_LOG%"
 set "cmd=%1"
 set "sub=%2"
 if "%cmd%"=="show" (
@@ -261,20 +261,28 @@ exit /b 0
 	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
 		wantDir = resolved
 	}
+	wantBeadsDir := filepath.Join(rigDir, ".beads")
+	if resolved, err := filepath.EvalSymlinks(wantBeadsDir); err == nil {
+		wantBeadsDir = resolved
+	}
 	gotCook := false
 	gotWisp := false
 	gotBond := false
 
 	for _, line := range logLines {
-		parts := strings.SplitN(line, "|", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) != 3 {
 			continue
 		}
 		dir := parts[0]
 		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 			dir = resolved
 		}
-		args := parts[1]
+		beadsDir := parts[1]
+		if resolved, err := filepath.EvalSymlinks(beadsDir); err == nil {
+			beadsDir = resolved
+		}
+		args := parts[2]
 
 		switch {
 		case strings.Contains(args, "cook "):
@@ -285,10 +293,16 @@ exit /b 0
 			if dir != wantDir {
 				t.Fatalf("bd mol wisp ran in %q, want %q (args: %q)", dir, wantDir, args)
 			}
+			if beadsDir != wantBeadsDir {
+				t.Fatalf("bd mol wisp used BEADS_DIR %q, want %q (args: %q)", beadsDir, wantBeadsDir, args)
+			}
 		case strings.Contains(args, "mol bond "):
 			gotBond = true
 			if dir != wantDir {
 				t.Fatalf("bd mol bond ran in %q, want %q (args: %q)", dir, wantDir, args)
+			}
+			if beadsDir != wantBeadsDir {
+				t.Fatalf("bd mol bond used BEADS_DIR %q, want %q (args: %q)", beadsDir, wantBeadsDir, args)
 			}
 		}
 	}
