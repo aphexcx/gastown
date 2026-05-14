@@ -446,7 +446,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		return m.git.CloneBareWithBranch(opts.GitURL, bareRepoPath, branch)
 	}
 
+	emptyRepoError := func() error {
+		return fmt.Errorf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", opts.GitURL)
+	}
+
 	if err := cloneBareWith(opts.DefaultBranch); err != nil {
+		if hasRefs, refsErr := m.git.RemoteHasRefs(opts.GitURL); refsErr == nil && !hasRefs {
+			return nil, emptyRepoError()
+		}
 		return nil, wrapCloneError(err, opts.GitURL)
 	}
 	if opts.CloneFilter != "" {
@@ -462,7 +469,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if empty, err := bareGit.IsEmpty(); err != nil {
 		return nil, fmt.Errorf("checking if repository is empty: %w", err)
 	} else if empty {
-		return nil, fmt.Errorf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", opts.GitURL)
+		hasRefs, refsErr := m.git.RemoteHasRefs(opts.GitURL)
+		if refsErr != nil {
+			return nil, fmt.Errorf("checking if repository is empty: %w", refsErr)
+		}
+		if !hasRefs {
+			return nil, emptyRepoError()
+		}
+		return nil, fmt.Errorf("repository %s has refs, but no default branch could be cloned. Ensure the remote HEAD points to a branch, or pass --branch <branch>", opts.GitURL)
 	}
 
 	// Configure push URL if provided (for read-only upstream repos)

@@ -1198,6 +1198,17 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 	return refs, nil
 }
 
+// RemoteHasRefs reports whether a remote has any refs at all. It deliberately
+// includes tags so callers can distinguish a truly empty repo from a non-empty
+// repo with no branch refs or a broken remote HEAD.
+func (g *Git) RemoteHasRefs(remote string) (bool, error) {
+	out, err := g.run("ls-remote", "--refs", remote)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
 // ListPushRemoteRefs lists remote refs from the push URL when it differs from
 // the fetch URL. With a fork-based workflow (pushurl configured), branches are
 // pushed to the fork but ls-remote reads from the fetch URL (upstream). This
