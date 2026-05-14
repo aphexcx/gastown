@@ -589,8 +589,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				skipClose := false
 				if issue, err := bd.Show(issueID); err == nil {
 					if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
-						style.PrintWarning("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
+						skipReason := fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
+						style.PrintWarning("%s", skipReason)
 						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
 						skipClose = true
 					}
 				}
@@ -975,6 +977,41 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						style.PrintWarning("could not notify dispatcher: %v", err)
 					} else {
 						fmt.Printf("%s Dispatcher notified: READY_FOR_REVIEW\n", style.Bold.Render("✓"))
+					}
+				}
+
+				// No-merge work never goes through the refinery, so close the source bead
+				// here after notifying the dispatcher. Otherwise hooked work remains open.
+				if issueID != "" {
+					canCloseIssue := true
+					if attachmentFields.AttachedMolecule != "" {
+						if n := closeDescendants(bd, attachmentFields.AttachedMolecule); n > 0 {
+							fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachmentFields.AttachedMolecule)
+						}
+						if closeErr := forceCloseIssueWithRetry(
+							bd.ForceCloseWithReason,
+							attachmentFields.AttachedMolecule,
+							"done",
+							"Attached molecule %s closed",
+						); closeErr != nil && !errors.Is(closeErr, beads.ErrNotFound) {
+							style.PrintWarning("could not close attached molecule %s after 3 attempts: %v", attachmentFields.AttachedMolecule, closeErr)
+							canCloseIssue = false
+						}
+					}
+
+					closeReason := "No-merge work completed; merge queue skipped"
+					if prURL != "" {
+						closeReason = fmt.Sprintf("%s\npr_url: %s", closeReason, prURL)
+					}
+					if canCloseIssue {
+						if closeErr := forceCloseIssueWithRetry(
+							bd.ForceCloseWithReason,
+							issueID,
+							closeReason,
+							"Issue %s closed (no-merge)",
+						); closeErr != nil {
+							style.PrintWarning("could not close issue %s after 3 attempts: %v (issue may be left HOOKED)", issueID, closeErr)
+						}
 					}
 				}
 
@@ -1462,6 +1499,50 @@ func pushSubmoduleChanges(g *git.Git, defaultBranch string) {
 		} else {
 			fmt.Printf("%s Submodule %s pushed\n", style.Bold.Render("✓"), sc.Path)
 		}
+	}
+}
+
+func forceCloseIssueWithRetry(closeFn func(string, ...string) error, issueID, reason, successFormat string) error {
+	return forceCloseIssueWithRetrySleep(closeFn, issueID, reason, successFormat, time.Sleep)
+}
+
+func forceCloseIssueWithRetrySleep(closeFn func(string, ...string) error, issueID, reason, successFormat string, sleep func(time.Duration)) error {
+	var closeErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		closeErr = closeFn(reason, issueID)
+		if closeErr == nil {
+			fmt.Printf("%s "+successFormat+"\n", style.Bold.Render("✓"), issueID)
+			return nil
+		}
+		if attempt < 3 {
+			style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
+			sleep(time.Duration(attempt*2) * time.Second)
+		}
+	}
+	return closeErr
+}
+
+func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
+	if townRoot == "" || rigName == "" || issueID == "" {
+		return
+	}
+	if sender == "" {
+		sender = fmt.Sprintf("%s/polecat", rigName)
+	}
+
+	router := mail.NewRouter(townRoot)
+	defer router.WaitPendingNotifications()
+	msg := &mail.Message{
+		To:      fmt.Sprintf("%s/witness", rigName),
+		From:    sender,
+		Subject: fmt.Sprintf("DONE_CLOSE_SKIPPED: %s", issueID),
+		Body: fmt.Sprintf("gt done skipped closing %s.\n\nReason: %s\n\nThe bead remains open for witness/mayor review.",
+			issueID, reason),
+	}
+	if err := router.Send(msg); err != nil {
+		style.PrintWarning("could not notify witness about skipped close: %v", err)
+	} else {
+		fmt.Printf("%s Witness notified: DONE_CLOSE_SKIPPED\n", style.Bold.Render("✓"))
 	}
 }
 
