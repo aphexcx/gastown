@@ -1194,6 +1194,43 @@ func TestConvoyHandler_CacheBypassOnExpand(t *testing.T) {
 	}
 }
 
+func TestConvoyHandler_ExpandCachePreventsRepeatedFetchConvoysErrors(t *testing.T) {
+	fetchCount := 0
+	mock := &CountingMockFetcher{
+		inner:      &MockConvoyFetcher{Error: errFetchFailed},
+		fetchCount: &fetchCount,
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+	handler.cacheTTL = 5 * time.Second
+
+	req1 := httptest.NewRequest("GET", "/?expand=convoys", nil)
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("First expand request status = %d, want 200", w1.Code)
+	}
+	if fetchCount != 1 {
+		t.Fatalf("After first expand request, fetchCount = %d, want 1", fetchCount)
+	}
+
+	req2 := httptest.NewRequest("GET", "/?expand=convoys", nil)
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("Second expand request status = %d, want 200", w2.Code)
+	}
+	if fetchCount != 1 {
+		t.Fatalf("Second expand request should use cached error response; fetchCount = %d, want 1", fetchCount)
+	}
+	if w1.Body.String() != w2.Body.String() {
+		t.Fatal("Cached expand error response should match original response")
+	}
+}
+
 // CountingMockFetcher wraps a ConvoyFetcher and counts FetchConvoys calls.
 type CountingMockFetcher struct {
 	inner      ConvoyFetcher
