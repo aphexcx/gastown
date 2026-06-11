@@ -37,6 +37,9 @@ var (
 	bdAllowStaleMu     sync.Mutex
 	bdAllowStalePath   string
 	bdAllowStaleResult bool
+	// bdAllowStaleProbeTimeout bounds the capability probe so a wedged bd
+	// binary cannot hang higher-level commands such as gt status.
+	bdAllowStaleProbeTimeout = 2 * time.Second
 )
 
 // ResetBdAllowStaleCacheForTest clears the cached bd --allow-stale capability.
@@ -70,18 +73,23 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 		return cachedResult
 	}
 
-	cmd := exec.Command(bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	ctx, cancel := context.WithTimeout(context.Background(), bdAllowStaleProbeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetProcessGroup(cmd)
 	if env != nil {
 		cmd.Env = env
 	}
 	var combinedOut bytes.Buffer
 	cmd.Stdout = &combinedOut
 	cmd.Stderr = &combinedOut
-	_ = cmd.Run()
+	err = cmd.Run()
 	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
-	// Check output for "unknown flag" to detect lack of support.
-	supported := !strings.Contains(combinedOut.String(), "unknown flag")
+	// Check output for "unknown flag" to detect lack of support. Treat probe
+	// errors/timeouts as unsupported so higher-level commands fail closed
+	// instead of hanging on a wedged bd subprocess.
+	supported := err == nil && !strings.Contains(combinedOut.String(), "unknown flag")
 
 	bdAllowStaleMu.Lock()
 	if bdAllowStalePath != bdPath {
@@ -391,6 +399,24 @@ func (b *Beads) getResolvedBeadsDir() string {
 	return ResolveBeadsDir(b.workDir)
 }
 
+// forIssueID returns a Beads wrapper bound to the correct beads directory for
+// the given issue ID. This is needed for cross-rig write operations that use an
+// ID to determine the owning database.
+func (b *Beads) forIssueID(id string) *Beads {
+	resolved := ResolveBeadsDirForID(b.getResolvedBeadsDir(), id)
+	if resolved == "" || resolved == b.getResolvedBeadsDir() {
+		return b
+	}
+	return &Beads{
+		workDir:    b.workDir,
+		beadsDir:   resolved,
+		isolated:   b.isolated,
+		serverPort: b.serverPort,
+		store:      b.store,
+		townRoot:   b.townRoot,
+	}
+}
+
 // Init initializes a new beads database in the working directory.
 // This uses the same environment isolation as other commands.
 // If ServerPort is set (via NewIsolatedWithPort), passes --server-port to bd init
@@ -402,7 +428,7 @@ func (b *Beads) Init(prefix string) error {
 	}
 	args = append(args, "--quiet")
 	if b.serverPort > 0 {
-		args = append(args, "--server-port", fmt.Sprintf("%d", b.serverPort))
+		args = append(args, "--server", "--server-port", fmt.Sprintf("%d", b.serverPort))
 	}
 	_, err := b.run(args...)
 	return err
@@ -1226,10 +1252,26 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	if opts.Ephemeral {
 		args = append(args, "--ephemeral")
 	}
+	// When Rig is set, route to the rig's .beads dir via BEADS_DIR rather than
+	// passing --repo=<rigDir>. Using --repo causes bd to open the target database
+	// as a second connection while BEADS_DIR already holds one, triggering a
+	// pthread_cond_wait deadlock when both paths resolve to the same database
+	// (e.g., a polecat running gt done on its own rig's issue). (hq-1uf2)
+	bdForCreate := b
 	if opts.Rig != "" {
 		if townRoot := b.getTownRoot(); townRoot != "" {
 			if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
-				args = append(args, "--repo="+rigDir)
+				rigBeadsDir := filepath.Join(rigDir, ".beads")
+				if _, statErr := os.Stat(rigBeadsDir); statErr == nil {
+					bdForCreate = &Beads{
+						workDir:    b.workDir,
+						beadsDir:   rigBeadsDir,
+						serverPort: b.serverPort,
+						isolated:   b.isolated,
+					}
+				}
+				// If .beads dir doesn't exist, fall through using b (no --repo flag).
+				// bd will auto-route from BEADS_DIR, which is better than hanging.
 			}
 		}
 	}
@@ -1243,7 +1285,7 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		args = append(args, "--actor="+actor)
 	}
 
-	out, err := b.run(args...)
+	out, err := bdForCreate.run(args...)
 	if err != nil {
 		return nil, err
 	}
