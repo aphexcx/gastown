@@ -230,8 +230,8 @@ func (d *testDAG) BdStubScript() string {
 	}
 
 	// --- handle: sql "SELECT ..." --json (bdDepListRawIDs) ---
-	// bdDepListRawIDs calls: bd sql "SELECT depends_on_id FROM dependencies WHERE issue_id = '<id>' AND type = 'tracks'" --json
-	// or: bd sql "SELECT issue_id FROM dependencies WHERE depends_on_id = '<id>' AND type = 'tracks'" --json
+	// bdDepListRawIDs calls: bd sql "SELECT COALESCE(...) AS depends_on_id FROM dependencies WHERE issue_id = '<id>' AND type = 'tracks'" --json
+	// or: bd sql "SELECT issue_id FROM dependencies WHERE COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) = '<id>' AND type = 'tracks'" --json
 	sb.WriteString("  sql\\ *)\n")
 	sb.WriteString("    # Handle SQL queries for dependency lookups\n")
 	// For "down" direction (convoy → tracked beads): match on issue_id = '<convoyID>'
@@ -246,12 +246,13 @@ func (d *testDAG) BdStubScript() string {
 			sb.WriteString("    esac\n")
 		}
 	}
-	// For "up" direction (bead → tracking convoys): match on depends_on_id = '<beadID>'
+	// For "up" direction (bead → tracking convoys): match on the COALESCE
+	// target expression's tail: depends_on_external) = '<beadID>'
 	for id := range d.beads {
 		trackersJSON := d.trackersSQLJSONFor(id)
 		if trackersJSON != "[]" {
 			sb.WriteString(`    case "$ALL_ARGS" in` + "\n")
-			sb.WriteString(fmt.Sprintf("      *\"depends_on_id = '%s'\"*)\n", id))
+			sb.WriteString(fmt.Sprintf("      *\"depends_on_external) = '%s'\"*)\n", id))
 			sb.WriteString(fmt.Sprintf("        echo '%s'\n", trackersJSON))
 			sb.WriteString("        exit 0\n")
 			sb.WriteString("        ;;\n")

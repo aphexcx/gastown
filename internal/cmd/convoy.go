@@ -483,21 +483,28 @@ func runBdJSON(dir string, args ...string) ([]byte, error) {
 // target issues live in a different Dolt database. See GH #2624.
 //
 // dir should be the town beads directory (.beads) for HQ queries.
-// direction is "down" (issue_id → depends_on_id) or "up" (depends_on_id → issue_id).
+// direction is "down" (issue_id → dependency target) or "up" (dependency target → issue_id).
 // depType filters by dependency type (e.g., "tracks", "blocks"); empty means all types.
 //
 // Returns deduplicated, unwrapped issue IDs (external:prefix:id → id).
 func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) {
+	// Schema v54 split dependencies.depends_on_id into depends_on_issue_id /
+	// depends_on_wisp_id / depends_on_external (exactly one non-NULL per row),
+	// so the target is read via COALESCE across the three columns.
+	const targetExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)"
+
 	// Determine query columns based on direction.
-	// "down": issueID depends on targets → SELECT depends_on_id WHERE issue_id = ?
-	// "up":   issueID is depended on → SELECT issue_id WHERE depends_on_id = ?
-	var selectCol, whereCol string
+	// "down": issueID depends on targets → SELECT <target> WHERE issue_id = ?
+	// "up":   issueID is depended on → SELECT issue_id WHERE <target> = ?
+	var selectExpr, selectCol, whereExpr string
 	if direction == "up" {
+		selectExpr = "issue_id"
 		selectCol = "issue_id"
-		whereCol = "depends_on_id"
+		whereExpr = targetExpr
 	} else {
+		selectExpr = targetExpr + " AS depends_on_id"
 		selectCol = "depends_on_id"
-		whereCol = "issue_id"
+		whereExpr = "issue_id"
 	}
 
 	// Build SQL query. Bead IDs are system-generated alphanumeric strings
@@ -506,7 +513,7 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		return nil, fmt.Errorf("invalid bead ID: %q", issueID)
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM dependencies WHERE %s = '%s'", selectCol, whereCol, issueID)
+	query := fmt.Sprintf("SELECT %s FROM dependencies WHERE %s = '%s'", selectExpr, whereExpr, issueID)
 	if depType != "" {
 		if !isValidBeadID(depType) {
 			return nil, fmt.Errorf("invalid dep type: %q", depType)

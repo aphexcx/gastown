@@ -467,9 +467,9 @@ shift || true
 
 case "$cmd" in
   sql)
-    # bdDepListRawIDs up: SELECT issue_id FROM dependencies WHERE depends_on_id = '<beadID>' AND type = 'tracks'
+    # bdDepListRawIDs up: SELECT issue_id FROM dependencies WHERE COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) = '<beadID>' AND type = 'tracks'
     case "$*" in
-      *"depends_on_id = 'gt-bbb'"*)
+      *"depends_on_external) = 'gt-bbb'"*)
         echo '[{"issue_id":"hq-cv-existing"}]'
         ;;
       *)

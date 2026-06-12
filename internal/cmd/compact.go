@@ -283,7 +283,8 @@ func runCompact(cmd *cobra.Command, args []string) error {
 func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 	const q = `DELETE FROM wisp_dependencies WHERE ` +
 		`NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.issue_id) ` +
-		`OR NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.depends_on_id)`
+		`OR NOT EXISTS (SELECT 1 FROM wisps WHERE id = COALESCE(` +
+		`wisp_dependencies.depends_on_issue_id, wisp_dependencies.depends_on_wisp_id, wisp_dependencies.depends_on_external))`
 	out, err := bd.Run("sql", q)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("orphaned wisp_deps cleanup: %v", err))

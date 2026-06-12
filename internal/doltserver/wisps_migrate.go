@@ -257,7 +257,7 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 
 	// Copy dependencies
 	if err := bdSQL(workDir,
-		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
+		"INSERT IGNORE INTO wisp_dependencies (id, issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id) SELECT d.id, d.issue_id, d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
 		if !strings.Contains(err.Error(), "nothing") {
 			return fmt.Errorf("copying dependencies: %w", err)
 		}
@@ -456,17 +456,30 @@ var wispAuxTableDDLs = []wispAuxTableDDL{
 )`,
 	},
 	{
+		// Mirrors the beads fork's split-target schema (migration 0021):
+		// depends_on_id is split into depends_on_issue_id / depends_on_wisp_id /
+		// depends_on_external. FK constraints are intentionally omitted — the
+		// issues table may not exist on the gt Dolt server when this runs.
 		name: "wisp_dependencies",
 		ddl: `CREATE TABLE wisp_dependencies (
+  id char(36) NOT NULL DEFAULT (UUID()),
   issue_id varchar(255) NOT NULL,
-  depends_on_id varchar(255) NOT NULL,
+  depends_on_issue_id varchar(255),
+  depends_on_wisp_id varchar(255),
+  depends_on_external varchar(255),
   type varchar(32) NOT NULL DEFAULT 'blocks',
   created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_by varchar(255) NOT NULL DEFAULT '',
   metadata json,
   thread_id varchar(255) DEFAULT '',
-  PRIMARY KEY (issue_id, depends_on_id),
-  KEY idx_wisp_deps_depends_on (depends_on_id)
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_wisp_dep_issue_target (issue_id, depends_on_issue_id),
+  UNIQUE KEY uk_wisp_dep_wisp_target (issue_id, depends_on_wisp_id),
+  UNIQUE KEY uk_wisp_dep_external_target (issue_id, depends_on_external),
+  KEY idx_wisp_dep_type_issue (type, depends_on_issue_id),
+  KEY idx_wisp_dep_type_wisp (type, depends_on_wisp_id),
+  KEY idx_wisp_dep_type_external (type, depends_on_external),
+  CONSTRAINT ck_wisp_dep_one_target CHECK ((depends_on_issue_id IS NOT NULL) + (depends_on_wisp_id IS NOT NULL) + (depends_on_external IS NOT NULL) = 1)
 )`,
 	},
 }
