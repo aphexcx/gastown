@@ -1360,11 +1360,30 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 			}
 		}
 		if pushGit != nil {
-			refspec := branchToDelete + ":" + branchToDelete
-			if err := pushGit.Push("origin", refspec, false); err != nil {
-				fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
-			} else {
-				fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
+			// Never push the rig default branch to its own name — that would
+			// fast-forward mainline with unreviewed work (P0 gt-3zkxr). Work on
+			// the default branch is parked on a rescue ref instead.
+			defaultBranch := polecat.RigDefaultBranch(r.Path, pushGit)
+			refspec, rescueBranch := polecat.PreservePushRefspec(branchToDelete, defaultBranch, polecatName, time.Now())
+			skipPush := false
+			if rescueBranch != "" {
+				// Only create a rescue ref when there is something to rescue.
+				// If the unpushed check itself fails (e.g. no origin tracking
+				// ref in the bare repo), push anyway: a redundant rescue ref
+				// beats lost work.
+				if ahead, aheadErr := pushGit.CommitsAhead("origin/"+defaultBranch, branchToDelete); aheadErr == nil && ahead == 0 {
+					skipPush = true
+					fmt.Printf("  %s branch %s matches origin/%s — nothing to preserve\n", style.Dim.Render("○"), branchToDelete, defaultBranch)
+				}
+			}
+			if !skipPush {
+				if err := pushGit.Push("origin", refspec, false); err != nil {
+					fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
+				} else if rescueBranch != "" {
+					fmt.Printf("  %s branch %s is the rig default — preserved work to origin/%s\n", style.Warning.Render("⚠"), branchToDelete, rescueBranch)
+				} else {
+					fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
+				}
 			}
 		}
 	}

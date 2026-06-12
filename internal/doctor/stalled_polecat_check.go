@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -141,8 +143,19 @@ func (c *StalledPolecatCheck) Fix(ctx *CheckContext) error {
 	var lastErr error
 	for _, s := range c.stalledPolecats {
 		polecatGit := git.NewGit(s.clonePath)
-		if err := polecatGit.Push("origin", s.branch, false); err != nil {
+		// Never push the rig default branch to its own name — that would
+		// fast-forward mainline with unreviewed work (P0 gt-3zkxr). Work on
+		// the default branch is parked on a rescue ref instead.
+		rigPath := filepath.Join(ctx.TownRoot, s.rigName)
+		defaultBranch := polecat.RigDefaultBranch(rigPath, polecatGit)
+		refspec, rescueBranch := polecat.PreservePushRefspec(s.branch, defaultBranch, s.name, time.Now())
+		if err := polecatGit.Push("origin", refspec, false); err != nil {
 			lastErr = fmt.Errorf("pushing %s/%s branch %s: %w", s.rigName, s.name, s.branch, err)
+			continue
+		}
+		if rescueBranch != "" {
+			fmt.Printf("  %s/%s: branch %s is the rig default — preserved %d unpushed commit(s) to origin/%s\n",
+				s.rigName, s.name, s.branch, s.unpushedCount, rescueBranch)
 		}
 	}
 	return lastErr
