@@ -36,8 +36,8 @@ func (m *Manager) preserveUnpushedWork(clonePath, name string) {
 		return
 	}
 	if rescueBranch != "" {
-		style.PrintWarning("branch %s is the rig default branch — preserved %d unpushed commit(s) to origin/%s instead of pushing %s",
-			branch, unpushedCount, rescueBranch, branch)
+		style.PrintWarning("not pushing %s directly — preserved %d unpushed commit(s) to origin/%s",
+			branch, unpushedCount, rescueBranch)
 	}
 }
 
@@ -62,13 +62,21 @@ func RigDefaultBranch(rigPath string, g *git.Git) string {
 // parked on a timestamped rescue ref instead. All other branches
 // (polecat/*, dog/*, pr/*, feature branches) push to their own name.
 //
-// Returns the refspec to push and, when the default-branch guard fired, the
-// rescue branch name so callers can report where the work went.
+// Returns the refspec to push and, when the guard fired, the rescue branch
+// name so callers can report where the work went.
 func PreservePushRefspec(branch, defaultBranch, polecatName string, now time.Time) (refspec, rescueBranch string) {
+	ts := now.UTC().Format("20060102-150405")
+	// Detached HEAD: rev-parse --abbrev-ref reports the literal string "HEAD".
+	// Pushing it to its own name would create a remote branch named "HEAD";
+	// park the detached commits on a rescue ref instead.
+	if branch == "HEAD" {
+		rescueBranch = fmt.Sprintf("rescue/%s-detached-%s", polecatName, ts)
+		return "HEAD:refs/heads/" + rescueBranch, rescueBranch
+	}
 	if branch != defaultBranch {
 		return branch + ":refs/heads/" + branch, ""
 	}
 	rescueBranch = fmt.Sprintf("rescue/%s-%s-%s",
-		polecatName, strings.ReplaceAll(branch, "/", "-"), now.UTC().Format("20060102-150405"))
+		polecatName, strings.ReplaceAll(branch, "/", "-"), ts)
 	return branch + ":refs/heads/" + rescueBranch, rescueBranch
 }

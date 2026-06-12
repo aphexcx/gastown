@@ -57,6 +57,13 @@ func TestPreservePushRefspec(t *testing.T) {
 			wantRefspec:   "release/v1:refs/heads/rescue/nux-release-v1-20260612-093045",
 			wantRescue:    "rescue/nux-release-v1-20260612-093045",
 		},
+		{
+			name:          "detached HEAD goes to rescue ref, never a branch named HEAD",
+			branch:        "HEAD",
+			defaultBranch: "main",
+			wantRefspec:   "HEAD:refs/heads/rescue/nux-detached-20260612-093045",
+			wantRescue:    "rescue/nux-detached-20260612-093045",
+		},
 	}
 
 	for _, tt := range tests {
@@ -188,6 +195,31 @@ func TestPreserveUnpushedWork_PolecatBranchPushedAsIs(t *testing.T) {
 	}
 	if rescues := originRescueRefs(t, origin); len(rescues) != 0 {
 		t.Errorf("unexpected rescue refs for non-default branch: %v", rescues)
+	}
+}
+
+func TestPreserveUnpushedWork_DetachedHEADGoesToRescueRef(t *testing.T) {
+	m, origin, clone := setupPreserveTestRepos(t)
+
+	mainBefore := runPreserveGit(t, origin, "rev-parse", "refs/heads/main")
+	runPreserveGit(t, clone, "checkout", "--detach")
+	commitFile(t, clone, "detached.txt") // unpushed commit on detached HEAD
+	detachedSHA := runPreserveGit(t, clone, "rev-parse", "HEAD")
+
+	m.preserveUnpushedWork(clone, "nux")
+
+	if mainAfter := runPreserveGit(t, origin, "rev-parse", "refs/heads/main"); mainAfter != mainBefore {
+		t.Errorf("origin main moved: %s -> %s", mainBefore, mainAfter)
+	}
+	rescues := originRescueRefs(t, origin)
+	if len(rescues) != 1 {
+		t.Fatalf("expected exactly 1 rescue ref, got %v", rescues)
+	}
+	if !strings.HasPrefix(rescues[0], "refs/heads/rescue/nux-detached-") {
+		t.Errorf("rescue ref %q, want prefix refs/heads/rescue/nux-detached-", rescues[0])
+	}
+	if got := runPreserveGit(t, origin, "rev-parse", rescues[0]); got != detachedSHA {
+		t.Errorf("rescue ref points at %s, want detached commit %s", got, detachedSHA)
 	}
 }
 

@@ -1380,7 +1380,7 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 				if err := pushGit.Push("origin", refspec, false); err != nil {
 					fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
 				} else if rescueBranch != "" {
-					fmt.Printf("  %s branch %s is the rig default — preserved work to origin/%s\n", style.Warning.Render("⚠"), branchToDelete, rescueBranch)
+					fmt.Printf("  %s not pushing %s directly — preserved work to origin/%s\n", style.Warning.Render("⚠"), branchToDelete, rescueBranch)
 				} else {
 					fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
 				}

@@ -154,7 +154,7 @@ func (c *StalledPolecatCheck) Fix(ctx *CheckContext) error {
 			continue
 		}
 		if rescueBranch != "" {
-			fmt.Printf("  %s/%s: branch %s is the rig default — preserved %d unpushed commit(s) to origin/%s\n",
+			fmt.Printf("  %s/%s: not pushing %s directly — preserved %d unpushed commit(s) to origin/%s\n",
 				s.rigName, s.name, s.branch, s.unpushedCount, rescueBranch)
 		}
 	}
