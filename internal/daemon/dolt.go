@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -20,6 +21,27 @@ import (
 )
 
 const doltCmdTimeout = 15 * time.Second
+
+// doltExecutorProbeTimeout bounds the executor wedge probe (SELECT 1).
+// A healthy executor answers in milliseconds; the observed connection-handler
+// wedge stalls queries ~10s before an i/o timeout, so 3s cleanly separates
+// the two without stalling the health tick.
+const doltExecutorProbeTimeout = 3 * time.Second
+
+// executorWedgeThreshold is how many consecutive executor-probe timeouts are
+// required before declaring a connection-handler wedge. The wedge is permanent
+// until restart, so requiring two detections (one extra 30s health tick) costs
+// little latency while filtering transient load spikes that could otherwise
+// trigger a false-positive restart of a busy-but-healthy server.
+const executorWedgeThreshold = 2
+
+// errDoltExecutorWedge marks the Dolt connection-handler wedge: the
+// lightweight connectivity probe (active_branch(), which bypasses the query
+// executor) succeeds while queries through the executor time out. Observed to
+// recur on multi-day uptime (gt-hcvs0, hq-l0jn4, hq-wisp-vgdnz0).
+// EnsureRunning matches this with errors.Is to route detection through the
+// controlled restart path.
+var errDoltExecutorWedge = errors.New("dolt connection-handler wedge detected")
 
 // DefaultDoltHealthCheckInterval is how often the dedicated Dolt health check
 // ticker fires, independent of the general daemon heartbeat (3 min).
@@ -133,6 +155,10 @@ type DoltServerManager struct {
 	// Identity verification state
 	lastIdentityCheck time.Time // Last time we ran the database identity check
 
+	// Executor wedge detection state: consecutive health checks where the
+	// executor probe timed out while the connectivity probe succeeded.
+	consecutiveExecutorTimeouts int
+
 	// Health check warnings (Option B throttling for doctor molecule).
 	// Populated by checkHealthLocked(), consumed by Daemon.ensureDoltServerRunning().
 	lastWarnings []string // Warnings from the most recent health check
@@ -145,6 +171,7 @@ type DoltServerManager struct {
 
 	// Test hooks (nil = use real implementations; set only in tests)
 	healthCheckFn     func() error
+	executorProbeFn   func() error // simulate wedge with context.DeadlineExceeded
 	writeProbeCheckFn func() error
 	identityCheckFn   func() error // nil = use real VerifyServerDataDir
 	startFn           func() error
@@ -429,8 +456,16 @@ func (m *DoltServerManager) EnsureRunning() error {
 		if err := m.checkHealthLocked(); err != nil {
 			m.logger("Dolt server unhealthy: %v, restarting...", err)
 			m.sendUnhealthyAlert(err)
-			m.writeUnhealthySignal("health_check_failed", err.Error())
-			m.captureGoroutineDump()
+			if errors.Is(err, errDoltExecutorWedge) {
+				m.writeUnhealthySignal("connection_wedge", err.Error())
+				// No goroutine dump here: captureGoroutineDump sends SIGQUIT,
+				// which TERMINATES this Dolt build instead of dumping
+				// (hq-l0jn4, hq-wisp-vgdnz0), bypassing the graceful stop
+				// below and risking journal corruption.
+			} else {
+				m.writeUnhealthySignal("health_check_failed", err.Error())
+				m.captureGoroutineDump()
+			}
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -1034,7 +1069,10 @@ func (m *DoltServerManager) checkHealthLocked() error {
 	m.lastWarnings = nil // Reset warnings each check cycle.
 
 	if m.healthCheckFn != nil {
-		return m.healthCheckFn()
+		if err := m.healthCheckFn(); err != nil {
+			return err
+		}
+		return m.checkExecutorWedgeLocked()
 	}
 	// 1. Connectivity + latency: time a SELECT active_branch()
 	// Per Tim Sehn (Dolt CEO): active_branch() is a lightweight probe that
@@ -1058,6 +1096,17 @@ func (m *DoltServerManager) checkHealthLocked() error {
 		w := fmt.Sprintf("Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
 		m.lastWarnings = append(m.lastWarnings, w)
 		m.logger("Warning: %s", w)
+	}
+
+	// 1.5. Executor wedge probe. active_branch() bypasses the query executor,
+	// so it stays green when the connection-handler/executor path wedges
+	// (gt-hcvs0: recurs on multi-day uptime; bd/gt queries stall ~10s then
+	// i/o-timeout while this health check keeps passing). Probe the executor
+	// directly and fail health if it is wedged. Runs before the warning
+	// checks below because those also query through the executor and would
+	// each stall for doltCmdTimeout against a wedged server.
+	if err := m.checkExecutorWedgeLocked(); err != nil {
+		return err
 	}
 
 	// 2. Connection count (best-effort, non-fatal)
@@ -1085,6 +1134,72 @@ func (m *DoltServerManager) checkHealthLocked() error {
 	}
 
 	return nil
+}
+
+// runExecutorProbe issues a query that goes through the full query executor
+// (unlike active_branch()). Returns nil on success, an error wrapping
+// context.DeadlineExceeded on timeout, and other errors as-is.
+func (m *DoltServerManager) runExecutorProbe() error {
+	if m.executorProbeFn != nil {
+		return m.executorProbeFn()
+	}
+	if m.healthCheckFn != nil {
+		// Connectivity probe is stubbed for tests; don't shell out to a real
+		// dolt binary unless the executor probe is stubbed too.
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), doltExecutorProbeTimeout)
+	defer cancel()
+
+	cmd := m.buildDoltSQLCmd(ctx, "-q", "SELECT 1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("executor probe (SELECT 1) timed out after %v: %w",
+				doltExecutorProbeTimeout, context.DeadlineExceeded)
+		}
+		return fmt.Errorf("executor probe (SELECT 1) failed: %w (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// checkExecutorWedgeLocked detects the Dolt connection-handler wedge: the
+// connectivity probe succeeds while executor queries time out. Requires
+// executorWedgeThreshold consecutive timeouts before returning
+// errDoltExecutorWedge (fatal — triggers the controlled restart path in
+// EnsureRunning). Earlier timeouts and non-timeout probe failures are
+// recorded as warnings only. Must be called with m.mu held.
+func (m *DoltServerManager) checkExecutorWedgeLocked() error {
+	err := m.runExecutorProbe()
+	if err == nil {
+		m.consecutiveExecutorTimeouts = 0
+		return nil
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		// The executor answered, just with an error — responsive, not wedged.
+		m.consecutiveExecutorTimeouts = 0
+		w := fmt.Sprintf("Dolt executor probe failed (non-timeout): %v", err)
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+		return nil
+	}
+
+	m.consecutiveExecutorTimeouts++
+	if m.consecutiveExecutorTimeouts < executorWedgeThreshold {
+		w := fmt.Sprintf("Dolt executor probe timed out (%d/%d) while connectivity probe succeeded — possible connection-handler wedge",
+			m.consecutiveExecutorTimeouts, executorWedgeThreshold)
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+		return nil
+	}
+
+	m.consecutiveExecutorTimeouts = 0
+	return fmt.Errorf("%w: executor probe (SELECT 1) timed out %d consecutive health checks while active_branch() succeeded; controlled restart required",
+		errDoltExecutorWedge, executorWedgeThreshold)
 }
 
 // LastWarnings returns warnings from the most recent health check.
