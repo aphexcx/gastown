@@ -284,25 +284,31 @@ func checkBackupHealth(townRoot string) *BackupHealth {
 		}
 	}
 
-	// JSONL git backup freshness.
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		gitRepo := filepath.Join(homeDir, ".dolt-archive", "git")
-		if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "log", "-1", "--format=%ci")
-			output, err := cmd.Output()
-			if err == nil {
-				commitTimeStr := strings.TrimSpace(string(output))
-				if commitTime, err := time.Parse("2006-01-02 15:04:05 -0700", commitTimeStr); err == nil {
-					age := time.Since(commitTime)
-					bh.JSONLAgeSeconds = int(age.Seconds())
-					bh.JSONLFreshness = age.Round(time.Second).String()
-					bh.JSONLStale = age > 30*time.Minute
-				}
+	// JSONL git backup freshness. The daemon patrol writes to
+	// {townRoot}/.dolt-archive/git; fall back to the legacy home-dir
+	// location for older installs (gt-gct3r).
+	candidates := []string{filepath.Join(townRoot, ".dolt-archive", "git")}
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(homeDir, ".dolt-archive", "git"))
+	}
+	for _, gitRepo := range candidates {
+		if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "log", "-1", "--format=%ci")
+		output, err := cmd.Output()
+		if err == nil {
+			commitTimeStr := strings.TrimSpace(string(output))
+			if commitTime, err := time.Parse("2006-01-02 15:04:05 -0700", commitTimeStr); err == nil {
+				age := time.Since(commitTime)
+				bh.JSONLAgeSeconds = int(age.Seconds())
+				bh.JSONLFreshness = age.Round(time.Second).String()
+				bh.JSONLStale = age > 30*time.Minute
 			}
 		}
+		break
 	}
 
 	return bh

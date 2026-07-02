@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -26,6 +27,7 @@ const (
 	gitPushTimeout                = 120 * time.Second
 	gitCmdTimeout                 = 30 * time.Second
 	maxConsecutivePushFailures    = 3
+	maxConsecutiveTickFailures    = 3
 	defaultSpikeThreshold         = 0.50 // 50% delta triggers halt (was 20%, too sensitive for bulk ops)
 )
 
@@ -89,20 +91,12 @@ func (d *Daemon) syncJsonlGitBackup() {
 
 	config := d.patrolConfig.Patrols.JsonlGitBackup
 
-	// Resolve git repo path.
-	gitRepo := config.GitRepo
-	if gitRepo == "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			d.logger.Printf("jsonl_git_backup: cannot determine home dir: %v", err)
-			return
-		}
-		gitRepo = filepath.Join(homeDir, ".dolt-archive", "git")
-	}
-
-	// Verify git repo exists.
-	if _, err := os.Stat(filepath.Join(gitRepo, ".git")); os.IsNotExist(err) {
-		d.logger.Printf("jsonl_git_backup: git repo %s does not exist, skipping", gitRepo)
+	// Resolve git repo path and make sure it exists. A backup that skips
+	// because its target is missing is a silent death (gt-gct3r: 3 weeks of
+	// "does not exist, skipping" at info level), so create it if needed.
+	gitRepo := jsonlGitRepoPath(config, d.config.TownRoot)
+	if err := d.ensureJsonlGitRepo(gitRepo); err != nil {
+		d.jsonlBackupTickFailed(mol, "export", fmt.Sprintf("git repo %s unavailable: %v", gitRepo, err))
 		return
 	}
 
@@ -112,10 +106,15 @@ func (d *Daemon) syncJsonlGitBackup() {
 		scrub = *config.Scrub
 	}
 
-	// Get database list.
+	// Get database list — from config, else auto-discover from the Dolt
+	// server as the config docs promise (gt-gct3r: an empty list used to
+	// skip the whole backup silently).
 	databases := config.Databases
 	if len(databases) == 0 {
-		d.logger.Printf("jsonl_git_backup: no databases configured, skipping")
+		databases = reaper.DiscoverDatabases("127.0.0.1", d.doltServerPort())
+	}
+	if len(databases) == 0 {
+		d.jsonlBackupTickFailed(mol, "export", "no databases configured or discovered")
 		return
 	}
 
@@ -127,7 +126,7 @@ func (d *Daemon) syncJsonlGitBackup() {
 		dataDir = filepath.Join(d.config.TownRoot, ".dolt-data")
 	}
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		d.logger.Printf("jsonl_git_backup: data dir %s does not exist, skipping", dataDir)
+		d.jsonlBackupTickFailed(mol, "export", fmt.Sprintf("data dir %s does not exist", dataDir))
 		return
 	}
 
@@ -148,10 +147,12 @@ func (d *Daemon) syncJsonlGitBackup() {
 	}
 
 	if exported == 0 {
-		d.logger.Printf("jsonl_git_backup: no databases exported successfully")
-		mol.failStep("export", "no databases exported successfully")
+		d.jsonlBackupTickFailed(mol, "export", fmt.Sprintf("all %d database export(s) failed", len(databases)))
 		return
 	}
+
+	// Something was exported — the backup is alive again.
+	d.jsonlTickFailures = 0
 
 	mol.closeStep("export")
 
@@ -203,6 +204,53 @@ func (d *Daemon) syncJsonlGitBackup() {
 
 	d.logger.Printf("jsonl_git_backup: exported %d/%d database(s), push=%s", exported, len(databases), pushStatus)
 	mol.closeStep("report")
+}
+
+// jsonlGitRepoPath returns the configured backup repo path, defaulting to
+// {townRoot}/.dolt-archive/git — the same location gt vitals reads. (The old
+// default was ~/.dolt-archive/git in the home directory, which never existed
+// on real installs and made the patrol skip every tick; gt-gct3r.)
+func jsonlGitRepoPath(config *JsonlGitBackupConfig, townRoot string) string {
+	if config != nil && config.GitRepo != "" {
+		return config.GitRepo
+	}
+	return filepath.Join(townRoot, ".dolt-archive", "git")
+}
+
+// ensureJsonlGitRepo verifies the backup git repo exists, creating and
+// initializing it when missing so the backup self-heals instead of skipping.
+func (d *Daemon) ensureJsonlGitRepo(gitRepo string) error {
+	if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(gitRepo, 0755); err != nil {
+		return fmt.Errorf("creating dir: %w", err)
+	}
+	if err := d.runGitCmd(gitRepo, gitCmdTimeout, "init"); err != nil {
+		return fmt.Errorf("git init: %w", err)
+	}
+	// Commit identity: git commit needs a committer even with --author, and
+	// the daemon may run without a global git config. Best-effort.
+	_ = d.runGitCmd(gitRepo, gitCmdTimeout, "config", "user.name", "Gas Town Daemon")
+	_ = d.runGitCmd(gitRepo, gitCmdTimeout, "config", "user.email", "daemon@gastown.local")
+	d.logger.Printf("jsonl_git_backup: WARNING: git repo %s was missing — created and initialized", gitRepo)
+	return nil
+}
+
+// jsonlBackupTickFailed records a tick that exported nothing. Logs at warning
+// level and escalates to the mayor after maxConsecutiveTickFailures so a dead
+// backup is always loud (gt-gct3r: the previous info-level skip logs hid a
+// 3-week outage).
+func (d *Daemon) jsonlBackupTickFailed(mol *dogMol, step, reason string) {
+	d.jsonlTickFailures++
+	d.logger.Printf("jsonl_git_backup: WARNING: %s (consecutive failed ticks: %d)", reason, d.jsonlTickFailures)
+	mol.failStep(step, reason)
+	if d.jsonlTickFailures >= maxConsecutiveTickFailures {
+		d.logger.Printf("jsonl_git_backup: ESCALATION: no exports for %d consecutive ticks", d.jsonlTickFailures)
+		d.escalate("jsonl_git_backup", fmt.Sprintf("backup produced no exports for %d consecutive ticks; last error: %s", d.jsonlTickFailures, reason))
+		// Reset to avoid flooding escalations every tick.
+		d.jsonlTickFailures = 0
+	}
 }
 
 // supplementalTables lists non-issues tables to include in JSONL backup.
@@ -459,6 +507,11 @@ func (d *Daemon) runGitCmd(dir string, timeout time.Duration, args ...string) er
 
 // escalate sends an escalation message to the mayor via gt escalate.
 func (d *Daemon) escalate(source, message string) {
+	if d.escalateFn != nil {
+		d.escalateFn(source, message)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

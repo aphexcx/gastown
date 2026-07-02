@@ -1,13 +1,16 @@
 package daemon
 
 import (
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -589,4 +592,221 @@ func writeNLines(t *testing.T, path string, n int) {
 
 func itoa(i int) string {
 	return strconv.Itoa(i)
+}
+
+// --- gt-gct3r: silent-death fixes (repo path default, auto-create, loud failures) ---
+
+func TestJsonlGitRepoPath_DefaultsToTownRoot(t *testing.T) {
+	got := jsonlGitRepoPath(&JsonlGitBackupConfig{}, "/town")
+	want := filepath.Join("/town", ".dolt-archive", "git")
+	if got != want {
+		t.Errorf("jsonlGitRepoPath default = %q, want %q", got, want)
+	}
+}
+
+func TestJsonlGitRepoPath_ConfigOverride(t *testing.T) {
+	got := jsonlGitRepoPath(&JsonlGitBackupConfig{GitRepo: "/custom/archive"}, "/town")
+	if got != "/custom/archive" {
+		t.Errorf("jsonlGitRepoPath override = %q, want /custom/archive", got)
+	}
+}
+
+func TestEnsureJsonlGitRepo_CreatesWhenMissing(t *testing.T) {
+	tmp := t.TempDir()
+	gitRepo := filepath.Join(tmp, ".dolt-archive", "git")
+	d := &Daemon{logger: log.New(io.Discard, "", 0)}
+
+	if err := d.ensureJsonlGitRepo(gitRepo); err != nil {
+		t.Fatalf("ensureJsonlGitRepo: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err != nil {
+		t.Errorf("expected initialized git repo at %s: %v", gitRepo, err)
+	}
+}
+
+func TestEnsureJsonlGitRepo_NoopWhenExists(t *testing.T) {
+	gitRepo := t.TempDir()
+	initGitRepo(t, gitRepo)
+	d := &Daemon{logger: log.New(io.Discard, "", 0)}
+
+	if err := d.ensureJsonlGitRepo(gitRepo); err != nil {
+		t.Fatalf("ensureJsonlGitRepo on existing repo: %v", err)
+	}
+}
+
+func TestJsonlBackupTickFailed_EscalatesAfterThreeConsecutive(t *testing.T) {
+	var escalations []string
+	d := &Daemon{
+		logger:     log.New(io.Discard, "", 0),
+		escalateFn: func(source, message string) { escalations = append(escalations, message) },
+	}
+	mol := &dogMol{stepIDs: map[string]string{}, logger: d.logger}
+
+	d.jsonlBackupTickFailed(mol, "export", "boom")
+	d.jsonlBackupTickFailed(mol, "export", "boom")
+	if len(escalations) != 0 {
+		t.Fatalf("escalated after %d failures, want none before 3", 2)
+	}
+	d.jsonlBackupTickFailed(mol, "export", "boom")
+	if len(escalations) != 1 {
+		t.Fatalf("got %d escalations after 3 failures, want 1", len(escalations))
+	}
+	if d.jsonlTickFailures != 0 {
+		t.Errorf("counter = %d after escalation, want 0 (reset to avoid flooding)", d.jsonlTickFailures)
+	}
+	// Next failure starts a fresh streak — no immediate re-escalation.
+	d.jsonlBackupTickFailed(mol, "export", "boom")
+	if len(escalations) != 1 {
+		t.Errorf("got %d escalations after 4th failure, want still 1", len(escalations))
+	}
+}
+
+func TestSyncJsonlGitBackup_ZeroExportTicksAreLoud(t *testing.T) {
+	tmp := t.TempDir()
+	var escalations []string
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: tmp},
+		patrolConfig: &DaemonPatrolConfig{
+			Patrols: &PatrolsConfig{
+				JsonlGitBackup: &JsonlGitBackupConfig{
+					Enabled: true,
+					// Explicit database list so no auto-discovery happens in tests.
+					Databases: []string{"nonexistent_test_db"},
+				},
+			},
+		},
+		logger:     log.New(&logBuf, "", 0),
+		bdPath:     "/nonexistent/bd", // dogMol degrades gracefully, no real wisps
+		escalateFn: func(source, message string) { escalations = append(escalations, message) },
+	}
+
+	// Data dir does not exist under tmp town root → every tick exports nothing.
+	for i := 0; i < 3; i++ {
+		d.syncJsonlGitBackup()
+	}
+
+	if !strings.Contains(logBuf.String(), "WARNING") {
+		t.Errorf("zero-export tick did not log at WARNING level; log:\n%s", logBuf.String())
+	}
+	if len(escalations) != 1 {
+		t.Fatalf("got %d escalations after 3 zero-export ticks, want 1; log:\n%s", len(escalations), logBuf.String())
+	}
+	// The repo should have been auto-created even though the tick failed later.
+	if _, err := os.Stat(filepath.Join(tmp, ".dolt-archive", "git", ".git")); err != nil {
+		t.Errorf("expected auto-created archive repo under town root: %v", err)
+	}
+}
+
+// TestSyncJsonlGitBackup_EndToEnd_TwoTicks runs the full patrol twice against
+// the package's shared Dolt test container: seed data → tick (export+commit) →
+// mutate data → tick again. Verifies fresh JSONL exports and git commits per
+// tick with zero escalations — the recovery criteria for gt-gct3r.
+func TestSyncJsonlGitBackup_EndToEnd_TwoTicks(t *testing.T) {
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt CLI not available")
+	}
+	portStr := os.Getenv("GT_DOLT_PORT")
+	if portStr == "" {
+		t.Skip("no shared Dolt container (GT_DOLT_PORT unset)")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("bad GT_DOLT_PORT %q: %v", portStr, err)
+	}
+
+	conn, err := sql.Open("mysql", fmt.Sprintf("root@tcp(127.0.0.1:%d)/?timeout=5s", port))
+	if err != nil {
+		t.Fatalf("connecting to Dolt container: %v", err)
+	}
+	defer conn.Close()
+
+	const dbName = "jsonl_e2e"
+	mustExec := func(q string) {
+		t.Helper()
+		if _, err := conn.Exec(q); err != nil {
+			t.Fatalf("SQL %q: %v", q, err)
+		}
+	}
+	mustExec("DROP DATABASE IF EXISTS " + dbName)
+	mustExec("CREATE DATABASE " + dbName)
+	t.Cleanup(func() { _, _ = conn.Exec("DROP DATABASE IF EXISTS " + dbName) })
+	mustExec("CREATE TABLE " + dbName + ".issues (id varchar(64) PRIMARY KEY, title text, status varchar(32), issue_type varchar(32), ephemeral tinyint)")
+	mustExec("INSERT INTO " + dbName + ".issues VALUES ('gt-e2e1','Backup record one','open','bug',0),('gt-e2e2','Backup record two','open','task',0)")
+
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, ".dolt-data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var escalations []string
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: tmp},
+		patrolConfig: &DaemonPatrolConfig{
+			Patrols: &PatrolsConfig{
+				JsonlGitBackup: &JsonlGitBackupConfig{
+					Enabled:   true,
+					Databases: []string{dbName},
+				},
+			},
+		},
+		doltServer: &DoltServerManager{config: &DoltServerConfig{
+			Enabled: true,
+			Host:    "127.0.0.1",
+			Port:    port,
+			User:    "root",
+			DataDir: dataDir,
+		}},
+		logger:     log.New(&logBuf, "", 0),
+		bdPath:     "/nonexistent/bd", // dogMol degrades gracefully, no real wisps
+		escalateFn: func(source, message string) { escalations = append(escalations, message) },
+	}
+
+	gitRepo := filepath.Join(tmp, ".dolt-archive", "git")
+	issuesPath := filepath.Join(gitRepo, dbName, "issues.jsonl")
+	commitCount := func() int {
+		t.Helper()
+		out, err := exec.Command("git", "-C", gitRepo, "rev-list", "--count", "HEAD").Output()
+		if err != nil {
+			t.Fatalf("git rev-list: %v", err)
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+		return n
+	}
+
+	// Tick 1: repo auto-created, both records exported and committed.
+	d.syncJsonlGitBackup()
+	data, err := os.ReadFile(issuesPath)
+	if err != nil {
+		t.Fatalf("tick 1 produced no export: %v; log:\n%s", err, logBuf.String())
+	}
+	if got := strings.Count(string(data), "\n"); got != 2 {
+		t.Errorf("tick 1 exported %d records, want 2; content:\n%s", got, data)
+	}
+	if got := commitCount(); got != 1 {
+		t.Errorf("tick 1: %d commits, want 1; log:\n%s", got, logBuf.String())
+	}
+
+	// Mutate data, tick 2: export refreshed and committed again.
+	mustExec("UPDATE " + dbName + ".issues SET title='Backup record one updated' WHERE id='gt-e2e1'")
+	d.syncJsonlGitBackup()
+	data, err = os.ReadFile(issuesPath)
+	if err != nil {
+		t.Fatalf("tick 2 export missing: %v", err)
+	}
+	if !strings.Contains(string(data), "Backup record one updated") {
+		t.Errorf("tick 2 export is stale — updated title not present; content:\n%s", data)
+	}
+	if got := commitCount(); got != 2 {
+		t.Errorf("tick 2: %d commits, want 2; log:\n%s", got, logBuf.String())
+	}
+
+	if len(escalations) != 0 {
+		t.Errorf("healthy ticks escalated: %v", escalations)
+	}
+	if d.jsonlTickFailures != 0 {
+		t.Errorf("jsonlTickFailures = %d after healthy ticks, want 0", d.jsonlTickFailures)
+	}
 }

@@ -102,6 +102,17 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	jsonlPushFailures int
 
+	// jsonlTickFailures tracks consecutive JSONL backup ticks that exported
+	// nothing (missing repo, no databases, all exports failed). Escalates to
+	// the mayor after maxConsecutiveTickFailures so the backup can never die
+	// silently again (gt-gct3r).
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	jsonlTickFailures int
+
+	// escalateFn overrides the gt-escalate subprocess call in escalate().
+	// Test hook only — nil in production.
+	escalateFn func(source, message string)
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
