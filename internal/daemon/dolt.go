@@ -76,6 +76,11 @@ type DoltServerConfig struct {
 	// LogFile is the path to the Dolt server log file.
 	LogFile string `json:"log_file,omitempty"`
 
+	// PidFile overrides the port-derived PID file path. Set by
+	// NewAutoDoltServerManager so the daemon reads/writes the same canonical
+	// pid file as gt dolt start even on non-default ports.
+	PidFile string `json:"pid_file,omitempty"`
+
 	// AutoRestart controls whether to restart on crash.
 	AutoRestart bool `json:"auto_restart,omitempty"`
 
@@ -169,6 +174,19 @@ type DoltServerManager struct {
 	// Protected by mu.
 	onRecoveryFn func()
 
+	// startDelegate, when set, replaces the built-in start path with the
+	// canonical doltserver.Start flow (same locking, squatter eviction,
+	// config.yaml, and readiness wait as `gt dolt start`). Wired by
+	// NewAutoDoltServerManager so daemon-triggered restarts and manual starts
+	// cannot diverge in server tuning.
+	startDelegate func() error
+
+	// autoManaged marks a manager created by NewAutoDoltServerManager: the
+	// daemon adopted a shared server it did not configure. Daemon shutdown
+	// must NOT stop an adopted server — the town's Dolt has always survived
+	// daemon restarts, and gt down stops it through its own path.
+	autoManaged bool
+
 	// Test hooks (nil = use real implementations; set only in tests)
 	healthCheckFn     func() error
 	executorProbeFn   func() error // simulate wedge with context.DeadlineExceeded
@@ -198,6 +216,49 @@ func NewDoltServerManager(townRoot string, config *DoltServerConfig, logger func
 	}
 }
 
+// NewAutoDoltServerManager builds a manager for the town's canonical Dolt
+// server when mayor/daemon.json has no dolt_server section. Historically that
+// section was opt-in and nothing ever wrote it, so most towns ran with NO
+// daemon-side Dolt recovery at all: a dead server stayed dead until a human
+// ran gt dolt start (gt-9uwuz — three manual resurrections in one week).
+//
+// The config is derived from doltserver.DefaultConfig — the same source gt
+// dolt start and gt up use — so the daemon manages the real production server
+// (port/config.yaml/.dolt-data/dolt.pid), not the daemon package's legacy
+// defaults (port 3306, townRoot/dolt). Starts are delegated to
+// doltserver.Start for the same reason.
+//
+// Returns nil when the town has no Dolt data directory (server mode not in
+// use). Remote hosts get External (monitor-only) mode: the daemon never
+// starts or stops a local process for a server it doesn't own.
+//
+// Opt-out: set {"dolt_server": {"enabled": false}} in mayor/daemon.json.
+func NewAutoDoltServerManager(townRoot string, logger func(format string, v ...interface{})) *DoltServerManager {
+	ds := doltserver.DefaultConfig(townRoot)
+	if _, err := os.Stat(ds.DataDir); err != nil {
+		return nil
+	}
+
+	cfg := DefaultDoltServerConfig(townRoot)
+	cfg.Enabled = true
+	cfg.Port = ds.Port
+	cfg.Host = ds.Host
+	cfg.User = ds.User
+	cfg.Password = ds.Password
+	cfg.DataDir = ds.DataDir
+	cfg.LogFile = ds.LogFile
+	cfg.PidFile = ds.PidFile
+
+	m := NewDoltServerManager(townRoot, cfg, logger)
+	m.autoManaged = true
+	if m.isRemote() {
+		cfg.External = true
+	} else {
+		m.startDelegate = func() error { return doltserver.Start(townRoot) }
+	}
+	return m
+}
+
 // SetRecoveryCallback registers fn to be called (in a goroutine) whenever Dolt
 // transitions from unhealthy back to healthy. Only the most recently registered
 // callback is used. Pass nil to clear the callback.
@@ -223,9 +284,13 @@ func (m *DoltServerManager) doSleep(d time.Duration) {
 }
 
 // pidFile returns the path to the Dolt server PID file.
-// Production (port 3307) uses the canonical "dolt.pid" for compatibility with
-// gt dolt start/stop. Other ports get a port-specific name to avoid collisions.
+// An explicit config.PidFile wins. Otherwise production (port 3307) uses the
+// canonical "dolt.pid" for compatibility with gt dolt start/stop, and other
+// ports get a port-specific name to avoid collisions.
 func (m *DoltServerManager) pidFile() string {
+	if m.config.PidFile != "" {
+		return m.config.PidFile
+	}
 	if m.config.Port == 3307 {
 		return filepath.Join(m.townRoot, "daemon", "dolt.pid")
 	}
@@ -395,9 +460,12 @@ func (m *DoltServerManager) isRunning() (int, bool) {
 	}
 
 	if !alive {
-		// Process not running, clean up stale PID file
+		// Process not running — clean up the stale PID file but report the
+		// dead PID so EnsureRunning can attribute the crash and send an
+		// alert. Returning 0 here made the fully-dead path silent: no crash
+		// alert, no server_dead signal (gt-9uwuz).
 		_ = os.Remove(m.pidFile())
-		return 0, false
+		return pid, false
 	}
 
 	// Verify it's actually our dolt server by checking port connectivity.
@@ -888,6 +956,13 @@ func (m *DoltServerManager) startLocked() error {
 	if _, running := m.isRunning(); running {
 		m.logger("Dolt server already running, skipping start")
 		return nil
+	}
+
+	// Auto-managed mode: route through the canonical doltserver.Start path.
+	// It is idempotent (already-running is success) and handles locking,
+	// squatter eviction, imposter checks, and the readiness wait.
+	if m.startDelegate != nil {
+		return m.startDelegate()
 	}
 
 	// Ensure data directory exists

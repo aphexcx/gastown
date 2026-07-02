@@ -238,7 +238,13 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Patrols disabled via town settings: %v", names)
 	}
 
-	// Initialize Dolt server manager if configured
+	// Initialize Dolt server manager. An explicit dolt_server section in
+	// mayor/daemon.json wins; without one, auto-manage the town's canonical
+	// Dolt server (derived from doltserver.DefaultConfig, gated on .dolt-data
+	// existing). The old behavior — no section means no management — left the
+	// daemon's entire Dolt recovery stack dark in every town that never
+	// hand-wrote the opt-in config: a dead server was never restarted and no
+	// alert was ever sent (gt-9uwuz).
 	var doltServer *DoltServerManager
 	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoltServer != nil {
 		doltServer = NewDoltServerManager(config.TownRoot, patrolConfig.Patrols.DoltServer, logger.Printf)
@@ -255,6 +261,11 @@ func New(config *Config) (*Daemon, error) {
 				os.Setenv("BEADS_DOLT_SERVER_HOST", patrolConfig.Patrols.DoltServer.Host)
 			}
 		}
+	} else if doltServer = NewAutoDoltServerManager(config.TownRoot, logger.Printf); doltServer != nil {
+		// Env propagation (GT_DOLT_PORT etc.) for this mode is handled by the
+		// fallback below, which reads the same doltserver.DefaultConfig.
+		logger.Printf("Dolt server management auto-enabled (no dolt_server in daemon.json): port %d, data dir %s, external=%v",
+			doltServer.config.Port, doltServer.config.DataDir, doltServer.IsExternal())
 	}
 
 	// Fallback: if GT_DOLT_PORT still isn't set (no DoltServerManager, daemon
@@ -2138,8 +2149,10 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 	// Push Dolt remotes before stopping the server (if patrol is enabled)
 	d.pushDoltRemotes()
 
-	// Stop Dolt server if we're managing it
-	if d.doltServer != nil && d.doltServer.IsEnabled() && !d.doltServer.IsExternal() {
+	// Stop Dolt server if we're managing it. Auto-managed servers are
+	// adopted, not owned: they must survive daemon restarts (bd across all
+	// rigs depends on them); gt down stops Dolt through its own path.
+	if d.doltServer != nil && d.doltServer.IsEnabled() && !d.doltServer.IsExternal() && !d.doltServer.autoManaged {
 		if err := d.doltServer.Stop(); err != nil {
 			d.logger.Printf("Warning: failed to stop Dolt server: %v", err)
 		} else {

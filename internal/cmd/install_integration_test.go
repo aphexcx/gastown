@@ -7,11 +7,45 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+// killTestDoltServers terminates dolt sql-server processes whose command line
+// references a path under the system temp directory, where every e2e test
+// HOME lives. This replaces `pkill -f "dolt sql-server"`, which killed EVERY
+// Dolt server on the machine — including a developer's production server on
+// port 3307 — whenever the suite ran outside the sanctioned container
+// (gt-9uwuz; same pattern as incident hq-p0gbl). A production server's data
+// dir is never under the temp root, so it can never match here.
+func killTestDoltServers(t *testing.T) {
+	t.Helper()
+	tempRoot := os.TempDir()
+	out, err := exec.Command("ps", "-eo", "pid,args").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "dolt sql-server") || !strings.Contains(line, tempRoot) {
+			continue
+		}
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		if proc, findErr := os.FindProcess(pid); findErr == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
+}
 
 // TestInstallCreatesCorrectStructure validates that a fresh gt install
 // creates the expected directory structure and configuration files.
@@ -27,8 +61,8 @@ func TestInstallCreatesCorrectStructure(t *testing.T) {
 	configureGitIdentity(t, env)
 
 	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
-	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
-	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+	killTestDoltServers(t)
+	t.Cleanup(func() { killTestDoltServers(t) })
 
 	// Run gt install
 	cmd := exec.Command(gtBinary, "install", hqPath, "--name", "test-town")
@@ -93,8 +127,8 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	configureGitIdentity(t, env)
 
 	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
-	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
-	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+	killTestDoltServers(t)
+	t.Cleanup(func() { killTestDoltServers(t) })
 
 	// Run gt install (includes beads init by default)
 	cmd := exec.Command(gtBinary, "install", hqPath)
@@ -357,8 +391,8 @@ func TestInstallFormulasProvisioned(t *testing.T) {
 	configureGitIdentity(t, env)
 
 	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
-	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
-	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+	killTestDoltServers(t)
+	t.Cleanup(func() { killTestDoltServers(t) })
 
 	// Run gt install (includes beads and formula provisioning)
 	cmd := exec.Command(gtBinary, "install", hqPath)
@@ -555,7 +589,7 @@ func TestInstallDoctorClean(t *testing.T) {
 	env = append(env, "HOME="+tmpDir)
 
 	// Kill any stale dolt from previous test BEFORE install to avoid port 3307 conflict.
-	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	killTestDoltServers(t)
 
 	// Set up git identity in the test's temp HOME so EnsureDoltIdentity can copy it.
 	configureGitIdentity(t, env)
@@ -689,7 +723,7 @@ func TestInstallWithDaemon(t *testing.T) {
 	env = append(env, "HOME="+tmpDir)
 
 	// Kill any stale dolt from previous test BEFORE install to avoid port 3307 conflict.
-	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	killTestDoltServers(t)
 
 	// Set up git identity in the test's temp HOME so EnsureDoltIdentity can copy it.
 	configureGitIdentity(t, env)
